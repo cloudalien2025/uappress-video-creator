@@ -1,17 +1,12 @@
-# UAPpress Video Creator (Zip → MP4)
 
-## What it does
-Upload a ZIP from Documentary TTS Studio (chapter scripts + MP3s).
-This app can:
-- Create a scene plan per chapter (OpenAI text model)
-- Generate short video clips per scene (OpenAI Sora Video API)
-- Stitch clips + mux MP3 into chapter MP4s
-- Optionally concatenate chapters into one final MP4
+---
 
-## Run locally
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export OPENAI_API_KEY="sk-..."
-streamlit run app.py
+### What you get every time (no options, always-on)
+- `chapter_XX..._final_subs.mp4`  ✅ (subtitles embedded)
+- `chapter_XX....srt` ✅
+- `uappress_documentary_full.srt` ✅
+- `uappress_documentary_final_subs.mp4` ✅ (when not in 1-chapter test mode)
+- `uappress_video_outputs.zip` ✅
+
+If you upload one of your real Documentary TTS Studio ZIPs and tell me how the files are named (or paste a screenshot of the ZIP contents), I can tweak the pairing logic so it matches perfectly even when filenames aren’t numbered.
+::contentReference[oaicite:0]{index=0}
