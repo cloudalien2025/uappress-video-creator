@@ -1,6 +1,6 @@
-# app.py — UAPpress Video Creator (ZIP → MP4 with ALWAYS-ON subtitles)
+# app.py — UAPpress Video Creator (ZIP → Documentary MP4 with ALWAYS subtitles)
 import os
-import zipfile
+import json
 import streamlit as st
 from openai import OpenAI
 
@@ -29,8 +29,8 @@ st.title("🎬 UAPpress — ZIP → Documentary MP4 (Subtitles Always)")
 
 st.caption(
     "Upload the ZIP exported by Documentary TTS Studio (chapter scripts + MP3s). "
-    "This app generates AI video clips per chapter, stitches everything into MP4, "
-    "and ALWAYS generates + embeds subtitles (SRT + subtitle track in MP4)."
+    "This app generates AI visuals per chapter scene, stitches everything into MP4, "
+    "and ALWAYS generates + embeds subtitles."
 )
 
 with st.sidebar:
@@ -41,9 +41,9 @@ with st.sidebar:
 
     st.divider()
     st.header("🎥 Video")
-    video_model = st.selectbox("Video model", ["sora-2", "sora-2-pro"], index=0)
+    video_model = st.selectbox("Video model", ["sora-2", "sora-2-pro"], index=0)  # kept for UI compatibility
     size = st.selectbox("Resolution", ["1280x720", "720x1280"], index=0)
-    seconds = st.selectbox("Seconds per scene", [4, 8, 12], index=1)
+    seconds = st.selectbox("Seconds per scene (ignored in stretch mode)", [4, 8, 12], index=1)
     max_scenes = st.slider("Max scenes per chapter", 3, 14, 8)
 
     st.divider()
@@ -95,7 +95,7 @@ for i, p in enumerate(pairs, start=1):
     st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
 
 st.subheader("3) Build Videos (Subtitles Always)")
-st.warning("Video generation can be expensive. Testing with 1 chapter first is recommended.")
+st.warning("This pipeline can be expensive if you generate lots of scenes. Testing with 1 chapter first is recommended.")
 
 if st.button("🚀 Build MP4 + Subtitles"):
     if not api_key:
@@ -110,11 +110,9 @@ if st.button("🚀 Build MP4 + Subtitles"):
     status = st.empty()
 
     chapter_final_mp4s = []
-    chapter_srt_paths = []
     full_srt_parts = []
     cumulative_offset = 0.0
 
-    # rough progress budget: scenes + assembly per chapter
     total_units = sum(max_scenes for _ in to_run) + (len(to_run) * 4)
     done_units = 0
 
@@ -129,40 +127,56 @@ if st.button("🚀 Build MP4 + Subtitles"):
         chapter_text = read_script_file(p["script_path"])
         audio_path = p["audio_path"]
 
+        # ✅ Measure chapter duration (used for stretch method)
+        chapter_duration = float(get_media_duration_seconds(audio_path))
+
         # 1) plan scenes
         scenes = plan_scenes(
             client,
             chapter_title=title,
             chapter_text=chapter_text,
             max_scenes=max_scenes,
-            seconds_per_scene=int(seconds),
+            seconds_per_scene=int(seconds),  # planner hint only (we override actual rendering length)
             model=text_model,
         )
+
+        # ✅ Stretch method: divide chapter audio evenly across scenes
+        scene_count = max(1, len(scenes))
+        # Minimum 6 seconds so a very short chapter doesn't make 1-second clips
+        target_scene_seconds = max(6, int(round(chapter_duration / scene_count)))
+
         st.write("**Scene plan**")
         st.json(scenes)
-        write_text(os.path.join(chapter_dir, "scene_plan.json"), __import__("json").dumps(scenes, ensure_ascii=False, indent=2))
+        write_text(os.path.join(chapter_dir, "scene_plan.json"), json.dumps(scenes, ensure_ascii=False, indent=2))
+
+        st.info(
+            f"Stretch mode ON: Chapter audio ≈ {int(chapter_duration)}s, "
+            f"{scene_count} scenes → {target_scene_seconds}s per scene."
+        )
 
         # 2) generate clips
         scene_paths = []
         for sc in scenes:
             sc_no = sc["scene"]
-            sc_seconds = int(sc.get("seconds", seconds))
-            prompt = sc["prompt"]
 
+            # ✅ OVERRIDE per-scene seconds so visuals cover full chapter length
+            sc_seconds = target_scene_seconds
+
+            prompt = sc["prompt"]
             clip_path = os.path.join(chapter_dir, f"scene_{sc_no:02d}.mp4")
 
-            status.write(f"Generating video — Chapter {idx} Scene {sc_no} ({sc_seconds}s)")
+            status.write(f"Generating visuals — Chapter {idx} Scene {sc_no} ({sc_seconds}s)")
             if not os.path.exists(clip_path):
                 generate_video_clip(
                     client,
                     prompt=prompt,
                     seconds=sc_seconds,
                     size=size,
-                    model=video_model,
+                    model=video_model,   # kept for compatibility (image pipeline ignores this)
                     out_path=clip_path,
                 )
-            scene_paths.append(clip_path)
 
+            scene_paths.append(clip_path)
             done_units += 1
             progress.progress(min(done_units / max(total_units, 1), 1.0))
 
@@ -172,7 +186,6 @@ if st.button("🚀 Build MP4 + Subtitles"):
         try:
             concat_mp4s(scene_paths, stitched_path)
         except Exception:
-            # fallback: re-encode each scene then concat
             status.write("Concat-copy failed; re-encoding scenes for compatibility…")
             reencoded_scenes = []
             for sp in scene_paths:
@@ -193,25 +206,21 @@ if st.button("🚀 Build MP4 + Subtitles"):
         done_units += 1
         progress.progress(min(done_units / max(total_units, 1), 1.0))
 
-        # 5) ALWAYS generate subtitles (SRT)
+        # 5) ALWAYS generate subtitles (SRT) from chapter audio
         status.write(f"Transcribing subtitles — Chapter {idx}")
         srt_text = transcribe_audio_to_srt(client, audio_path, model=stt_model, language=language)
         srt_path = os.path.join(chapter_dir, f"{chapter_slug}.srt")
         write_text(srt_path, srt_text)
-        chapter_srt_paths.append(srt_path)
 
-        # Add to full SRT with time offset (based on audio duration)
+        # Add to full SRT with time offset
         shifted = shift_srt(srt_text, cumulative_offset)
         full_srt_parts.append(shifted)
-
-        # Update offset by chapter audio duration (best alignment)
-        dur = get_media_duration_seconds(audio_path)
-        cumulative_offset += float(dur)
+        cumulative_offset += chapter_duration
 
         done_units += 1
         progress.progress(min(done_units / max(total_units, 1), 1.0))
 
-        # 6) ALWAYS embed subtitles into chapter MP4 (soft subs)
+        # 6) ALWAYS embed subtitles (your video_pipeline embed method controls whether soft or burned-in)
         status.write(f"Embedding subtitles into MP4 — Chapter {idx}")
         chapter_final = os.path.join(chapter_dir, f"{chapter_slug}_final_subs.mp4")
         embed_srt_softsubs(chapter_with_audio, srt_path, chapter_final)
@@ -246,8 +255,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
     full_srt_text = renumber_srt_blocks(full_srt_text)
 
     full_srt_path = os.path.join(out_dir, "uappress_documentary_full.srt")
-    with open(full_srt_path, "w", encoding="utf-8") as f:
-        f.write(full_srt_text)
+    write_text(full_srt_path, full_srt_text)
 
     # Concatenate chapters into full documentary MP4
     if len(chapter_final_mp4s) > 1 and not only_first_chapter:
@@ -266,7 +274,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
                 reencoded_ch.append(rp)
             concat_mp4s(reencoded_ch, full_mp4)
 
-        # ALWAYS embed full subtitles into final MP4
+        # Embed full subtitles into final MP4
         status.write("Embedding full subtitles into final MP4…")
         full_mp4_subs = os.path.join(out_dir, "uappress_documentary_final_subs.mp4")
         embed_srt_softsubs(full_mp4, full_srt_path, full_mp4_subs)
@@ -290,11 +298,10 @@ if st.button("🚀 Build MP4 + Subtitles"):
                 file_name=os.path.basename(full_srt_path),
                 mime="text/plain",
             )
-
     else:
         st.info("Rendered only one chapter. Full documentary concat is skipped in testing mode.")
 
-    # Output ZIP (ALWAYS)
+    # Output ZIP
     status.write("Packaging outputs into ZIP…")
     out_zip_path = os.path.join(out_dir, "uappress_video_outputs.zip")
     zip_dir(out_dir, out_zip_path)
