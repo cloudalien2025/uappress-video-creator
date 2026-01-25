@@ -211,11 +211,17 @@ def plan_scenes(
     out: List[Dict] = []
     for i, sc in enumerate(scenes, start=1):
         out.append({
-            "scene": int(sc.get("scene", i)),
-            "seconds": int(sc.get("seconds", seconds_per_scene)),
-            "prompt": str(sc["prompt"]).strip(),
-            "on_screen_text": (str(sc["on_screen_text"]).strip() if sc.get("on_screen_text") else None),
-        })
+    # Always trust loop index, NOT model-provided scene labels
+    "scene": i,
+    "seconds": int(sc.get("seconds", seconds_per_scene)),
+    "prompt": str(sc.get("prompt", "")).strip(),
+    "on_screen_text": (
+        str(sc.get("on_screen_text")).strip()
+        if sc.get("on_screen_text") is not None
+        else None
+    ),
+})
+
     return out
 
 
