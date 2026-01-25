@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import io
-import json
 import os
 import re
-import shutil
-import subprocess
-import tempfile
+import json
 import time
 import zipfile
+import base64
+import tempfile
+import subprocess
 from typing import Dict, List, Optional, Tuple
 
 import imageio_ffmpeg
 from openai import OpenAI
 
+
+# ----------------------------
+# Extensions / discovery
+# ----------------------------
 
 SCRIPT_EXTS = {".txt", ".md", ".json"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".mpeg", ".mpga", ".ogg", ".webm", ".flac"}
@@ -166,9 +170,9 @@ def best_match_pairs(scripts: List[str], audios: List[str]) -> List[Dict]:
 # ----------------------------
 
 SCENE_PLANNER_SYSTEM = (
-    "You convert a documentary narration chapter into a list of short visual scenes for AI video generation. "
+    "You convert a documentary narration chapter into a list of short visual scenes for AI generation. "
     "Return STRICT JSON only: a list of objects with keys: scene, seconds, prompt, on_screen_text(optional). "
-    "Style: cinematic documentary b-roll and reenactment vibes; realistic lighting; camera movement notes. "
+    "Style: cinematic documentary b-roll / reenactment vibes; realistic lighting; camera movement notes. "
     "Avoid brand names, copyrighted characters, celebrity likeness, and explicit violence/gore. "
     "Keep prompts concise (1–3 sentences)."
 )
@@ -199,7 +203,6 @@ def plan_scenes(
     )
 
     text = (resp.output_text or "").strip()
-    # Extract JSON list if wrapped
     m = re.search(r"(\[\s*\{.*\}\s*\])", text, flags=re.S)
     if m:
         text = m.group(1)
@@ -217,47 +220,7 @@ def plan_scenes(
 
 
 # ----------------------------
-# Video generation (Sora) - sync polling
-# ----------------------------
-
-def generate_video_clip(
-    client: OpenAI,
-    *,
-    prompt: str,
-    seconds: int,
-    size: str,
-    model: str,
-    out_path: str,
-    poll_every_s: int = 2,
-) -> str:
-    """
-    Creates video job, polls until completed, downloads MP4 bytes to out_path.
-    """
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    video = client.videos.create(
-        model=model,
-        prompt=prompt,
-        seconds=str(seconds),
-        size=size,
-    )
-
-    while getattr(video, "status", None) in ("queued", "in_progress"):
-        time.sleep(poll_every_s)
-        video = client.videos.retrieve(video.id)
-
-    if getattr(video, "status", None) != "completed":
-        err = getattr(getattr(video, "error", None), "message", "Video generation failed")
-        raise RuntimeError(f"Video failed: {err}")
-
-    content = client.videos.download_content(video.id, variant="video")
-    # Stainless binary response has write_to_file
-    content.write_to_file(out_path)
-    return out_path
-
-
-# ----------------------------
-# Transcription -> SRT (always)
+# Transcription -> SRT
 # ----------------------------
 
 def transcribe_audio_to_srt(
@@ -278,12 +241,10 @@ def transcribe_audio_to_srt(
             language=language,
         )
 
-    # SDK may return a string or an object depending on version; handle both.
     if isinstance(tr, str):
         return tr
     if hasattr(tr, "text") and isinstance(tr.text, str):
         return tr.text
-    # fallback
     return str(tr)
 
 def write_text(path: str, text: str) -> None:
@@ -297,7 +258,6 @@ def write_text(path: str, text: str) -> None:
 # ----------------------------
 
 def srt_time_to_seconds(t: str) -> float:
-    # "HH:MM:SS,mmm"
     hh, mm, rest = t.split(":")
     ss, ms = rest.split(",")
     return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
@@ -311,7 +271,6 @@ def seconds_to_srt_time(x: float) -> str:
     x -= mm * 60
     ss = int(x)
     ms = int(round((x - ss) * 1000))
-    # normalize ms rollover
     if ms >= 1000:
         ss += 1
         ms -= 1000
@@ -324,9 +283,6 @@ def seconds_to_srt_time(x: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
 def shift_srt(srt_text: str, offset_seconds: float) -> str:
-    """
-    Adds offset to all cue times in an SRT.
-    """
     def repl(match: re.Match) -> str:
         start = match.group(1)
         end = match.group(2)
@@ -338,9 +294,6 @@ def shift_srt(srt_text: str, offset_seconds: float) -> str:
     return pattern.sub(repl, srt_text)
 
 def renumber_srt_blocks(srt_text: str) -> str:
-    """
-    Ensures sequential numbering after merges.
-    """
     blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.S)
     out_blocks = []
     n = 1
@@ -348,8 +301,7 @@ def renumber_srt_blocks(srt_text: str) -> str:
         lines = b.strip().splitlines()
         if not lines:
             continue
-        # drop first line if it's just a number
-        if re.fullmatch(r"\d+", lines[0].strip() or ""):
+        if re.fullmatch(r"\d+", (lines[0].strip() or "")):
             lines = lines[1:]
         out_blocks.append(str(n) + "\n" + "\n".join(lines))
         n += 1
@@ -395,9 +347,6 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     return out_path
 
 def embed_srt_softsubs(video_path: str, srt_path: str, out_path: str) -> str:
-    """
-    Embeds SRT as a toggleable subtitle track into MP4 (mov_text).
-    """
     ff = ffmpeg_exe()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     run_cmd([
@@ -415,9 +364,6 @@ def embed_srt_softsubs(video_path: str, srt_path: str, out_path: str) -> str:
     return out_path
 
 def reencode_mp4(in_path: str, out_path: str) -> str:
-    """
-    Re-encodes to common H.264/AAC (useful if concat-copy fails).
-    """
     ff = ffmpeg_exe()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     run_cmd([
@@ -429,6 +375,109 @@ def reencode_mp4(in_path: str, out_path: str) -> str:
         "-movflags", "+faststart",
         out_path
     ])
+    return out_path
+
+
+# ----------------------------
+# ✅ FIX: generate_video_clip now uses Image -> ffmpeg motion -> MP4
+# ----------------------------
+
+def _parse_size(size: str) -> Tuple[int, int]:
+    # "1280x720"
+    if "x" not in size:
+        return 1280, 720
+    w, h = size.lower().split("x", 1)
+    try:
+        return int(w), int(h)
+    except Exception:
+        return 1280, 720
+
+def _best_image_size_for_video(w: int, h: int) -> str:
+    # gpt-image-1 supports: 1024x1024, 1792x1024, 1024x1792 (common)
+    if w >= h:
+        return "1792x1024"
+    return "1024x1792"
+
+def generate_video_clip(
+    client: OpenAI,
+    *,
+    prompt: str,
+    seconds: int,
+    size: str,
+    model: str,     # kept for compatibility with app.py, but not used now
+    out_path: str,
+) -> str:
+    """
+    Generates a scene clip WITHOUT using OpenAI video generation.
+    This avoids 'blocked by moderation' errors from the video endpoint.
+
+    Flow:
+      prompt -> OpenAI image -> ffmpeg Ken Burns motion -> mp4
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    W, H = _parse_size(size)
+    img_size = _best_image_size_for_video(W, H)
+
+    # 1) Generate an image
+    img_prompt = (
+        prompt
+        + "\n\nStyle notes: cinematic documentary b-roll, realistic lighting, "
+          "photorealistic, no text overlays, no logos, no watermarks."
+    )
+
+    try:
+        img = client.images.generate(
+            model="gpt-image-1",
+            prompt=img_prompt,
+            size=img_size,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Image generation failed (gpt-image-1). {type(e).__name__}: {e}")
+
+    try:
+        b64 = img.data[0].b64_json
+        img_bytes = base64.b64decode(b64)
+    except Exception as e:
+        raise RuntimeError(f"Could not decode image bytes. {type(e).__name__}: {e}")
+
+    # Save image next to clip
+    png_path = out_path.replace(".mp4", ".png")
+    with open(png_path, "wb") as f:
+        f.write(img_bytes)
+
+    # 2) Animate image into video (Ken Burns zoom/pan)
+    ff = ffmpeg_exe()
+    fps = 30
+    frames = max(1, int(seconds * fps))
+
+    # zoompan does the motion. We keep it subtle.
+    # Notes:
+    # - scale to output size first
+    # - zoom gradually to ~1.08
+    # - fps + format for widest compatibility
+    vf = (
+        f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"crop={W}:{H},"
+        f"zoompan=z='min(zoom+0.0008,1.08)':"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"d={frames}:s={W}x{H},"
+        f"fps={fps},"
+        f"format=yuv420p"
+    )
+
+    run_cmd([
+        ff, "-y",
+        "-loop", "1",
+        "-i", png_path,
+        "-t", str(seconds),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        out_path
+    ])
+
     return out_path
 
 
