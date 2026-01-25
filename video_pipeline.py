@@ -282,3 +282,166 @@ def transcribe_audio_to_srt(
     if isinstance(tr, str):
         return tr
     if hasattr(tr, "text") and isinstance(tr.text, str):
+        return tr.text
+    # fallback
+    return str(tr)
+
+def write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+# ----------------------------
+# SRT shifting / merging
+# ----------------------------
+
+def srt_time_to_seconds(t: str) -> float:
+    # "HH:MM:SS,mmm"
+    hh, mm, rest = t.split(":")
+    ss, ms = rest.split(",")
+    return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+
+def seconds_to_srt_time(x: float) -> str:
+    if x < 0:
+        x = 0.0
+    hh = int(x // 3600)
+    x -= hh * 3600
+    mm = int(x // 60)
+    x -= mm * 60
+    ss = int(x)
+    ms = int(round((x - ss) * 1000))
+    # normalize ms rollover
+    if ms >= 1000:
+        ss += 1
+        ms -= 1000
+    if ss >= 60:
+        mm += 1
+        ss -= 60
+    if mm >= 60:
+        hh += 1
+        mm -= 60
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+def shift_srt(srt_text: str, offset_seconds: float) -> str:
+    """
+    Adds offset to all cue times in an SRT.
+    """
+    def repl(match: re.Match) -> str:
+        start = match.group(1)
+        end = match.group(2)
+        s = seconds_to_srt_time(srt_time_to_seconds(start) + offset_seconds)
+        e = seconds_to_srt_time(srt_time_to_seconds(end) + offset_seconds)
+        return f"{s} --> {e}"
+
+    pattern = re.compile(r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})")
+    return pattern.sub(repl, srt_text)
+
+def renumber_srt_blocks(srt_text: str) -> str:
+    """
+    Ensures sequential numbering after merges.
+    """
+    blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.S)
+    out_blocks = []
+    n = 1
+    for b in blocks:
+        lines = b.strip().splitlines()
+        if not lines:
+            continue
+        # drop first line if it's just a number
+        if re.fullmatch(r"\d+", lines[0].strip() or ""):
+            lines = lines[1:]
+        out_blocks.append(str(n) + "\n" + "\n".join(lines))
+        n += 1
+    return "\n\n".join(out_blocks) + "\n"
+
+
+# ----------------------------
+# ffmpeg assembly: concat, mux, embed subtitles
+# ----------------------------
+
+def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
+    ff = ffmpeg_exe()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+        for p in mp4_paths:
+            tf.write(f"file '{p}'\n")
+        list_path = tf.name
+
+    try:
+        run_cmd([ff, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path])
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+
+    return out_path
+
+def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
+    ff = ffmpeg_exe()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    run_cmd([
+        ff, "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        "-movflags", "+faststart",
+        out_path
+    ])
+    return out_path
+
+def embed_srt_softsubs(video_path: str, srt_path: str, out_path: str) -> str:
+    """
+    Embeds SRT as a toggleable subtitle track into MP4 (mov_text).
+    """
+    ff = ffmpeg_exe()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    run_cmd([
+        ff, "-y",
+        "-i", video_path,
+        "-i", srt_path,
+        "-map", "0",
+        "-map", "1",
+        "-c", "copy",
+        "-c:s", "mov_text",
+        "-metadata:s:s:0", "language=eng",
+        "-movflags", "+faststart",
+        out_path
+    ])
+    return out_path
+
+def reencode_mp4(in_path: str, out_path: str) -> str:
+    """
+    Re-encodes to common H.264/AAC (useful if concat-copy fails).
+    """
+    ff = ffmpeg_exe()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    run_cmd([
+        ff, "-y",
+        "-i", in_path,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        out_path
+    ])
+    return out_path
+
+
+# ----------------------------
+# Packaging outputs
+# ----------------------------
+
+def zip_dir(dir_path: str, zip_path: str) -> str:
+    os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(dir_path):
+            for f in files:
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, dir_path)
+                z.write(full, rel)
+    return zip_path
