@@ -1,6 +1,7 @@
 # app.py — UAPpress Video Creator (ZIP → Documentary MP4 with ALWAYS subtitles)
 import os
 import json
+import math
 import streamlit as st
 from openai import OpenAI
 
@@ -29,7 +30,7 @@ st.title("🎬 UAPpress — ZIP → Documentary MP4 (Subtitles Always)")
 
 st.caption(
     "Upload the ZIP exported by Documentary TTS Studio (chapter scripts + MP3s). "
-    "This app generates AI visuals per chapter scene, stitches everything into MP4, "
+    "This app generates AI visuals per chapter, stitches into MP4, "
     "and ALWAYS generates + embeds subtitles."
 )
 
@@ -95,7 +96,7 @@ for i, p in enumerate(pairs, start=1):
     st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
 
 st.subheader("3) Build Videos (Subtitles Always)")
-st.warning("This pipeline can be expensive if you generate lots of scenes. Testing with 1 chapter first is recommended.")
+st.warning("Testing with 1 chapter first is recommended.")
 
 if st.button("🚀 Build MP4 + Subtitles"):
     if not api_key:
@@ -136,31 +137,35 @@ if st.button("🚀 Build MP4 + Subtitles"):
             chapter_title=title,
             chapter_text=chapter_text,
             max_scenes=max_scenes,
-            seconds_per_scene=int(seconds),  # planner hint only (we override actual rendering length)
+            seconds_per_scene=int(seconds),  # planner hint only
             model=text_model,
         )
 
-        # ✅ Stretch method: divide chapter audio evenly across scenes
         scene_count = max(1, len(scenes))
-        # Minimum 6 seconds so a very short chapter doesn't make 1-second clips
-        target_scene_seconds = max(6, int(round(chapter_duration / scene_count)))
+
+        # ✅ FIXED STRETCH:
+        # Make TOTAL video >= audio length (so ffmpeg -shortest never chops narration).
+        # We take ceil(duration) + 1s padding, then distribute seconds across scenes.
+        total_needed = int(math.ceil(chapter_duration)) + 1
+        base = max(6, total_needed // scene_count)
+        rem = total_needed % scene_count  # first 'rem' scenes get +1 second
 
         st.write("**Scene plan**")
         st.json(scenes)
         write_text(os.path.join(chapter_dir, "scene_plan.json"), json.dumps(scenes, ensure_ascii=False, indent=2))
 
         st.info(
-            f"Stretch mode ON: Chapter audio ≈ {int(chapter_duration)}s, "
-            f"{scene_count} scenes → {target_scene_seconds}s per scene."
+            f"Stretch mode FIXED: audio ≈ {chapter_duration:.2f}s, scenes={scene_count}, "
+            f"total video target={total_needed}s → base={base}s, remainder={rem}s."
         )
 
         # 2) generate clips
         scene_paths = []
-        for sc in scenes:
+        for j, sc in enumerate(scenes, start=1):
             sc_no = sc["scene"]
 
-            # ✅ OVERRIDE per-scene seconds so visuals cover full chapter length
-            sc_seconds = target_scene_seconds
+            # Distribute remainder seconds across first 'rem' scenes
+            sc_seconds = base + (1 if j <= rem else 0)
 
             prompt = sc["prompt"]
             clip_path = os.path.join(chapter_dir, f"scene_{sc_no:02d}.mp4")
@@ -172,7 +177,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
                     prompt=prompt,
                     seconds=sc_seconds,
                     size=size,
-                    model=video_model,   # kept for compatibility (image pipeline ignores this)
+                    model=video_model,   # image pipeline ignores this
                     out_path=clip_path,
                 )
 
@@ -198,7 +203,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
         done_units += 1
         progress.progress(min(done_units / max(total_units, 1), 1.0))
 
-        # 4) mux audio
+        # 4) mux audio (safe now because video >= audio)
         status.write(f"Adding narration audio — Chapter {idx}")
         chapter_with_audio = os.path.join(chapter_dir, f"{chapter_slug}_audio.mp4")
         mux_audio(stitched_path, audio_path, chapter_with_audio)
@@ -206,13 +211,12 @@ if st.button("🚀 Build MP4 + Subtitles"):
         done_units += 1
         progress.progress(min(done_units / max(total_units, 1), 1.0))
 
-        # 5) ALWAYS generate subtitles (SRT) from chapter audio
+        # 5) subtitles (SRT)
         status.write(f"Transcribing subtitles — Chapter {idx}")
         srt_text = transcribe_audio_to_srt(client, audio_path, model=stt_model, language=language)
         srt_path = os.path.join(chapter_dir, f"{chapter_slug}.srt")
         write_text(srt_path, srt_text)
 
-        # Add to full SRT with time offset
         shifted = shift_srt(srt_text, cumulative_offset)
         full_srt_parts.append(shifted)
         cumulative_offset += chapter_duration
@@ -220,7 +224,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
         done_units += 1
         progress.progress(min(done_units / max(total_units, 1), 1.0))
 
-        # 6) ALWAYS embed subtitles (your video_pipeline embed method controls whether soft or burned-in)
+        # 6) embed/burn subtitles (video_pipeline controls behavior)
         status.write(f"Embedding subtitles into MP4 — Chapter {idx}")
         chapter_final = os.path.join(chapter_dir, f"{chapter_slug}_final_subs.mp4")
         embed_srt_softsubs(chapter_with_audio, srt_path, chapter_final)
@@ -249,7 +253,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
                 key=f"dl_srt_{idx}",
             )
 
-    # Build full SRT
+    # Full SRT
     status.write("Building full SRT…")
     full_srt_text = "\n\n".join([p.strip() for p in full_srt_parts if p.strip()])
     full_srt_text = renumber_srt_blocks(full_srt_text)
@@ -257,7 +261,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
     full_srt_path = os.path.join(out_dir, "uappress_documentary_full.srt")
     write_text(full_srt_path, full_srt_text)
 
-    # Concatenate chapters into full documentary MP4
+    # Full documentary concat
     if len(chapter_final_mp4s) > 1 and not only_first_chapter:
         status.write("Concatenating full documentary MP4…")
         full_mp4 = os.path.join(out_dir, "uappress_documentary_final.mp4")
@@ -274,7 +278,6 @@ if st.button("🚀 Build MP4 + Subtitles"):
                 reencoded_ch.append(rp)
             concat_mp4s(reencoded_ch, full_mp4)
 
-        # Embed full subtitles into final MP4
         status.write("Embedding full subtitles into final MP4…")
         full_mp4_subs = os.path.join(out_dir, "uappress_documentary_final_subs.mp4")
         embed_srt_softsubs(full_mp4, full_srt_path, full_mp4_subs)
