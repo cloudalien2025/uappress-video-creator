@@ -211,17 +211,16 @@ def plan_scenes(
     out: List[Dict] = []
     for i, sc in enumerate(scenes, start=1):
         out.append({
-    # Always trust loop index, NOT model-provided scene labels
-    "scene": i,
-    "seconds": int(sc.get("seconds", seconds_per_scene)),
-    "prompt": str(sc.get("prompt", "")).strip(),
-    "on_screen_text": (
-        str(sc.get("on_screen_text")).strip()
-        if sc.get("on_screen_text") is not None
-        else None
-    ),
-})
-
+            # ✅ Robust: always trust the loop index, not model-provided scene labels
+            "scene": i,
+            "seconds": int(sc.get("seconds", seconds_per_scene)),
+            "prompt": str(sc.get("prompt", "")).strip(),
+            "on_screen_text": (
+                str(sc.get("on_screen_text")).strip()
+                if sc.get("on_screen_text") is not None
+                else None
+            ),
+        })
     return out
 
 
@@ -315,7 +314,7 @@ def renumber_srt_blocks(srt_text: str) -> str:
 
 
 # ----------------------------
-# ffmpeg assembly: concat, mux, embed subtitles
+# ffmpeg assembly: concat, mux, subtitles
 # ----------------------------
 
 def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
@@ -352,22 +351,41 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     ])
     return out_path
 
-def embed_srt_softsubs(video_path: str, srt_path: str, out_path: str) -> str:
+def _escape_for_ffmpeg_filter(path: str) -> str:
+    """
+    Escape for ffmpeg subtitles filter on Linux.
+    """
+    # backslashes first, then colon (windows paths), then single quotes
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+def burn_in_subtitles(video_path: str, srt_path: str, out_path: str) -> str:
+    """
+    Burns subtitles into video (always visible). Re-encodes.
+    """
     ff = ffmpeg_exe()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    srt_escaped = _escape_for_ffmpeg_filter(srt_path)
+
     run_cmd([
         ff, "-y",
         "-i", video_path,
-        "-i", srt_path,
-        "-map", "0",
-        "-map", "1",
-        "-c", "copy",
-        "-c:s", "mov_text",
-        "-metadata:s:s:0", "language=eng",
+        "-vf", f"subtitles='{srt_escaped}'",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
         "-movflags", "+faststart",
         out_path
     ])
     return out_path
+
+def embed_srt_softsubs(video_path: str, srt_path: str, out_path: str) -> str:
+    """
+    ✅ IMPORTANT:
+    We keep this function name/signature so app.py doesn't need to change,
+    but it now BURNS subtitles into the video so they are ALWAYS visible.
+    """
+    return burn_in_subtitles(video_path, srt_path, out_path)
 
 def reencode_mp4(in_path: str, out_path: str) -> str:
     ff = ffmpeg_exe()
@@ -385,7 +403,7 @@ def reencode_mp4(in_path: str, out_path: str) -> str:
 
 
 # ----------------------------
-# ✅ FIX: generate_video_clip now uses Image -> ffmpeg motion -> MP4
+# ✅ Image -> Ken Burns MP4 generation (with retries + safe sizing)
 # ----------------------------
 
 def _parse_size(size: str) -> Tuple[int, int]:
@@ -407,8 +425,8 @@ def _best_image_size_for_video(w: int, h: int) -> str:
     - auto
     """
     if w >= h:
-        return "1536x1024"   # landscape
-    return "1024x1536"       # portrait
+        return "1536x1024"
+    return "1024x1536"
 
 def generate_video_clip(
     client: OpenAI,
@@ -416,37 +434,59 @@ def generate_video_clip(
     prompt: str,
     seconds: int,
     size: str,
-    model: str,     # kept for compatibility with app.py, but not used now
+    model: str,     # kept for compatibility with app.py (not used)
     out_path: str,
 ) -> str:
     """
-    Generates a scene clip WITHOUT using OpenAI video generation.
-    This avoids 'blocked by moderation' errors from the video endpoint.
-
+    Generates a scene clip WITHOUT OpenAI video endpoint (avoids moderation blocks).
     Flow:
       prompt -> OpenAI image -> ffmpeg Ken Burns motion -> mp4
+
+    Patches included:
+    - Retries + backoff for image generation
+    - Fallback to size="auto"
+    - Consistent MP4 encoding to prevent concat stopping at the end
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     W, H = _parse_size(size)
     img_size = _best_image_size_for_video(W, H)
 
-    # 1) Generate an image
     img_prompt = (
         prompt
         + "\n\nStyle notes: cinematic documentary b-roll, realistic lighting, "
           "photorealistic, no text overlays, no logos, no watermarks."
     )
 
-    try:
-        img = client.images.generate(
-            model="gpt-image-1",
-            prompt=img_prompt,
-            size=img_size,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Image generation failed (gpt-image-1). {type(e).__name__}: {e}")
+    # ✅ Retry image generation (handles intermittent 429/5xx)
+    img = None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            img = client.images.generate(
+                model="gpt-image-1",
+                prompt=img_prompt,
+                size=img_size,
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * attempt)
 
+    # ✅ Fallback to size="auto" if size-specific fails
+    if img is None and last_err is not None:
+        try:
+            img = client.images.generate(
+                model="gpt-image-1",
+                prompt=img_prompt,
+                size="auto",
+            )
+            last_err = None
+        except Exception as e:
+            raise RuntimeError(f"Image generation failed (gpt-image-1). {type(e).__name__}: {e}") from e
+
+    # Decode b64
     try:
         b64 = img.data[0].b64_json
         img_bytes = base64.b64decode(b64)
@@ -458,16 +498,11 @@ def generate_video_clip(
     with open(png_path, "wb") as f:
         f.write(img_bytes)
 
-    # 2) Animate image into video (Ken Burns zoom/pan)
+    # Animate image into video (Ken Burns zoom/pan)
     ff = ffmpeg_exe()
     fps = 30
     frames = max(1, int(seconds * fps))
 
-    # zoompan does the motion. We keep it subtle.
-    # Notes:
-    # - scale to output size first
-    # - zoom gradually to ~1.08
-    # - fps + format for widest compatibility
     vf = (
         f"scale={W}:{H}:force_original_aspect_ratio=increase,"
         f"crop={W}:{H},"
@@ -478,14 +513,19 @@ def generate_video_clip(
         f"format=yuv420p"
     )
 
+    # ✅ Consistent encoding (reduces concat failures)
     run_cmd([
         ff, "-y",
         "-loop", "1",
         "-i", png_path,
         "-t", str(seconds),
         "-vf", vf,
+        "-r", "30",
         "-c:v", "libx264",
+        "-profile:v", "high",
+        "-level", "4.1",
         "-pix_fmt", "yuv420p",
+        "-g", "60",
         "-movflags", "+faststart",
         out_path
     ])
