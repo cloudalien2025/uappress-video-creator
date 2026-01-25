@@ -1,26 +1,30 @@
 # video_pipeline.py
 from __future__ import annotations
 
-import asyncio
+import io
+import json
 import os
 import re
-import json
-import time
 import shutil
-import tempfile
 import subprocess
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+import tempfile
+import time
+import zipfile
+from typing import Dict, List, Optional, Tuple
 
 import imageio_ffmpeg
-from openai import OpenAI, AsyncOpenAI
+from openai import OpenAI
+
+
+SCRIPT_EXTS = {".txt", ".md", ".json"}
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".mpeg", ".mpga", ".ogg", ".webm", ".flac"}
 
 
 # ----------------------------
-# utils
+# OS / ffmpeg helpers
 # ----------------------------
 
-def ffmpeg_path() -> str:
+def ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 def run_cmd(cmd: List[str]) -> None:
@@ -41,12 +45,6 @@ def safe_slug(s: str, max_len: int = 80) -> str:
     return (s[:max_len] if s else "chapter")
 
 def extract_int_prefix(name: str) -> Optional[int]:
-    """
-    Best-effort chapter number extraction:
-      "01 - Intro.mp3" -> 1
-      "Chapter 12 ...txt" -> 12
-      "1_intro.txt" -> 1
-    """
     base = os.path.basename(name)
     m = re.search(r"(^|\b)(\d{1,3})(\b|_|\s|-)", base)
     if not m:
@@ -56,13 +54,38 @@ def extract_int_prefix(name: str) -> Optional[int]:
     except Exception:
         return None
 
+def get_media_duration_seconds(path: str) -> float:
+    """
+    Uses `ffmpeg -i` stderr parsing (works even without ffprobe).
+    """
+    ff = ffmpeg_exe()
+    p = subprocess.run([ff, "-i", path], capture_output=True, text=True)
+    txt = (p.stderr or "") + "\n" + (p.stdout or "")
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", txt)
+    if not m:
+        return 0.0
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    ss = float(m.group(3))
+    return hh * 3600 + mm * 60 + ss
+
 
 # ----------------------------
-# finding inputs inside ZIP
+# ZIP + file discovery
 # ----------------------------
 
-SCRIPT_EXTS = {".txt", ".md", ".json"}
-AUDIO_EXTS = {".mp3", ".wav", ".m4a"}
+def extract_zip_to_temp(zip_bytes: bytes) -> Tuple[str, str]:
+    """
+    Returns (workdir, extract_dir)
+    """
+    workdir = tempfile.mkdtemp(prefix="uappress_video_")
+    extract_dir = os.path.join(workdir, "extracted")
+    os.makedirs(extract_dir, exist_ok=True)
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        z.extractall(extract_dir)
+
+    return workdir, extract_dir
 
 def find_files(root_dir: str) -> Tuple[List[str], List[str]]:
     scripts, audios = [], []
@@ -79,14 +102,12 @@ def find_files(root_dir: str) -> Tuple[List[str], List[str]]:
 def read_script_file(path: str) -> str:
     ext = os.path.splitext(path.lower())[1]
     if ext == ".json":
-        # allow a few formats: {"text": "..."} or {"chapter_text":"..."} etc.
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             data = json.load(f)
         if isinstance(data, dict):
             for k in ["text", "chapter_text", "content", "script"]:
                 if k in data and isinstance(data[k], str):
-                    return data[k]
-        # fallback
+                    return data[k].strip()
         return json.dumps(data, ensure_ascii=False, indent=2)
     else:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -94,44 +115,37 @@ def read_script_file(path: str) -> str:
 
 def best_match_pairs(scripts: List[str], audios: List[str]) -> List[Dict]:
     """
-    Attempts to pair script + audio by:
-      1) shared chapter number prefix
-      2) similar filename tokens
-    Returns list of dicts: {chapter_no, title_guess, script_path, audio_path}
+    Pair script + audio by chapter number if possible; fallback to token overlap.
     """
-    # index audios by chapter number if possible
     audio_by_num: Dict[int, List[str]] = {}
     for a in audios:
         n = extract_int_prefix(a)
         if n is not None:
             audio_by_num.setdefault(n, []).append(a)
 
-    def score(script_path: str, audio_path: str) -> int:
+    def token_score(script_path: str, audio_path: str) -> int:
         sname = os.path.splitext(os.path.basename(script_path).lower())[0]
         aname = os.path.splitext(os.path.basename(audio_path).lower())[0]
-        stoks = set(re.split(r"[^a-z0-9]+", sname))
-        atoks = set(re.split(r"[^a-z0-9]+", aname))
-        stoks.discard(""); atoks.discard("")
+        stoks = set(re.split(r"[^a-z0-9]+", sname)); stoks.discard("")
+        atoks = set(re.split(r"[^a-z0-9]+", aname)); atoks.discard("")
         return len(stoks.intersection(atoks))
 
     pairs = []
     used_audio = set()
 
-    # First pass: match by number
     for s in sorted(scripts):
         sn = extract_int_prefix(s)
         best_a = None
+
         if sn is not None and sn in audio_by_num:
-            # pick the first unused, else best token match
             candidates = [a for a in audio_by_num[sn] if a not in used_audio]
             if candidates:
-                best_a = max(candidates, key=lambda a: score(s, a))
+                best_a = max(candidates, key=lambda a: token_score(s, a))
 
-        # Second pass: best token match overall
         if best_a is None:
             candidates = [a for a in audios if a not in used_audio]
             if candidates:
-                best_a = max(candidates, key=lambda a: score(s, a))
+                best_a = max(candidates, key=lambda a: token_score(s, a))
 
         if best_a:
             used_audio.add(best_a)
@@ -140,18 +154,15 @@ def best_match_pairs(scripts: List[str], audios: List[str]) -> List[Dict]:
                 "chapter_no": sn,
                 "title_guess": base,
                 "script_path": s,
-                "audio_path": best_a
+                "audio_path": best_a,
             })
 
-    # Sort: numeric first, then name
-    def sort_key(p):
-        return (p["chapter_no"] if p["chapter_no"] is not None else 9999, p["title_guess"].lower())
-    pairs.sort(key=sort_key)
+    pairs.sort(key=lambda p: (p["chapter_no"] if p["chapter_no"] is not None else 9999, p["title_guess"].lower()))
     return pairs
 
 
 # ----------------------------
-# scene planning
+# Scene planning (text -> JSON scenes)
 # ----------------------------
 
 SCENE_PLANNER_SYSTEM = (
@@ -159,7 +170,7 @@ SCENE_PLANNER_SYSTEM = (
     "Return STRICT JSON only: a list of objects with keys: scene, seconds, prompt, on_screen_text(optional). "
     "Style: cinematic documentary b-roll and reenactment vibes; realistic lighting; camera movement notes. "
     "Avoid brand names, copyrighted characters, celebrity likeness, and explicit violence/gore. "
-    "No medical claims. No hateful or sexual content. Keep prompts concise."
+    "Keep prompts concise (1–3 sentences)."
 )
 
 def plan_scenes(
@@ -176,19 +187,19 @@ def plan_scenes(
         "max_scenes": max_scenes,
         "seconds_per_scene": seconds_per_scene,
         "chapter_text": chapter_text,
-        "output": "STRICT_JSON_LIST_ONLY"
+        "output": "STRICT_JSON_LIST_ONLY",
     }
 
     resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": SCENE_PLANNER_SYSTEM},
-            {"role": "user", "content": json.dumps(payload)}
+            {"role": "user", "content": json.dumps(payload)},
         ],
     )
-    text = resp.output_text.strip()
 
-    # Extract JSON list if model wrapped it
+    text = (resp.output_text or "").strip()
+    # Extract JSON list if wrapped
     m = re.search(r"(\[\s*\{.*\}\s*\])", text, flags=re.S)
     if m:
         text = m.group(1)
@@ -206,102 +217,68 @@ def plan_scenes(
 
 
 # ----------------------------
-# video generation
+# Video generation (Sora) - sync polling
 # ----------------------------
 
-async def generate_clip_bytes(
-    client: AsyncOpenAI,
+def generate_video_clip(
+    client: OpenAI,
     *,
     prompt: str,
     seconds: int,
     size: str,
     model: str,
-) -> bytes:
+    out_path: str,
+    poll_every_s: int = 2,
+) -> str:
     """
-    Uses OpenAI Sora Video API.
-    Async job: create_and_poll -> download_content (MP4 bytes). :contentReference[oaicite:1]{index=1}
+    Creates video job, polls until completed, downloads MP4 bytes to out_path.
     """
-    video = await client.videos.create_and_poll(
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    video = client.videos.create(
         model=model,
         prompt=prompt,
         seconds=str(seconds),
         size=size,
     )
-    if video.status != "completed":
-        raise RuntimeError(f"Video job did not complete: status={video.status} id={video.id}")
 
-    content = client.videos.download_content(video_id=video.id)
-    return content.read()
+    while getattr(video, "status", None) in ("queued", "in_progress"):
+        time.sleep(poll_every_s)
+        video = client.videos.retrieve(video.id)
 
-def write_bytes(path: str, b: bytes) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(b)
+    if getattr(video, "status", None) != "completed":
+        err = getattr(getattr(video, "error", None), "message", "Video generation failed")
+        raise RuntimeError(f"Video failed: {err}")
+
+    content = client.videos.download_content(video.id, variant="video")
+    # Stainless binary response has write_to_file
+    content.write_to_file(out_path)
+    return out_path
 
 
 # ----------------------------
-# ffmpeg assembly
+# Transcription -> SRT (always)
 # ----------------------------
 
-def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
-    ffmpeg = ffmpeg_path()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    # concat demuxer list
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
-        for p in mp4_paths:
-            tf.write(f"file '{p}'\n")
-        list_path = tf.name
-
-    try:
-        run_cmd([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path])
-    finally:
-        try:
-            os.remove(list_path)
-        except OSError:
-            pass
-
-    return out_path
-
-def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
-    ffmpeg = ffmpeg_path()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    run_cmd([
-        ffmpeg, "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        out_path
-    ])
-    return out_path
-
-def reencode_if_needed(in_path: str, out_path: str) -> str:
+def transcribe_audio_to_srt(
+    client: OpenAI,
+    audio_path: str,
+    *,
+    model: str = "whisper-1",
+    language: str = "en",
+) -> str:
     """
-    Optional safety net if concat-copy fails due to codec mismatch.
-    Re-encodes to H.264/AAC for consistent concatenation.
+    Returns SRT string. Uses whisper-1 for reliable SRT output.
     """
-    ffmpeg = ffmpeg_path()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    run_cmd([
-        ffmpeg, "-y",
-        "-i", in_path,
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        out_path
-    ])
-    return out_path
+    with open(audio_path, "rb") as f:
+        tr = client.audio.transcriptions.create(
+            model=model,
+            file=f,
+            response_format="srt",
+            language=language,
+        )
 
-def build_chapter_mp4(scene_mp4s: List[str], mp3_path: str, out_dir: str, chapter_slug: str) -> str:
-    stitched = os.path.join(out_dir, f"{chapter_slug}_stitched.mp4")
-    final = os.path.join(out_dir, f"{chapter_slug}_final.mp4")
-    concat_mp4s(scene_mp4s, stitched)
-    mux_audio(stitched, mp3_path, final)
-    return final
-
-def build_full_documentary(chapter_mp4s: List[str], out_path: str) -> str:
-    return concat_mp4s(chapter_mp4s, out_path)
+    # SDK may return a string or an object depending on version; handle both.
+    if isinstance(tr, str):
+        return tr
+    if hasattr(tr, "text") and isinstance(tr.text, str):
