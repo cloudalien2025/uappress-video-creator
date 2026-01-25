@@ -399,10 +399,16 @@ def _parse_size(size: str) -> Tuple[int, int]:
         return 1280, 720
 
 def _best_image_size_for_video(w: int, h: int) -> str:
-    # gpt-image-1 supports: 1024x1024, 1792x1024, 1024x1792 (common)
+    """
+    gpt-image-1 supported sizes:
+    - 1024x1024
+    - 1536x1024 (landscape)
+    - 1024x1536 (portrait)
+    - auto
+    """
     if w >= h:
-        return "1792x1024"
-    return "1024x1792"
+        return "1536x1024"   # landscape
+    return "1024x1536"       # portrait
 
 def generate_video_clip(
     client: OpenAI,
