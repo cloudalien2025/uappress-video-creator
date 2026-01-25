@@ -146,7 +146,7 @@ if st.button("🚀 Build MP4 + Subtitles"):
         # ✅ FIXED STRETCH:
         # Make TOTAL video >= audio length (so ffmpeg -shortest never chops narration).
         # We take ceil(duration) + 1s padding, then distribute seconds across scenes.
-        total_needed = int(math.ceil(chapter_duration)) + 1
+        total_needed = int(math.ceil(chapter_duration)) + 2
         base = max(6, total_needed // scene_count)
         rem = total_needed % scene_count  # first 'rem' scenes get +1 second
 
