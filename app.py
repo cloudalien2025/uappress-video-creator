@@ -1,4 +1,4 @@
-# app.py — UAPpress ZIP → Documentary MP4 Studio (ZIP-Only)
+# app.py — UAPpress ZIP → Documentary MP4 Studio (ZIP-only, capped intro/outro, stretch-safe)
 import os
 import json
 import math
@@ -9,7 +9,6 @@ from openai import OpenAI
 from video_pipeline import (
     extract_zip_to_temp,
     find_files,
-    best_match_pairs,
     read_script_file,
     plan_scenes,
     generate_video_clip,
@@ -27,22 +26,143 @@ from video_pipeline import (
 )
 
 # ----------------------------
-# Helpers
+# Pairing (robust intro/outro + chapter number matching)
+# ----------------------------
+
+def _norm_tokens(s: str) -> set[str]:
+    import re
+    s = (s or "").lower()
+    toks = set(re.split(r"[^a-z0-9]+", s))
+    toks.discard("")
+    return toks
+
+def _chapter_no_from_name(name: str) -> int | None:
+    import re
+    base = os.path.splitext(os.path.basename(name))[0].lower()
+    # match chapter_03, chapter-03, chapter 03, ch03, etc.
+    m = re.search(r"(?:chapter|ch)[\s_\-]*0*(\d{1,3})\b", base)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    # fallback: any standalone number
+    m2 = re.search(r"\b0*(\d{1,3})\b", base)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except Exception:
+            return None
+    return None
+
+def _is_intro_name(name: str) -> bool:
+    b = os.path.splitext(os.path.basename(name))[0].lower()
+    return b.startswith("intro") or b == "intro" or " intro" in b or "_intro" in b or "-intro" in b
+
+def _is_outro_name(name: str) -> bool:
+    b = os.path.splitext(os.path.basename(name))[0].lower()
+    return b.startswith("outro") or b == "outro" or " outro" in b or "_outro" in b or "-outro" in b
+
+def pair_segments(scripts: list[str], audios: list[str]) -> list[dict]:
+    """
+    Creates pairs:
+      - intro script ↔ intro audio (by name)
+      - outro script ↔ outro audio (by name)
+      - chapter_N script ↔ chapter_N audio (by extracted chapter number)
+    Falls back to token overlap only if needed.
+    """
+    intro_script = next((s for s in scripts if _is_intro_name(s)), None)
+    outro_script = next((s for s in scripts if _is_outro_name(s)), None)
+
+    intro_audio = next((a for a in audios if _is_intro_name(a)), None)
+    outro_audio = next((a for a in audios if _is_outro_name(a)), None)
+
+    scripts_left = [s for s in scripts if s not in {intro_script, outro_script}]
+    audios_left = [a for a in audios if a not in {intro_audio, outro_audio}]
+
+    audio_by_no: dict[int, list[str]] = {}
+    for a in audios_left:
+        n = _chapter_no_from_name(a)
+        if n is not None:
+            audio_by_no.setdefault(n, []).append(a)
+
+    used_audio = set()
+    pairs: list[dict] = []
+
+    # add intro/outro first (if present)
+    if intro_script and intro_audio:
+        pairs.append({
+            "chapter_no": 0,
+            "title_guess": os.path.splitext(os.path.basename(intro_script))[0],
+            "script_path": intro_script,
+            "audio_path": intro_audio,
+        })
+        used_audio.add(intro_audio)
+
+    if outro_script and outro_audio:
+        # put it later; we’ll sort at end
+        pairs.append({
+            "chapter_no": 9998,
+            "title_guess": os.path.splitext(os.path.basename(outro_script))[0],
+            "script_path": outro_script,
+            "audio_path": outro_audio,
+        })
+        used_audio.add(outro_audio)
+
+    def token_score(sp: str, ap: str) -> int:
+        return len(_norm_tokens(sp).intersection(_norm_tokens(ap)))
+
+    # match chapters by number
+    for s in sorted(scripts_left):
+        sn = _chapter_no_from_name(s)
+        chosen = None
+
+        if sn is not None and sn in audio_by_no:
+            cands = [a for a in audio_by_no[sn] if a not in used_audio]
+            if cands:
+                chosen = max(cands, key=lambda a: token_score(s, a))
+
+        if chosen is None:
+            cands = [a for a in audios_left if a not in used_audio]
+            if cands:
+                chosen = max(cands, key=lambda a: token_score(s, a))
+
+        if chosen:
+            used_audio.add(chosen)
+            pairs.append({
+                "chapter_no": sn,
+                "title_guess": os.path.splitext(os.path.basename(s))[0],
+                "script_path": s,
+                "audio_path": chosen,
+            })
+
+    # sort: intro first, then numeric chapters, then outro
+    def sort_key(p: dict):
+        n = p.get("chapter_no")
+        if n == 0:
+            return (-1, p["title_guess"].lower())
+        if n == 9998:
+            return (999999, p["title_guess"].lower())
+        if n is None:
+            return (500000, p["title_guess"].lower())
+        return (n, p["title_guess"].lower())
+
+    pairs.sort(key=sort_key)
+    return pairs
+
+
+# ----------------------------
+# Segment logic
 # ----------------------------
 
 def is_intro(p: dict) -> bool:
-    t = (p.get("title_guess") or "").lower()
-    return ("intro" in t) and ("outro" not in t)
+    return _is_intro_name(p.get("title_guess", "")) or _is_intro_name(p.get("script_path", "")) or _is_intro_name(p.get("audio_path", ""))
 
 def is_outro(p: dict) -> bool:
-    t = (p.get("title_guess") or "").lower()
-    return "outro" in t
+    return _is_outro_name(p.get("title_guess", "")) or _is_outro_name(p.get("script_path", "")) or _is_outro_name(p.get("audio_path", ""))
 
 def is_chapter_one(p: dict) -> bool:
-    if p.get("chapter_no") == 1:
-        return True
-    t = (p.get("title_guess") or "").lower()
-    return ("chapter_01" in t) or ("chapter-01" in t) or ("chapter 01" in t) or ("chapter 1" in t)
+    return p.get("chapter_no") == 1 or "chapter_01" in (p.get("title_guess") or "").lower() or "chapter-01" in (p.get("title_guess") or "").lower()
 
 def segment_label(p: dict) -> str:
     if is_intro(p):
@@ -54,10 +174,9 @@ def segment_label(p: dict) -> str:
     return "SEGMENT"
 
 def segment_scene_cap(title: str, default_cap: int, intro_cap: int, outro_cap: int) -> int:
-    t = (title or "").lower()
-    if ("intro" in t) and ("outro" not in t):
+    if _is_intro_name(title):
         return min(default_cap, intro_cap)
-    if "outro" in t:
+    if _is_outro_name(title):
         return min(default_cap, outro_cap)
     return default_cap
 
@@ -67,8 +186,8 @@ def segment_scene_cap(title: str, default_cap: int, intro_cap: int, outro_cap: i
 # ----------------------------
 
 st.set_page_config(page_title="UAPpress — Documentary MP4 Studio (ZIP)", layout="wide")
-st.title("🛸 UAPpress — Documentary MP4 Studio (ZIP-Only)")
-st.caption("Upload the ZIP exported by Documentary TTS Studio (scripts + MP3s). The app builds MP4s with burned-in subtitles.")
+st.title("🛸 UAPpress — Documentary MP4 Studio (ZIP-only)")
+st.caption("Upload the ZIP exported by Documentary TTS Studio (scripts + audio). Generates MP4s with burned-in subtitles.")
 
 with st.sidebar:
     st.header("🔑 OpenAI")
@@ -80,7 +199,6 @@ with st.sidebar:
     st.header("🎞 Output")
     resolution = st.selectbox("Resolution", ["1280x720", "1920x1080", "720x1280"], index=0)
 
-    st.caption("Caching saves money + time on reruns. Your video_pipeline.py uses this folder.")
     cache_dir = st.text_input("Image/clip cache folder", value=os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache"))
     os.environ["UAPPRESS_CACHE_DIR"] = cache_dir
 
@@ -92,11 +210,8 @@ with st.sidebar:
     st.divider()
     st.header("🎬 Scenes")
     max_scenes = st.slider("Max scenes per Chapter", 3, 14, 8)
-
     intro_cap = st.slider("Intro scene cap", 1, 6, 2)
     outro_cap = st.slider("Outro scene cap", 1, 6, 2)
-
-    st.caption("Stretch mode always covers full audio length (no cutoff).")
 
     st.divider()
     st.header("🧠 Models")
@@ -129,7 +244,7 @@ if zip_file:
     os.makedirs(st.session_state.out_dir, exist_ok=True)
 
     scripts, audios = find_files(extract_dir)
-    pairs = best_match_pairs(scripts, audios)
+    pairs = pair_segments(scripts, audios)
     st.session_state.pairs = pairs
 
     st.success(f"ZIP extracted. Found {len(scripts)} script file(s) and {len(audios)} audio file(s).")
@@ -140,7 +255,7 @@ if not pairs:
     st.info("Upload a ZIP to detect segments.")
     st.stop()
 
-st.subheader("2) Detected Segments (Intro / Chapters / Outro)")
+st.subheader("2) Detected Segments (Pairing)")
 for i, p in enumerate(pairs, start=1):
     st.write(f"**{i}. [{segment_label(p)}] {p['title_guess']}**")
     st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
@@ -168,13 +283,12 @@ if st.button("🚀 Build MP4(s) from ZIP"):
     progress = st.progress(0.0)
     status = st.empty()
 
-    chapter_final_mp4s = []
+    final_mp4s = []
     full_srt_parts = []
     cumulative_offset = 0.0
 
-    # rough progress
-    total_units = max(1, sum(max_scenes for _ in to_run) + (len(to_run) * 5))
-    done_units = 0
+    total_units = max(1, sum(max_scenes for _ in to_run) + (len(to_run) * 6))
+    done = 0
 
     for idx, p in enumerate(to_run, start=1):
         title = p["title_guess"]
@@ -192,7 +306,6 @@ if st.button("🚀 Build MP4(s) from ZIP"):
             st.error(f"Could not read duration for: {audio_path}")
             st.stop()
 
-        # cap scenes for intro/outro
         seg_max_scenes = segment_scene_cap(title, max_scenes, intro_cap, outro_cap)
 
         # 1) plan scenes
@@ -201,20 +314,21 @@ if st.button("🚀 Build MP4(s) from ZIP"):
             chapter_title=title,
             chapter_text=script_text,
             max_scenes=seg_max_scenes,
-            seconds_per_scene=8,  # hint only; rendering uses stretch allocation
+            seconds_per_scene=8,   # hint only; we do stretch allocation below
             model=text_model,
         )
 
-        # stretch allocation that guarantees no cutoff
         scene_count = max(1, len(scenes))
-        total_needed = int(math.ceil(seg_duration)) + 2  # padding prevents abrupt cutoffs
+
+        # ✅ Stretch allocation that prevents cutoff:
+        # total video target >= audio duration + padding
+        total_needed = int(math.ceil(seg_duration)) + 2
         base = max(6, total_needed // scene_count)
         rem = total_needed % scene_count  # first rem scenes get +1 sec
 
         st.info(
-            f"{segment_label(p)} duration ≈ {seg_duration:.2f}s | scenes={scene_count} "
-            f"(cap={seg_max_scenes}) → total video target={total_needed}s "
-            f"(base={base}s, remainder={rem}s)"
+            f"{segment_label(p)} audio ≈ {seg_duration:.2f}s | scenes={scene_count} (cap={seg_max_scenes}) "
+            f"→ target={total_needed}s (base={base}s, remainder={rem}s)"
         )
 
         write_text(os.path.join(seg_dir, "scene_plan.json"), json.dumps(scenes, ensure_ascii=False, indent=2))
@@ -222,10 +336,10 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         # 2) generate clips
         scene_paths = []
         for j, sc in enumerate(scenes, start=1):
-            sc_no = sc["scene"]
+            sc_no = int(sc.get("scene", j))
             sc_seconds = base + (1 if j <= rem else 0)
+            prompt = str(sc.get("prompt", "")).strip()
 
-            prompt = sc["prompt"]
             clip_path = os.path.join(seg_dir, f"scene_{sc_no:02d}.mp4")
 
             status.write(f"Generating visuals — {segment_label(p)} Scene {sc_no} ({sc_seconds}s)")
@@ -240,10 +354,10 @@ if st.button("🚀 Build MP4(s) from ZIP"):
                 )
 
             scene_paths.append(clip_path)
-            done_units += 1
-            progress.progress(min(done_units / total_units, 1.0))
+            done += 1
+            progress.progress(min(done / total_units, 1.0))
 
-        # 3) stitch scenes
+        # 3) stitch scenes (SAFE: uses video_pipeline.concat_mp4s; no fragile f-string escaping)
         status.write("Stitching scenes…")
         stitched_path = os.path.join(seg_dir, f"{seg_slug}_stitched.mp4")
         try:
@@ -258,16 +372,16 @@ if st.button("🚀 Build MP4(s) from ZIP"):
                 reencoded.append(rp)
             concat_mp4s(reencoded, stitched_path)
 
-        done_units += 1
-        progress.progress(min(done_units / total_units, 1.0))
+        done += 1
+        progress.progress(min(done / total_units, 1.0))
 
         # 4) mux audio
         status.write("Adding narration audio…")
         with_audio = os.path.join(seg_dir, f"{seg_slug}_audio.mp4")
         mux_audio(stitched_path, audio_path, with_audio)
 
-        done_units += 1
-        progress.progress(min(done_units / total_units, 1.0))
+        done += 1
+        progress.progress(min(done / total_units, 1.0))
 
         # 5) subtitles (SRT)
         status.write("Transcribing subtitles…")
@@ -279,10 +393,10 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         full_srt_parts.append(shifted)
         cumulative_offset += seg_duration
 
-        done_units += 1
-        progress.progress(min(done_units / total_units, 1.0))
+        done += 1
+        progress.progress(min(done / total_units, 1.0))
 
-        # 6) burn subs into MP4 (video_pipeline handles burn-in)
+        # 6) burn subtitles into MP4
         status.write("Embedding subtitles into MP4…")
         final_mp4 = os.path.join(seg_dir, f"{seg_slug}_final_subs.mp4")
         embed_srt_softsubs(with_audio, srt_path, final_mp4)
@@ -291,17 +405,16 @@ if st.button("🚀 Build MP4(s) from ZIP"):
             final_re = os.path.join(seg_dir, f"{seg_slug}_final_subs_reencoded.mp4")
             final_mp4 = reencode_mp4(final_mp4, final_re)
 
-        chapter_final_mp4s.append(final_mp4)
+        final_mp4s.append(final_mp4)
 
-        st.success(f"Segment ready: {os.path.basename(final_mp4)}")
-
+        st.success(f"Ready: {os.path.basename(final_mp4)}")
         with open(final_mp4, "rb") as f:
             st.download_button(
                 label=f"Download {segment_label(p)} MP4 (burned subs)",
                 data=f,
                 file_name=os.path.basename(final_mp4),
                 mime="video/mp4",
-                key=f"dl_seg_mp4_{idx}",
+                key=f"dl_mp4_{idx}",
             )
         with open(srt_path, "rb") as f:
             st.download_button(
@@ -309,42 +422,42 @@ if st.button("🚀 Build MP4(s) from ZIP"):
                 data=f,
                 file_name=os.path.basename(srt_path),
                 mime="text/plain",
-                key=f"dl_seg_srt_{idx}",
+                key=f"dl_srt_{idx}",
             )
 
-        done_units += 1
-        progress.progress(min(done_units / total_units, 1.0))
+        done += 1
+        progress.progress(min(done / total_units, 1.0))
 
-    # Build full SRT
+    # Full SRT
     status.write("Building full SRT…")
     full_srt_text = "\n\n".join([p.strip() for p in full_srt_parts if p.strip()])
     full_srt_text = renumber_srt_blocks(full_srt_text)
     full_srt_path = os.path.join(out_dir, "uappress_full_documentary.srt")
     write_text(full_srt_path, full_srt_text)
 
-    # Optionally build full combined MP4
-    if build_full_movie and len(chapter_final_mp4s) >= 2:
+    # Full combined movie (optional)
+    if build_full_movie and len(final_mp4s) >= 2:
         status.write("Concatenating full movie…")
         full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
         try:
-            concat_mp4s(chapter_final_mp4s, full_mp4)
+            concat_mp4s(final_mp4s, full_mp4)
         except Exception:
             status.write("Full concat-copy failed; re-encoding segments for compatibility…")
             reencoded = []
-            for mp in chapter_final_mp4s:
+            for mp in final_mp4s:
                 rp = mp.replace(".mp4", "_reencoded.mp4")
                 if not os.path.exists(rp):
                     reencode_mp4(mp, rp)
                 reencoded.append(rp)
             concat_mp4s(reencoded, full_mp4)
 
-        status.write("Embedding full subtitles into full movie…")
+        status.write("Embedding subtitles into full movie…")
         full_mp4_subs = os.path.join(out_dir, "uappress_full_documentary_subs.mp4")
         embed_srt_softsubs(full_mp4, full_srt_path, full_mp4_subs)
 
         if force_reencode:
-            full_mp4_subs_re = os.path.join(out_dir, "uappress_full_documentary_subs_reencoded.mp4")
-            full_mp4_subs = reencode_mp4(full_mp4_subs, full_mp4_subs_re)
+            full_re = os.path.join(out_dir, "uappress_full_documentary_subs_reencoded.mp4")
+            full_mp4_subs = reencode_mp4(full_mp4_subs, full_re)
 
         st.success("Full movie ready!")
         with open(full_mp4_subs, "rb") as f:
