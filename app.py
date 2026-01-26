@@ -3,8 +3,11 @@ import os
 import json
 import math
 import shutil
+import tempfile
+import subprocess
 import streamlit as st
 from openai import OpenAI
+import imageio_ffmpeg
 
 from video_pipeline import (
     extract_zip_to_temp,
@@ -15,7 +18,6 @@ from video_pipeline import (
     transcribe_audio_to_srt,
     write_text,
     safe_slug,
-    concat_mp4s,
     mux_audio,
     embed_srt_softsubs,
     get_media_duration_seconds,
@@ -24,6 +26,53 @@ from video_pipeline import (
     reencode_mp4,
     zip_dir,
 )
+
+# ----------------------------
+# PATCHED: Safe concat that avoids fragile f-string escaping
+# ----------------------------
+
+def _ffmpeg_escape_path(p: str) -> str:
+    # FFmpeg concat demuxer expects: file 'path'
+    # Inside single quotes, FFmpeg escaping uses: '\''  (close-quote, escaped quote, reopen)
+    return (p or "").replace("'", "'\\''")
+
+def safe_concat_mp4s(paths: list[str], out_path: str) -> None:
+    if not paths:
+        raise ValueError("safe_concat_mp4s: no input paths provided")
+    for p in paths:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"safe_concat_mp4s: missing input file: {p}")
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    out_dir = os.path.dirname(out_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        list_path = f.name
+        for p in paths:
+            safe_path = _ffmpeg_escape_path(os.path.abspath(p))  # PATCH 1/2: pre-clean path
+            f.write(f"file '{safe_path}'\n")
+
+    try:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            out_path,
+        ]
+        subprocess.run(cmd, check=True)
+    finally:
+        try:
+            os.remove(list_path)
+        except Exception:
+            pass
+
 
 # ----------------------------
 # Pairing (robust intro/outro + chapter number matching)
@@ -321,7 +370,6 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         scene_count = max(1, len(scenes))
 
         # ✅ Stretch allocation that prevents cutoff:
-        # total video target >= audio duration + padding
         total_needed = int(math.ceil(seg_duration)) + 2
         base = max(6, total_needed // scene_count)
         rem = total_needed % scene_count  # first rem scenes get +1 sec
@@ -357,11 +405,11 @@ if st.button("🚀 Build MP4(s) from ZIP"):
             done += 1
             progress.progress(min(done / total_units, 1.0))
 
-        # 3) stitch scenes (SAFE: uses video_pipeline.concat_mp4s; no fragile f-string escaping)
+        # 3) stitch scenes (PATCHED: safe concat implementation)
         status.write("Stitching scenes…")
         stitched_path = os.path.join(seg_dir, f"{seg_slug}_stitched.mp4")
         try:
-            concat_mp4s(scene_paths, stitched_path)
+            safe_concat_mp4s(scene_paths, stitched_path)
         except Exception:
             status.write("Concat-copy failed; re-encoding scenes for compatibility…")
             reencoded = []
@@ -370,7 +418,7 @@ if st.button("🚀 Build MP4(s) from ZIP"):
                 if not os.path.exists(rp):
                     reencode_mp4(sp, rp)
                 reencoded.append(rp)
-            concat_mp4s(reencoded, stitched_path)
+            safe_concat_mp4s(reencoded, stitched_path)
 
         done += 1
         progress.progress(min(done / total_units, 1.0))
@@ -440,7 +488,7 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         status.write("Concatenating full movie…")
         full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
         try:
-            concat_mp4s(final_mp4s, full_mp4)
+            safe_concat_mp4s(final_mp4s, full_mp4)
         except Exception:
             status.write("Full concat-copy failed; re-encoding segments for compatibility…")
             reencoded = []
@@ -449,7 +497,7 @@ if st.button("🚀 Build MP4(s) from ZIP"):
                 if not os.path.exists(rp):
                     reencode_mp4(mp, rp)
                 reencoded.append(rp)
-            concat_mp4s(reencoded, full_mp4)
+            safe_concat_mp4s(reencoded, full_mp4)
 
         status.write("Embedding subtitles into full movie…")
         full_mp4_subs = os.path.join(out_dir, "uappress_full_documentary_subs.mp4")
