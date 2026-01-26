@@ -224,7 +224,9 @@ def concat_video_segments(segments: List[str], out_path: str) -> None:
         list_file = os.path.join(td, "concat.txt")
         with open(list_file, "w", encoding="utf-8") as f:
             for s in segments:
-                f.write(f"file '{s.replace(\"'\", \"'\\\\''\")}'\n")
+                safe_path = s.replace("'", "'\\''")
+                f.write(f"file '{safe_path}'\n")
+
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
