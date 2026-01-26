@@ -1,575 +1,382 @@
-# app.py
-# 🛸 UAPpress — Documentary MP4 Studio (FAST + FINAL)
-# Features:
-# 1) Fast Mode / Final Mode toggle (draft vs cinematic settings)
-# 2) Automatic image caching (generate once, reuse forever)
-# 3) Parallel chapter rendering + final concat
-
+# app.py — UAPpress ZIP → Documentary MP4 Studio (ZIP-Only)
 import os
-import re
 import json
-import time
+import math
 import shutil
-import zipfile
-import hashlib
-import tempfile
-import subprocess
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
-
 import streamlit as st
 from openai import OpenAI
 
-
-# ----------------------------
-# Page setup
-# ----------------------------
-st.set_page_config(page_title="UAPpress Documentary Studio", layout="wide")
-st.title("🛸 UAPpress — Documentary MP4 Studio (Fast + Final)")
-st.caption("Fast drafts in minutes. Final cinematic export when ready.")
-
+from video_pipeline import (
+    extract_zip_to_temp,
+    find_files,
+    best_match_pairs,
+    read_script_file,
+    plan_scenes,
+    generate_video_clip,
+    transcribe_audio_to_srt,
+    write_text,
+    safe_slug,
+    concat_mp4s,
+    mux_audio,
+    embed_srt_softsubs,
+    get_media_duration_seconds,
+    shift_srt,
+    renumber_srt_blocks,
+    reencode_mp4,
+    zip_dir,
+)
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def safe_filename(s: str, max_len: int = 120) -> str:
-    s = re.sub(r"[^\w\-\.\s]", "", s).strip()
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace(" ", "_")
-    return s[:max_len] if len(s) > max_len else s
 
+def is_intro(p: dict) -> bool:
+    t = (p.get("title_guess") or "").lower()
+    return ("intro" in t) and ("outro" not in t)
 
-def sha1(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+def is_outro(p: dict) -> bool:
+    t = (p.get("title_guess") or "").lower()
+    return "outro" in t
 
+def is_chapter_one(p: dict) -> bool:
+    if p.get("chapter_no") == 1:
+        return True
+    t = (p.get("title_guess") or "").lower()
+    return ("chapter_01" in t) or ("chapter-01" in t) or ("chapter 01" in t) or ("chapter 1" in t)
 
-def run(cmd: List[str], cwd: Optional[str] = None) -> None:
-    """Run command and raise on error with readable output."""
-    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"Command failed:\n{' '.join(cmd)}\n\n{p.stdout}")
+def segment_label(p: dict) -> str:
+    if is_intro(p):
+        return "INTRO"
+    if is_outro(p):
+        return "OUTRO"
+    if p.get("chapter_no") is not None:
+        return f"CHAPTER {p['chapter_no']}"
+    return "SEGMENT"
 
-
-def ffprobe_duration_sec(path: str) -> float:
-    """Return media duration in seconds using ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        return float(p.stdout.strip())
-    except Exception:
-        return 0.0
-
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def which_or_hint(bin_name: str) -> None:
-    if shutil.which(bin_name) is None:
-        raise RuntimeError(
-            f"Missing dependency: {bin_name}\n"
-            "Install ffmpeg and ensure it's on PATH."
-        )
-
-
-def ffmpeg_concat_escape(path: str) -> str:
-    """
-    Escape a file path for FFmpeg concat demuxer file list.
-    FFmpeg expects: file '<path>'
-    If path contains single quotes, escape them in the standard shell-safe way.
-    """
-    return path.replace("'", "'\\''")
-
-
-# ----------------------------
-# Render settings
-# ----------------------------
-@dataclass
-class RenderProfile:
-    name: str
-    images_per_chapter: int
-    enable_ken_burns: bool
-    image_min_seconds: int
-    image_max_seconds: int
-    crf: int
-    preset: str
-    fps: int
-    audio_bitrate: str
-    video_codec: str = "libx264"
-    pix_fmt: str = "yuv420p"
-
-
-FAST_PROFILE = RenderProfile(
-    name="Fast (Draft)",
-    images_per_chapter=3,
-    enable_ken_burns=False,     # BIG speed win
-    image_min_seconds=60,
-    image_max_seconds=120,
-    crf=28,
-    preset="ultrafast",         # BIG speed win
-    fps=30,
-    audio_bitrate="160k",
-)
-
-FINAL_PROFILE = RenderProfile(
-    name="Final (Cinematic)",
-    images_per_chapter=6,
-    enable_ken_burns=True,
-    image_min_seconds=30,
-    image_max_seconds=75,
-    crf=18,
-    preset="slow",
-    fps=30,
-    audio_bitrate="192k",
-)
-
-
-# ----------------------------
-# Image caching + generation
-# ----------------------------
-def cached_image_path(cache_dir: str, prompt: str, size: str) -> str:
-    key = sha1(json.dumps({"prompt": prompt, "size": size}, ensure_ascii=False))
-    return os.path.join(cache_dir, f"{key}_{size}.png")
-
-
-def generate_image_openai(client: OpenAI, prompt: str, size: str) -> bytes:
-    """
-    Uses OpenAI Images API.
-    If your account requires a different model, change model= below.
-    """
-    result = client.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        size=size
-    )
-    import base64
-    b64 = result.data[0].b64_json
-    return base64.b64decode(b64)
-
-
-def get_or_make_image(client: OpenAI, cache_dir: str, prompt: str, size: str) -> str:
-    ensure_dir(cache_dir)
-    out_path = cached_image_path(cache_dir, prompt, size)
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return out_path
-    img_bytes = generate_image_openai(client, prompt, size)
-    with open(out_path, "wb") as f:
-        f.write(img_bytes)
-    return out_path
-
-
-# ----------------------------
-# FFmpeg clip building
-# ----------------------------
-def build_image_clip(
-    image_path: str,
-    out_path: str,
-    duration: float,
-    profile: RenderProfile,
-    target_w: int,
-    target_h: int
-) -> None:
-    """
-    Creates a video segment from a still image.
-    Fast mode uses simple loop (very fast).
-    Final mode uses subtle zoompan (Ken Burns-like).
-    """
-    which_or_hint("ffmpeg")
-
-    # Scale to target while preserving aspect, pad to fill
-    base_vf = (
-        f"scale=w={target_w}:h={target_h}:force_original_aspect_ratio=decrease,"
-        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
-    )
-
-    if not profile.enable_ken_burns:
-        # Very fast: loop image for duration
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1",
-            "-i", image_path,
-            "-t", f"{duration:.3f}",
-            "-vf", base_vf,
-            "-r", str(profile.fps),
-            "-c:v", profile.video_codec,
-            "-preset", profile.preset,
-            "-crf", str(profile.crf),
-            "-pix_fmt", profile.pix_fmt,
-            "-an",
-            out_path
-        ]
-        run(cmd)
-        return
-
-    # Ken Burns via zoompan — subtle and smooth
-    frames = max(1, int(duration * profile.fps))
-    zoom_expr = "if(lte(on,1),1.0, min(1.08, zoom+0.0008))"
-    x_expr = "(iw-(iw/zoom))/2"
-    y_expr = "(ih-(ih/zoom))/2"
-
-    vf = (
-        f"{base_vf},"
-        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={target_w}x{target_h}"
-    )
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1",
-        "-i", image_path,
-        "-t", f"{duration:.3f}",
-        "-vf", vf,
-        "-r", str(profile.fps),
-        "-c:v", profile.video_codec,
-        "-preset", profile.preset,
-        "-crf", str(profile.crf),
-        "-pix_fmt", profile.pix_fmt,
-        "-an",
-        out_path
-    ]
-    run(cmd)
-
-
-def concat_video_segments(segments: List[str], out_path: str) -> None:
-    which_or_hint("ffmpeg")
-    with tempfile.TemporaryDirectory() as td:
-        list_file = os.path.join(td, "concat.txt")
-        with open(list_file, "w", encoding="utf-8") as f:
-            for s in segments:
-                safe_path = ffmpeg_concat_escape(s)
-                f.write(f"file '{safe_path}'\n")
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", list_file,
-            "-c", "copy",
-            out_path
-        ]
-        run(cmd)
-
-
-def mux_audio(video_path: str, audio_path: str, out_path: str, profile: RenderProfile) -> None:
-    which_or_hint("ffmpeg")
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", profile.audio_bitrate,
-        "-shortest",
-        out_path
-    ]
-    run(cmd)
-
-
-# ----------------------------
-# Chapter rendering (single)
-# ----------------------------
-def pick_durations(total_sec: float, n: int, min_s: int, max_s: int) -> List[float]:
-    """Spread total duration across n images, clamped to [min_s, max_s]."""
-    if n <= 0:
-        return []
-
-    base = total_sec / n
-    base_clamped = min(max(base, min_s), max_s)
-    durations = [base_clamped] * n
-    current = sum(durations)
-
-    if current < total_sec:
-        remaining = total_sec - current
-        i = 0
-        while remaining > 0.001:
-            add = min(max_s - durations[i], remaining)
-            if add > 0:
-                durations[i] += add
-                remaining -= add
-            i = (i + 1) % n
-            if all(abs(max_s - d) < 1e-6 for d in durations):
-                break
-    elif current > total_sec:
-        excess = current - total_sec
-        i = 0
-        while excess > 0.001:
-            sub = min(durations[i] - min_s, excess)
-            if sub > 0:
-                durations[i] -= sub
-                excess -= sub
-            i = (i + 1) % n
-            if all(abs(d - min_s) < 1e-6 for d in durations):
-                break
-
-    scale = total_sec / max(0.001, sum(durations))
-    return [d * scale for d in durations]
-
-
-def render_chapter(
-    chapter_idx: int,
-    chapter_title: str,
-    image_prompts: List[str],
-    audio_path: str,
-    cache_dir: str,
-    profile: RenderProfile,
-    out_dir: str,
-    image_size: str,
-    target_w: int,
-    target_h: int,
-    api_key: str,
-) -> str:
-    """
-    Renders one chapter MP4 and returns output path.
-    Safe to call in parallel (no Streamlit calls).
-    """
-    client = OpenAI(api_key=api_key)
-    ensure_dir(out_dir)
-
-    dur = ffprobe_duration_sec(audio_path)
-    if dur <= 0:
-        raise RuntimeError(f"Audio duration not found or zero: {audio_path}")
-
-    prompts = (image_prompts or [])[: profile.images_per_chapter]
-    if len(prompts) < 1:
-        prompts = [f"Documentary still image, atmospheric, related to: {chapter_title}"] * profile.images_per_chapter
-    if len(prompts) < profile.images_per_chapter:
-        prompts = prompts + [prompts[-1]] * (profile.images_per_chapter - len(prompts))
-
-    images = [get_or_make_image(client, cache_dir, p, image_size) for p in prompts]
-
-    durs = pick_durations(
-        total_sec=dur,
-        n=len(images),
-        min_s=profile.image_min_seconds,
-        max_s=profile.image_max_seconds
-    )
-
-    seg_dir = os.path.join(out_dir, f"chapter_{chapter_idx:02d}_segs")
-    ensure_dir(seg_dir)
-    segments = []
-    for i, (img, seg_dur) in enumerate(zip(images, durs), start=1):
-        seg_path = os.path.join(seg_dir, f"seg_{i:02d}.mp4")
-        build_image_clip(img, seg_path, seg_dur, profile, target_w, target_h)
-        segments.append(seg_path)
-
-    silent_video = os.path.join(out_dir, f"chapter_{chapter_idx:02d}_silent.mp4")
-    concat_video_segments(segments, silent_video)
-
-    out_name = safe_filename(f"{chapter_idx:02d}_{chapter_title}") + ".mp4"
-    out_path = os.path.join(out_dir, out_name)
-    mux_audio(silent_video, audio_path, out_path, profile)
-    return out_path
-
-
-# ----------------------------
-# Parallel render + concat
-# ----------------------------
-def render_all_chapters_parallel(
-    chapters: List[Dict],
-    cache_dir: str,
-    profile: RenderProfile,
-    out_dir: str,
-    image_size: str,
-    target_w: int,
-    target_h: int,
-    api_key: str,
-    max_workers: int
-) -> List[str]:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    ensure_dir(out_dir)
-    results = [None] * len(chapters)
-
-    def _job(i: int, ch: Dict) -> Tuple[int, str]:
-        return i, render_chapter(
-            chapter_idx=i + 1,
-            chapter_title=ch.get("title", f"Chapter {i+1}"),
-            image_prompts=ch.get("image_prompts", []),
-            audio_path=ch["audio_path"],
-            cache_dir=cache_dir,
-            profile=profile,
-            out_dir=out_dir,
-            image_size=image_size,
-            target_w=target_w,
-            target_h=target_h,
-            api_key=api_key,
-        )
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_job, i, ch) for i, ch in enumerate(chapters)]
-        for fut in as_completed(futures):
-            i, out_path = fut.result()
-            results[i] = out_path
-
-    return results
-
-
-def concat_final_movie(chapter_mp4s: List[str], out_path: str) -> None:
-    which_or_hint("ffmpeg")
-    with tempfile.TemporaryDirectory() as td:
-        list_file = os.path.join(td, "final_concat.txt")
-        with open(list_file, "w", encoding="utf-8") as f:
-            for p in chapter_mp4s:
-                safe_path = ffmpeg_concat_escape(p)
-                f.write(f"file '{safe_path}'\n")
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", out_path]
-        run(cmd)
+def segment_scene_cap(title: str, default_cap: int, intro_cap: int, outro_cap: int) -> int:
+    t = (title or "").lower()
+    if ("intro" in t) and ("outro" not in t):
+        return min(default_cap, intro_cap)
+    if "outro" in t:
+        return min(default_cap, outro_cap)
+    return default_cap
 
 
 # ----------------------------
 # UI
 # ----------------------------
-st.sidebar.header("Settings")
 
-api_key = st.sidebar.text_input("OpenAI API Key", type="password", value=os.environ.get("OPENAI_API_KEY", ""))
-if api_key:
-    os.environ["OPENAI_API_KEY"] = api_key
+st.set_page_config(page_title="UAPpress — Documentary MP4 Studio (ZIP)", layout="wide")
+st.title("🛸 UAPpress — Documentary MP4 Studio (ZIP-Only)")
+st.caption("Upload the ZIP exported by Documentary TTS Studio (scripts + MP3s). The app builds MP4s with burned-in subtitles.")
 
-profile_choice = st.sidebar.radio("Render Profile", [FAST_PROFILE.name, FINAL_PROFILE.name], index=0)
-profile = FAST_PROFILE if profile_choice == FAST_PROFILE.name else FINAL_PROFILE
+with st.sidebar:
+    st.header("🔑 OpenAI")
+    api_key = st.text_input("OpenAI API Key", type="password")
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
 
-st.sidebar.markdown("**Parallel Rendering**")
-max_workers = st.sidebar.slider("Chapters rendered at the same time", min_value=1, max_value=8, value=4)
+    st.divider()
+    st.header("🎞 Output")
+    resolution = st.selectbox("Resolution", ["1280x720", "1920x1080", "720x1280"], index=0)
 
-st.sidebar.markdown("**Output**")
-target_resolution = st.sidebar.selectbox("Resolution", ["1920x1080 (1080p)", "1280x720 (720p)"], index=0)
-target_w, target_h = (1920, 1080) if "1920x1080" in target_resolution else (1280, 720)
+    st.caption("Caching saves money + time on reruns. Your video_pipeline.py uses this folder.")
+    cache_dir = st.text_input("Image/clip cache folder", value=os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache"))
+    os.environ["UAPPRESS_CACHE_DIR"] = cache_dir
 
-image_size = st.sidebar.selectbox(
-    "AI image size (generation)",
-    ["1024x1024", "1536x1024", "1024x1536"],
-    index=1
-)
+    if st.button("🧹 Clear cache"):
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        st.success("Cache cleared.")
 
-cache_dir = st.sidebar.text_input("Image cache folder", value=os.path.join(os.getcwd(), "image_cache"))
-out_dir = st.sidebar.text_input("Output folder", value=os.path.join(os.getcwd(), "outputs"))
+    st.divider()
+    st.header("🎬 Scenes")
+    max_scenes = st.slider("Max scenes per Chapter", 3, 14, 8)
 
-st.sidebar.info(
-    f"**{profile.name}**\n\n"
-    f"- Images/chapter: {profile.images_per_chapter}\n"
-    f"- Ken Burns: {'ON' if profile.enable_ken_burns else 'OFF'}\n"
-    f"- Preset: {profile.preset}\n"
-    f"- CRF: {profile.crf}\n"
-)
+    intro_cap = st.slider("Intro scene cap", 1, 6, 2)
+    outro_cap = st.slider("Outro scene cap", 1, 6, 2)
 
-st.markdown("### Chapters")
-st.write("Upload your chapter audio files (MP3/WAV/M4A). Optionally provide image prompts per chapter.")
+    st.caption("Stretch mode always covers full audio length (no cutoff).")
 
-uploaded = st.file_uploader("Upload chapter audio files", type=["mp3", "wav", "m4a"], accept_multiple_files=True)
+    st.divider()
+    st.header("🧠 Models")
+    text_model = st.selectbox("Scene planning model", ["gpt-5-mini", "gpt-5"], index=0)
+    stt_model = st.selectbox("Transcription model", ["whisper-1"], index=0)
+    language = st.text_input("Subtitle language (ISO-639-1)", value="en")
 
-default_titles = [os.path.splitext(f.name)[0] for f in uploaded] if uploaded else []
+    st.divider()
+    st.header("⚙ Run")
+    test_mode = st.checkbox("Test Mode (Intro + Chapter 1 + Outro)", value=True)
+    force_reencode = st.checkbox("Force re-encode (safer, slower)", value=False)
+    build_full_movie = st.checkbox("Also build full combined movie", value=False)
 
-chapters: List[Dict] = []
-if uploaded:
-    st.markdown("#### Chapter Setup")
-    for idx, f in enumerate(uploaded, start=1):
-        with st.expander(f"Chapter {idx}: {f.name}", expanded=(idx == 1)):
-            title = st.text_input(f"Title (Chapter {idx})", value=default_titles[idx - 1], key=f"title_{idx}")
-            prompts_raw = st.text_area(
-                "Image prompts (one per line) — leave blank to auto-generate from title",
-                value="",
-                height=120,
-                key=f"prompts_{idx}"
+
+st.subheader("1) Upload Documentary ZIP")
+zip_file = st.file_uploader("Upload ZIP from Documentary TTS Studio", type=["zip"])
+
+if "pairs" not in st.session_state:
+    st.session_state.pairs = []
+if "workdir" not in st.session_state:
+    st.session_state.workdir = None
+if "out_dir" not in st.session_state:
+    st.session_state.out_dir = None
+
+if zip_file:
+    zip_bytes = zip_file.getvalue()
+    workdir, extract_dir = extract_zip_to_temp(zip_bytes)
+    st.session_state.workdir = workdir
+    st.session_state.out_dir = os.path.join(workdir, "render_out")
+    os.makedirs(st.session_state.out_dir, exist_ok=True)
+
+    scripts, audios = find_files(extract_dir)
+    pairs = best_match_pairs(scripts, audios)
+    st.session_state.pairs = pairs
+
+    st.success(f"ZIP extracted. Found {len(scripts)} script file(s) and {len(audios)} audio file(s).")
+
+
+pairs = st.session_state.pairs
+if not pairs:
+    st.info("Upload a ZIP to detect segments.")
+    st.stop()
+
+st.subheader("2) Detected Segments (Intro / Chapters / Outro)")
+for i, p in enumerate(pairs, start=1):
+    st.write(f"**{i}. [{segment_label(p)}] {p['title_guess']}**")
+    st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
+
+# Choose run list
+if test_mode:
+    intro = next((p for p in pairs if is_intro(p)), None)
+    ch1 = next((p for p in pairs if is_chapter_one(p)), None) or (pairs[0] if pairs else None)
+    outro = next((p for p in pairs if is_outro(p)), None)
+    to_run = [p for p in [intro, ch1, outro] if p is not None]
+else:
+    to_run = pairs
+
+st.subheader("3) Build")
+st.warning("First run costs money (images + transcription). Reruns should be fast/cheap thanks to caching.")
+
+if st.button("🚀 Build MP4(s) from ZIP"):
+    if not api_key:
+        st.error("Enter your OpenAI API key in the sidebar.")
+        st.stop()
+
+    client = OpenAI()
+    out_dir = st.session_state.out_dir
+
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    chapter_final_mp4s = []
+    full_srt_parts = []
+    cumulative_offset = 0.0
+
+    # rough progress
+    total_units = max(1, sum(max_scenes for _ in to_run) + (len(to_run) * 5))
+    done_units = 0
+
+    for idx, p in enumerate(to_run, start=1):
+        title = p["title_guess"]
+        seg_slug = f"seg_{idx:02d}_{safe_slug(title)}"
+        seg_dir = os.path.join(out_dir, seg_slug)
+        os.makedirs(seg_dir, exist_ok=True)
+
+        status.write(f"### {idx}/{len(to_run)} — {segment_label(p)}: {title}")
+
+        script_text = read_script_file(p["script_path"])
+        audio_path = p["audio_path"]
+
+        seg_duration = float(get_media_duration_seconds(audio_path))
+        if seg_duration <= 0:
+            st.error(f"Could not read duration for: {audio_path}")
+            st.stop()
+
+        # cap scenes for intro/outro
+        seg_max_scenes = segment_scene_cap(title, max_scenes, intro_cap, outro_cap)
+
+        # 1) plan scenes
+        scenes = plan_scenes(
+            client,
+            chapter_title=title,
+            chapter_text=script_text,
+            max_scenes=seg_max_scenes,
+            seconds_per_scene=8,  # hint only; rendering uses stretch allocation
+            model=text_model,
+        )
+
+        # stretch allocation that guarantees no cutoff
+        scene_count = max(1, len(scenes))
+        total_needed = int(math.ceil(seg_duration)) + 2  # padding prevents abrupt cutoffs
+        base = max(6, total_needed // scene_count)
+        rem = total_needed % scene_count  # first rem scenes get +1 sec
+
+        st.info(
+            f"{segment_label(p)} duration ≈ {seg_duration:.2f}s | scenes={scene_count} "
+            f"(cap={seg_max_scenes}) → total video target={total_needed}s "
+            f"(base={base}s, remainder={rem}s)"
+        )
+
+        write_text(os.path.join(seg_dir, "scene_plan.json"), json.dumps(scenes, ensure_ascii=False, indent=2))
+
+        # 2) generate clips
+        scene_paths = []
+        for j, sc in enumerate(scenes, start=1):
+            sc_no = sc["scene"]
+            sc_seconds = base + (1 if j <= rem else 0)
+
+            prompt = sc["prompt"]
+            clip_path = os.path.join(seg_dir, f"scene_{sc_no:02d}.mp4")
+
+            status.write(f"Generating visuals — {segment_label(p)} Scene {sc_no} ({sc_seconds}s)")
+            if not os.path.exists(clip_path):
+                generate_video_clip(
+                    client,
+                    prompt=prompt,
+                    seconds=sc_seconds,
+                    size=resolution,
+                    model="unused",
+                    out_path=clip_path,
+                )
+
+            scene_paths.append(clip_path)
+            done_units += 1
+            progress.progress(min(done_units / total_units, 1.0))
+
+        # 3) stitch scenes
+        status.write("Stitching scenes…")
+        stitched_path = os.path.join(seg_dir, f"{seg_slug}_stitched.mp4")
+        try:
+            concat_mp4s(scene_paths, stitched_path)
+        except Exception:
+            status.write("Concat-copy failed; re-encoding scenes for compatibility…")
+            reencoded = []
+            for sp in scene_paths:
+                rp = sp.replace(".mp4", "_reencoded.mp4")
+                if not os.path.exists(rp):
+                    reencode_mp4(sp, rp)
+                reencoded.append(rp)
+            concat_mp4s(reencoded, stitched_path)
+
+        done_units += 1
+        progress.progress(min(done_units / total_units, 1.0))
+
+        # 4) mux audio
+        status.write("Adding narration audio…")
+        with_audio = os.path.join(seg_dir, f"{seg_slug}_audio.mp4")
+        mux_audio(stitched_path, audio_path, with_audio)
+
+        done_units += 1
+        progress.progress(min(done_units / total_units, 1.0))
+
+        # 5) subtitles (SRT)
+        status.write("Transcribing subtitles…")
+        srt_text = transcribe_audio_to_srt(client, audio_path, model=stt_model, language=language)
+        srt_path = os.path.join(seg_dir, f"{seg_slug}.srt")
+        write_text(srt_path, srt_text)
+
+        shifted = shift_srt(srt_text, cumulative_offset)
+        full_srt_parts.append(shifted)
+        cumulative_offset += seg_duration
+
+        done_units += 1
+        progress.progress(min(done_units / total_units, 1.0))
+
+        # 6) burn subs into MP4 (video_pipeline handles burn-in)
+        status.write("Embedding subtitles into MP4…")
+        final_mp4 = os.path.join(seg_dir, f"{seg_slug}_final_subs.mp4")
+        embed_srt_softsubs(with_audio, srt_path, final_mp4)
+
+        if force_reencode:
+            final_re = os.path.join(seg_dir, f"{seg_slug}_final_subs_reencoded.mp4")
+            final_mp4 = reencode_mp4(final_mp4, final_re)
+
+        chapter_final_mp4s.append(final_mp4)
+
+        st.success(f"Segment ready: {os.path.basename(final_mp4)}")
+
+        with open(final_mp4, "rb") as f:
+            st.download_button(
+                label=f"Download {segment_label(p)} MP4 (burned subs)",
+                data=f,
+                file_name=os.path.basename(final_mp4),
+                mime="video/mp4",
+                key=f"dl_seg_mp4_{idx}",
             )
-            prompts = [p.strip() for p in prompts_raw.splitlines() if p.strip()]
-            chapters.append({"title": title, "image_prompts": prompts, "file_obj": f})
-
-st.markdown("---")
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    render_btn = st.button("🎬 Render MP4s (Parallel)", type="primary", disabled=(not uploaded or not api_key))
-
-with col2:
-    concat_btn = st.button("🧩 Concat into 1 Full Movie", disabled=(not uploaded))
-
-if "rendered_chapters" not in st.session_state:
-    st.session_state.rendered_chapters = []
-if "chapter_tempdir" not in st.session_state:
-    st.session_state.chapter_tempdir = None
-
-
-def save_uploads_to_temp(chapters_ui: List[Dict]) -> List[Dict]:
-    td = tempfile.mkdtemp(prefix="uappress_")
-    st.session_state.chapter_tempdir = td
-    prepared = []
-    for ch in chapters_ui:
-        f = ch["file_obj"]
-        audio_path = os.path.join(td, safe_filename(f.name))
-        with open(audio_path, "wb") as out:
-            out.write(f.read())
-        prepared.append({"title": ch["title"], "image_prompts": ch["image_prompts"], "audio_path": audio_path})
-    return prepared
-
-
-if render_btn:
-    try:
-        which_or_hint("ffmpeg")
-        which_or_hint("ffprobe")
-        ensure_dir(cache_dir)
-        ensure_dir(out_dir)
-
-        st.info("Rendering chapters in parallel…")
-        prepared_chapters = save_uploads_to_temp(chapters)
-
-        t0 = time.time()
-        with st.spinner("Rendering…"):
-            chapter_mp4s = render_all_chapters_parallel(
-                chapters=prepared_chapters,
-                cache_dir=cache_dir,
-                profile=profile,
-                out_dir=out_dir,
-                image_size=image_size,
-                target_w=target_w,
-                target_h=target_h,
-                api_key=api_key,
-                max_workers=max_workers
+        with open(srt_path, "rb") as f:
+            st.download_button(
+                label=f"Download {segment_label(p)} SRT",
+                data=f,
+                file_name=os.path.basename(srt_path),
+                mime="text/plain",
+                key=f"dl_seg_srt_{idx}",
             )
-        elapsed = time.time() - t0
-        st.session_state.rendered_chapters = chapter_mp4s
 
-        st.success(f"Done! Rendered {len(chapter_mp4s)} chapter(s) in {elapsed:.1f}s.")
-        for p in chapter_mp4s:
-            st.write(f"✅ {p}")
+        done_units += 1
+        progress.progress(min(done_units / total_units, 1.0))
 
-        with tempfile.TemporaryDirectory() as tdzip:
-            zip_path = os.path.join(tdzip, "chapter_mp4s.zip")
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-                for p in chapter_mp4s:
-                    z.write(p, arcname=os.path.basename(p))
-            with open(zip_path, "rb") as f:
-                st.download_button("⬇️ Download ZIP of chapter MP4s", data=f, file_name="chapter_mp4s.zip")
+    # Build full SRT
+    status.write("Building full SRT…")
+    full_srt_text = "\n\n".join([p.strip() for p in full_srt_parts if p.strip()])
+    full_srt_text = renumber_srt_blocks(full_srt_text)
+    full_srt_path = os.path.join(out_dir, "uappress_full_documentary.srt")
+    write_text(full_srt_path, full_srt_text)
 
-    except Exception as e:
-        st.error(str(e))
+    # Optionally build full combined MP4
+    if build_full_movie and len(chapter_final_mp4s) >= 2:
+        status.write("Concatenating full movie…")
+        full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
+        try:
+            concat_mp4s(chapter_final_mp4s, full_mp4)
+        except Exception:
+            status.write("Full concat-copy failed; re-encoding segments for compatibility…")
+            reencoded = []
+            for mp in chapter_final_mp4s:
+                rp = mp.replace(".mp4", "_reencoded.mp4")
+                if not os.path.exists(rp):
+                    reencode_mp4(mp, rp)
+                reencoded.append(rp)
+            concat_mp4s(reencoded, full_mp4)
 
+        status.write("Embedding full subtitles into full movie…")
+        full_mp4_subs = os.path.join(out_dir, "uappress_full_documentary_subs.mp4")
+        embed_srt_softsubs(full_mp4, full_srt_path, full_mp4_subs)
 
-if concat_btn:
-    try:
-        if not st.session_state.rendered_chapters:
-            st.warning("Render chapters first (so there are MP4s to concat).")
-        else:
-            final_name = safe_filename("UAPpress_Full_Movie") + ".mp4"
-            final_path = os.path.join(out_dir, final_name)
+        if force_reencode:
+            full_mp4_subs_re = os.path.join(out_dir, "uappress_full_documentary_subs_reencoded.mp4")
+            full_mp4_subs = reencode_mp4(full_mp4_subs, full_mp4_subs_re)
 
-            st.info("Concatenating chapters into one movie…")
-            with st.spinner("Concatenating…"):
-                concat_final_movie(st.session_state.rendered_chapters, final_path)
+        st.success("Full movie ready!")
+        with open(full_mp4_subs, "rb") as f:
+            st.download_button(
+                label="Download FULL Documentary MP4 (burned subs)",
+                data=f,
+                file_name=os.path.basename(full_mp4_subs),
+                mime="video/mp4",
+                key="dl_full_mp4",
+            )
+        with open(full_srt_path, "rb") as f:
+            st.download_button(
+                label="Download FULL Documentary SRT",
+                data=f,
+                file_name=os.path.basename(full_srt_path),
+                mime="text/plain",
+                key="dl_full_srt",
+            )
 
-            st.success(f"Full movie created: {final_path}")
-            with open(final_path, "rb") as f:
-                st.download_button("⬇️ Download Full Movie MP4", data=f, file_name=final_name)
+    # Package outputs
+    status.write("Packaging outputs into ZIP…")
+    out_zip_path = os.path.join(out_dir, "uappress_video_outputs.zip")
+    zip_dir(out_dir, out_zip_path)
 
-    except Exception as e:
-        st.error(str(e))
+    st.success("All outputs packaged.")
+    with open(out_zip_path, "rb") as f:
+        st.download_button(
+            label="Download Output ZIP (MP4s + SRTs + plans)",
+            data=f,
+            file_name="uappress_video_outputs.zip",
+            mime="application/zip",
+            key="dl_outputs_zip",
+        )
 
-
-st.markdown("---")
-st.markdown("### Speed Tips (built into this app)")
-st.markdown(
-    "- **Fast Mode** disables Ken Burns and uses ultrafast encoding.\n"
-    "- **Image caching** means you generate images once per prompt and reuse forever.\n"
-    "- **Parallel rendering** renders multiple chapters at the same time, then concatenates.\n"
-)
+    status.write("✅ Done.")
