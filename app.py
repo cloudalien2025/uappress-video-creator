@@ -5,6 +5,7 @@ import math
 import shutil
 import tempfile
 import subprocess
+import hashlib  # ✅ PATCH: zip hash guard
 import streamlit as st
 from openai import OpenAI
 import imageio_ffmpeg
@@ -274,6 +275,15 @@ with st.sidebar:
     force_reencode = st.checkbox("Force re-encode (safer, slower)", value=False)
     build_full_movie = st.checkbox("Also build full combined movie", value=False)
 
+    st.divider()
+    st.header("🧩 Project")
+    if st.button("♻️ Reset Project (re-extract ZIP)"):
+        for k in ["pairs", "workdir", "out_dir", "zip_hash"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.success("Project reset. Re-upload (or re-run) to extract again.")
+        st.rerun()
+
 
 st.subheader("1) Upload Documentary ZIP")
 zip_file = st.file_uploader("Upload ZIP from Documentary TTS Studio", type=["zip"])
@@ -284,19 +294,29 @@ if "workdir" not in st.session_state:
     st.session_state.workdir = None
 if "out_dir" not in st.session_state:
     st.session_state.out_dir = None
+if "zip_hash" not in st.session_state:
+    st.session_state.zip_hash = None  # ✅ PATCH: track which ZIP we've extracted
 
+# ✅ PATCH: Extract ZIP ONLY when it changes (prevents silent rerun resets)
 if zip_file:
     zip_bytes = zip_file.getvalue()
-    workdir, extract_dir = extract_zip_to_temp(zip_bytes)
-    st.session_state.workdir = workdir
-    st.session_state.out_dir = os.path.join(workdir, "render_out")
-    os.makedirs(st.session_state.out_dir, exist_ok=True)
+    zip_hash = hashlib.sha256(zip_bytes).hexdigest()
 
-    scripts, audios = find_files(extract_dir)
-    pairs = pair_segments(scripts, audios)
-    st.session_state.pairs = pairs
+    if st.session_state.zip_hash != zip_hash:
+        st.session_state.zip_hash = zip_hash
 
-    st.success(f"ZIP extracted. Found {len(scripts)} script file(s) and {len(audios)} audio file(s).")
+        workdir, extract_dir = extract_zip_to_temp(zip_bytes)
+        st.session_state.workdir = workdir
+        st.session_state.out_dir = os.path.join(workdir, "render_out")
+        os.makedirs(st.session_state.out_dir, exist_ok=True)
+
+        scripts, audios = find_files(extract_dir)
+        pairs = pair_segments(scripts, audios)
+        st.session_state.pairs = pairs
+
+        st.success(f"ZIP extracted. Found {len(scripts)} script file(s) and {len(audios)} audio file(s).")
+    else:
+        st.info("Same ZIP detected — using existing extracted files and outputs (rerun-safe).")
 
 
 pairs = st.session_state.pairs
@@ -456,10 +476,12 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         final_mp4s.append(final_mp4)
 
         st.success(f"Ready: {os.path.basename(final_mp4)}")
+
+        # ✅ PATCH: pass bytes (more reliable than passing file object)
         with open(final_mp4, "rb") as f:
             st.download_button(
                 label=f"Download {segment_label(p)} MP4 (burned subs)",
-                data=f,
+                data=f.read(),
                 file_name=os.path.basename(final_mp4),
                 mime="video/mp4",
                 key=f"dl_mp4_{idx}",
@@ -467,7 +489,7 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         with open(srt_path, "rb") as f:
             st.download_button(
                 label=f"Download {segment_label(p)} SRT",
-                data=f,
+                data=f.read(),
                 file_name=os.path.basename(srt_path),
                 mime="text/plain",
                 key=f"dl_srt_{idx}",
@@ -511,7 +533,7 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         with open(full_mp4_subs, "rb") as f:
             st.download_button(
                 label="Download FULL Documentary MP4 (burned subs)",
-                data=f,
+                data=f.read(),
                 file_name=os.path.basename(full_mp4_subs),
                 mime="video/mp4",
                 key="dl_full_mp4",
@@ -519,7 +541,7 @@ if st.button("🚀 Build MP4(s) from ZIP"):
         with open(full_srt_path, "rb") as f:
             st.download_button(
                 label="Download FULL Documentary SRT",
-                data=f,
+                data=f.read(),
                 file_name=os.path.basename(full_srt_path),
                 mime="text/plain",
                 key="dl_full_srt",
@@ -534,7 +556,7 @@ if st.button("🚀 Build MP4(s) from ZIP"):
     with open(out_zip_path, "rb") as f:
         st.download_button(
             label="Download Output ZIP (MP4s + SRTs + plans)",
-            data=f,
+            data=f.read(),
             file_name="uappress_video_outputs.zip",
             mime="application/zip",
             key="dl_outputs_zip",
