@@ -1,13 +1,24 @@
-# app.py — UAPpress ZIP → Documentary MP4 Studio (ZIP-only, checkpoint+resume, full movie default)
+# app.py — UAPpress ZIP → Segment MP4 Studio (ZIP upload, generate/download per segment)
+# - Upload the ZIP from Documentary TTS Studio (scripts + audio)
+# - Each segment has its own Generate + Download buttons
+# - Builds ONE segment per click (Streamlit-safe)
+# - Subtitles are ALWAYS burned into each segment MP4
+# - Hard-caps per-scene seconds to avoid huge ffmpeg zoompan spikes
+# - Outputs persist in UAPPRESS_CACHE_DIR so reruns keep downloads
+
 from __future__ import annotations
 
 import os
 import json
 import math
+import time
 import shutil
+import hashlib
 import tempfile
 import subprocess
-import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
 import streamlit as st
 from openai import OpenAI
 import imageio_ffmpeg
@@ -24,22 +35,18 @@ from video_pipeline import (
     mux_audio,
     embed_srt_softsubs,
     get_media_duration_seconds,
-    shift_srt,
-    renumber_srt_blocks,
     reencode_mp4,
-    zip_dir,
 )
 
 # ----------------------------
-# PATCHED: Safe concat (no fragile inline escaping)
+# Safe concat helpers
 # ----------------------------
 
 def _ffmpeg_escape_path(p: str) -> str:
     # concat demuxer wants: file '...'
-    # inside single quotes, escape single quote as: '\''
     return (p or "").replace("'", "'\\''")
 
-def safe_concat_mp4s(paths: list[str], out_path: str) -> None:
+def safe_concat_mp4s(paths: List[str], out_path: str) -> None:
     if not paths:
         raise ValueError("safe_concat_mp4s: no input paths provided")
     for p in paths:
@@ -47,19 +54,16 @@ def safe_concat_mp4s(paths: list[str], out_path: str) -> None:
             raise FileNotFoundError(f"safe_concat_mp4s: missing input file: {p}")
 
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    out_dir = os.path.dirname(out_path) or "."
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
         list_path = f.name
         for p in paths:
-            safe_path = _ffmpeg_escape_path(os.path.abspath(p))
-            f.write(f"file '{safe_path}'\n")
+            f.write(f"file '{_ffmpeg_escape_path(os.path.abspath(p))}'\n")
 
     try:
         cmd = [
-            ffmpeg,
-            "-y",
+            ffmpeg, "-y",
             "-hide_banner",
             "-loglevel", "error",
             "-f", "concat",
@@ -77,7 +81,7 @@ def safe_concat_mp4s(paths: list[str], out_path: str) -> None:
 
 
 # ----------------------------
-# Pairing (robust intro/outro + chapter matching)
+# Segment pairing (robust intro/outro + chapter matching)
 # ----------------------------
 
 def _norm_tokens(s: str) -> set[str]:
@@ -87,7 +91,7 @@ def _norm_tokens(s: str) -> set[str]:
     toks.discard("")
     return toks
 
-def _chapter_no_from_name(name: str) -> int | None:
+def _chapter_no_from_name(name: str) -> Optional[int]:
     import re
     base = os.path.splitext(os.path.basename(name))[0].lower()
     m = re.search(r"(?:chapter|ch)[\s_\-]*0*(\d{1,3})\b", base)
@@ -112,40 +116,40 @@ def _is_outro_name(name: str) -> bool:
     b = os.path.splitext(os.path.basename(name))[0].lower()
     return b.startswith("outro") or b == "outro" or " outro" in b or "_outro" in b or "-outro" in b
 
-def pair_segments(scripts: list[str], audios: list[str]) -> list[dict]:
+def segment_label(p: dict) -> str:
+    if _is_intro_name(p.get("title_guess", "")) or _is_intro_name(p.get("script_path", "")) or _is_intro_name(p.get("audio_path", "")):
+        return "INTRO"
+    if _is_outro_name(p.get("title_guess", "")) or _is_outro_name(p.get("script_path", "")) or _is_outro_name(p.get("audio_path", "")):
+        return "OUTRO"
+    n = p.get("chapter_no")
+    if n is not None:
+        return f"CHAPTER {n}"
+    return "SEGMENT"
+
+def pair_segments(scripts: List[str], audios: List[str]) -> List[dict]:
     intro_script = next((s for s in scripts if _is_intro_name(s)), None)
     outro_script = next((s for s in scripts if _is_outro_name(s)), None)
-    intro_audio = next((a for a in audios if _is_intro_name(a)), None)
-    outro_audio = next((a for a in audios if _is_outro_name(a)), None)
+    intro_audio  = next((a for a in audios  if _is_intro_name(a)), None)
+    outro_audio  = next((a for a in audios  if _is_outro_name(a)), None)
 
     scripts_left = [s for s in scripts if s not in {intro_script, outro_script}]
-    audios_left = [a for a in audios if a not in {intro_audio, outro_audio}]
+    audios_left  = [a for a in audios  if a not in {intro_audio,  outro_audio}]
 
-    audio_by_no: dict[int, list[str]] = {}
+    audio_by_no: Dict[int, List[str]] = {}
     for a in audios_left:
         n = _chapter_no_from_name(a)
         if n is not None:
             audio_by_no.setdefault(n, []).append(a)
 
     used_audio = set()
-    pairs: list[dict] = []
+    pairs: List[dict] = []
 
     if intro_script and intro_audio:
-        pairs.append({
-            "chapter_no": 0,
-            "title_guess": os.path.splitext(os.path.basename(intro_script))[0],
-            "script_path": intro_script,
-            "audio_path": intro_audio,
-        })
+        pairs.append({"chapter_no": 0, "title_guess": os.path.splitext(os.path.basename(intro_script))[0], "script_path": intro_script, "audio_path": intro_audio})
         used_audio.add(intro_audio)
 
     if outro_script and outro_audio:
-        pairs.append({
-            "chapter_no": 9998,
-            "title_guess": os.path.splitext(os.path.basename(outro_script))[0],
-            "script_path": outro_script,
-            "audio_path": outro_audio,
-        })
+        pairs.append({"chapter_no": 9998, "title_guess": os.path.splitext(os.path.basename(outro_script))[0], "script_path": outro_script, "audio_path": outro_audio})
         used_audio.add(outro_audio)
 
     def token_score(sp: str, ap: str) -> int:
@@ -167,12 +171,7 @@ def pair_segments(scripts: list[str], audios: list[str]) -> list[dict]:
 
         if chosen:
             used_audio.add(chosen)
-            pairs.append({
-                "chapter_no": sn,
-                "title_guess": os.path.splitext(os.path.basename(s))[0],
-                "script_path": s,
-                "audio_path": chosen,
-            })
+            pairs.append({"chapter_no": sn, "title_guess": os.path.splitext(os.path.basename(s))[0], "script_path": s, "audio_path": chosen})
 
     def sort_key(p: dict):
         n = p.get("chapter_no")
@@ -189,80 +188,53 @@ def pair_segments(scripts: list[str], audios: list[str]) -> list[dict]:
 
 
 # ----------------------------
-# Segment helpers
+# Persistence helpers (cache-backed)
 # ----------------------------
 
-def is_intro(p: dict) -> bool:
-    return _is_intro_name(p.get("title_guess", "")) or _is_intro_name(p.get("script_path", "")) or _is_intro_name(p.get("audio_path", ""))
+def sha1_file(path: str, max_bytes: int = 2_000_000) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        h.update(f.read(max_bytes))
+    return h.hexdigest()[:12]
 
-def is_outro(p: dict) -> bool:
-    return _is_outro_name(p.get("title_guess", "")) or _is_outro_name(p.get("script_path", "")) or _is_outro_name(p.get("audio_path", ""))
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
-def is_chapter_one(p: dict) -> bool:
-    return p.get("chapter_no") == 1 or "chapter_01" in (p.get("title_guess") or "").lower() or "chapter-01" in (p.get("title_guess") or "").lower()
+def out_base_dir(cache_dir: str) -> str:
+    d = os.path.join(cache_dir, "uappress_segments_out")
+    ensure_dir(d)
+    return d
 
-def segment_label(p: dict) -> str:
-    if is_intro(p):
-        return "INTRO"
-    if is_outro(p):
-        return "OUTRO"
-    if p.get("chapter_no") is not None:
-        return f"CHAPTER {p['chapter_no']}"
-    return "SEGMENT"
-
-def segment_scene_cap(title: str, default_cap: int, intro_cap: int, outro_cap: int) -> int:
-    if _is_intro_name(title):
-        return min(default_cap, intro_cap)
-    if _is_outro_name(title):
-        return min(default_cap, outro_cap)
-    return default_cap
-
-
-# ----------------------------
-# Checkpoint / Resume
-# ----------------------------
-
-def checkpoint_path(out_dir: str) -> str:
-    return os.path.join(out_dir, "_checkpoint.json")
-
-def load_checkpoint(out_dir: str) -> dict | None:
-    p = checkpoint_path(out_dir)
-    if os.path.exists(p):
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-def save_checkpoint(out_dir: str, data: dict) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    with open(checkpoint_path(out_dir), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def clear_checkpoint(out_dir: str) -> None:
-    try:
-        os.remove(checkpoint_path(out_dir))
-    except Exception:
-        pass
+def segment_output_paths(cache_dir: str, seg_slug: str, audio_path: str) -> Dict[str, str]:
+    """
+    Deterministic output paths so reruns can rediscover completed work.
+    Includes a short audio hash so if audio changes, it won't collide.
+    """
+    akey = sha1_file(audio_path)
+    base = os.path.join(out_base_dir(cache_dir), f"{seg_slug}_{akey}")
+    ensure_dir(base)
+    return {
+        "dir": base,
+        "final_mp4": os.path.join(base, f"{seg_slug}_{akey}_final_subs.mp4"),
+        "srt": os.path.join(base, f"{seg_slug}_{akey}.srt"),
+        "scene_plan": os.path.join(base, f"{seg_slug}_{akey}_scene_plan.json"),
+    }
 
 
 # ----------------------------
-# UI
+# App UI
 # ----------------------------
 
-st.set_page_config(page_title="UAPpress — Documentary MP4 Studio (ZIP)", layout="wide")
-st.title("🛸 UAPpress — Documentary MP4 Studio (ZIP-only)")
-st.caption("Upload the ZIP exported by Documentary TTS Studio (scripts + audio). Generates a full MP4 with burned-in subtitles.")
+st.set_page_config(page_title="UAPpress — Segment MP4 Studio (ZIP)", layout="wide")
+st.title("🛸 UAPpress — Segment MP4 Studio (ZIP upload)")
+st.caption("Upload the ZIP from Documentary TTS Studio. Generate and download ONE segment at a time (subtitles burned in).")
 
-if "pairs" not in st.session_state:
-    st.session_state.pairs = []
-if "workdir" not in st.session_state:
-    st.session_state.workdir = None
-if "out_dir" not in st.session_state:
-    st.session_state.out_dir = None
-if "zip_bytes" not in st.session_state:
-    st.session_state.zip_bytes = None
+# Session state
+st.session_state.setdefault("pairs", [])
+st.session_state.setdefault("workdir", None)
+st.session_state.setdefault("out_dir", None)
+st.session_state.setdefault("zip_bytes", None)
+st.session_state.setdefault("status_by_slug", {})   # slug -> {state, paths, err}
 
 with st.sidebar:
     st.header("🔑 OpenAI")
@@ -274,19 +246,21 @@ with st.sidebar:
     st.header("🎞 Output")
     resolution = st.selectbox("Resolution", ["1280x720", "1920x1080", "720x1280"], index=0)
 
-    cache_dir = st.text_input("Image/clip cache folder", value=os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache"))
+    cache_dir = st.text_input("Cache folder (persistent)", value=os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache"))
     os.environ["UAPPRESS_CACHE_DIR"] = cache_dir
+    ensure_dir(cache_dir)
 
-    if st.button("🧹 Clear cache"):
+    if st.button("🧹 Clear cache + outputs"):
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir, ignore_errors=True)
+        ensure_dir(cache_dir)
+        st.session_state["status_by_slug"] = {}
         st.success("Cache cleared.")
 
     st.divider()
-    st.header("🎬 Scenes")
-    max_scenes = st.slider("Max scenes per Chapter", 3, 14, 8)
-    intro_cap = st.slider("Intro scene cap", 1, 6, 2)
-    outro_cap = st.slider("Outro scene cap", 1, 6, 2)
+    st.header("🎬 Scene pacing (stability)")
+    max_scene_seconds = st.slider("Max seconds per scene (hard cap)", 8, 25, 18, 1)
+    min_scene_seconds = st.slider("Min seconds per scene", 6, 15, 10, 1)
 
     st.divider()
     st.header("🧠 Models")
@@ -295,46 +269,24 @@ with st.sidebar:
     language = st.text_input("Subtitle language (ISO-639-1)", value="en")
 
     st.divider()
-    st.header("⚙ Run")
-    test_mode = st.checkbox("Test Mode (Intro + Chapter 1 + Outro)", value=False)
-    force_reencode = st.checkbox("Force re-encode (safer, slower)", value=False)
-
-    # ✅ Option B defaults:
-    build_full_movie = st.checkbox("Build full combined movie (recommended)", value=True)
-    burn_segment_subs = st.checkbox("Also burn subtitles into each segment (slower)", value=False)
-
-    st.divider()
-    st.header("🧩 Project")
-    if st.button("♻️ Reset Project (re-extract ZIP)"):
-        # wipe current workdir + state
-        if st.session_state.workdir and os.path.exists(st.session_state.workdir):
-            shutil.rmtree(st.session_state.workdir, ignore_errors=True)
-        st.session_state.pairs = []
-        st.session_state.workdir = None
-        st.session_state.out_dir = None
-        # keep zip_bytes so user doesn't have to re-upload if Streamlit kept it
-        st.success("Project reset. Re-upload ZIP (or it will re-extract if ZIP is still loaded).")
-        st.rerun()
+    st.header("⚙ Safety")
+    force_reencode = st.checkbox("Force re-encode final MP4 (safer, slower)", value=False)
+    retry_images = st.checkbox("Retry image generation failures", value=True)
 
 
 st.subheader("1) Upload Documentary ZIP")
 zip_file = st.file_uploader("Upload ZIP from Documentary TTS Studio", type=["zip"])
 
-# If user reloaded page but zip still present, keep it
 if zip_file:
     st.session_state.zip_bytes = zip_file.getvalue()
 
-if st.session_state.zip_bytes and (not st.session_state.workdir or not st.session_state.pairs):
-    zip_bytes = st.session_state.zip_bytes
-    workdir, extract_dir = extract_zip_to_temp(zip_bytes)
+# Extract once per session
+if st.session_state.zip_bytes and not st.session_state.pairs:
+    workdir, extract_dir = extract_zip_to_temp(st.session_state.zip_bytes)
     st.session_state.workdir = workdir
-    st.session_state.out_dir = os.path.join(workdir, "render_out")
-    os.makedirs(st.session_state.out_dir, exist_ok=True)
-
     scripts, audios = find_files(extract_dir)
     pairs = pair_segments(scripts, audios)
     st.session_state.pairs = pairs
-
     st.success(f"ZIP extracted. Found {len(scripts)} script file(s) and {len(audios)} audio file(s).")
 
 pairs = st.session_state.pairs
@@ -342,121 +294,107 @@ if not pairs:
     st.info("Upload a ZIP to detect segments.")
     st.stop()
 
-st.subheader("2) Detected Segments (Pairing)")
-for i, p in enumerate(pairs, start=1):
-    st.write(f"**{i}. [{segment_label(p)}] {p['title_guess']}**")
-    st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
+# Instantiate client only when needed
+def get_client() -> OpenAI:
+    if not (os.environ.get("OPENAI_API_KEY") or api_key):
+        raise RuntimeError("Missing OpenAI API key.")
+    return OpenAI()
 
-# Choose run list
-if test_mode:
-    intro = next((p for p in pairs if is_intro(p)), None)
-    ch1 = next((p for p in pairs if is_chapter_one(p)), None) or (pairs[0] if pairs else None)
-    outro = next((p for p in pairs if is_outro(p)), None)
-    to_run = [p for p in [intro, ch1, outro] if p is not None]
-else:
-    to_run = pairs
+def compute_desired_scenes(seg_seconds: float) -> int:
+    total_needed = int(math.ceil(seg_seconds)) + 2  # small pad
+    desired = int(math.ceil(total_needed / max_scene_seconds))
+    return max(3, min(desired, 18))  # clamp to sane range
 
-st.subheader("3) Build")
-st.warning("First run costs money (images + transcription). Reruns should be faster/cheaper thanks to caching + resume checkpoints.")
+def generate_segment(p: dict) -> Dict[str, str]:
+    client = get_client()
+    title = p["title_guess"]
+    audio_path = p["audio_path"]
+    script_path = p["script_path"]
 
-# Resume detection
-out_dir = st.session_state.out_dir
-ck = load_checkpoint(out_dir) if out_dir else None
-resume_available = bool(ck and ck.get("next_index", 0) > 0 and ck.get("next_index", 0) < len(to_run))
+    seg_slug = f"{safe_slug(segment_label(p))}_{safe_slug(title)}"
+    paths = segment_output_paths(cache_dir, seg_slug, audio_path)
 
-colA, colB = st.columns([1, 1])
-with colA:
-    build_clicked = st.button("🚀 Build Final MP4 from ZIP", type="primary")
-with colB:
-    resume_clicked = st.button("▶️ Resume from last checkpoint", disabled=not resume_available)
+    # If already built, return immediately
+    if os.path.exists(paths["final_mp4"]) and os.path.exists(paths["srt"]):
+        return paths
 
-if (build_clicked or resume_clicked):
-    if not api_key:
-        st.error("Enter your OpenAI API key in the sidebar.")
-        st.stop()
+    script_text = read_script_file(script_path)
+    seg_duration = float(get_media_duration_seconds(audio_path))
+    if seg_duration <= 0:
+        raise RuntimeError(f"Could not read duration for audio: {audio_path}")
 
-    client = OpenAI()
-    out_dir = st.session_state.out_dir
-    os.makedirs(out_dir, exist_ok=True)
+    desired_scenes = compute_desired_scenes(seg_duration)
 
-    # Starting fresh wipes checkpoint (unless resume)
-    if build_clicked and not resume_clicked:
-        clear_checkpoint(out_dir)
-        ck = None
+    st.info(f"{segment_label(p)} audio ≈ {seg_duration:.2f}s → requesting up to {desired_scenes} scenes (cap {max_scene_seconds}s/scene)")
 
+    # 1) plan scenes (ask for enough scenes to avoid long clips)
+    scenes = plan_scenes(
+        client,
+        chapter_title=title,
+        chapter_text=script_text,
+        max_scenes=desired_scenes,
+        seconds_per_scene=min_scene_seconds,  # guidance only; we allocate below
+        model=text_model,
+    )
+    scene_count = max(1, len(scenes))
+
+    # 2) allocate per-scene seconds with hard cap
+    total_needed = int(math.ceil(seg_duration)) + 2
+    base = max(min_scene_seconds, int(math.floor(total_needed / scene_count)))
+    base = min(base, max_scene_seconds)
+    # Recompute counts if allocation would underfill total_needed
+    # If base*scene_count < total_needed, we distribute remaining seconds but never exceed cap.
+    alloc = [base] * scene_count
+    remaining = total_needed - sum(alloc)
+    i = 0
+    while remaining > 0 and i < 5000:
+        idx = i % scene_count
+        if alloc[idx] < max_scene_seconds:
+            alloc[idx] += 1
+            remaining -= 1
+        i += 1
+
+    # If still remaining, we need more scenes; simplest: append extra scenes by reusing last prompt style
+    # (Keeps the run stable rather than creating giant clips)
+    if remaining > 0:
+        extra = int(math.ceil(remaining / max_scene_seconds))
+        extra = min(extra, 10)
+        # Create lightweight extra scenes from the last prompt
+        last_prompt = (scenes[-1].get("prompt") or "").strip() if scenes else "cinematic documentary b-roll"
+        for k in range(extra):
+            scenes.append({"scene": len(scenes) + 1, "seconds": min_scene_seconds, "prompt": last_prompt, "on_screen_text": None})
+            alloc.append(min(min_scene_seconds, max_scene_seconds))
+        scene_count = len(scenes)
+        # try finishing remaining distribution
+        remaining = total_needed - sum(alloc)
+        i = 0
+        while remaining > 0 and i < 5000:
+            idx = i % scene_count
+            if alloc[idx] < max_scene_seconds:
+                alloc[idx] += 1
+                remaining -= 1
+            i += 1
+
+    write_text(paths["scene_plan"], json.dumps(scenes, ensure_ascii=False, indent=2))
+
+    # 3) generate clips
     progress = st.progress(0.0)
     status = st.empty()
 
-    # Restore or initialize state
-    if ck:
-        start_idx = int(ck.get("next_index", 0))
-        final_mp4s = ck.get("final_mp4s", [])
-        full_srt_parts = ck.get("full_srt_parts", [])
-        cumulative_offset = float(ck.get("cumulative_offset", 0.0))
-        status.info(f"Resuming at segment {start_idx + 1}/{len(to_run)} …")
-    else:
-        start_idx = 0
-        final_mp4s = []
-        full_srt_parts = []
-        cumulative_offset = 0.0
+    scene_paths: List[str] = []
+    for j, sc in enumerate(scenes, start=1):
+        sc_no = int(sc.get("scene", j))
+        sc_seconds = int(alloc[j - 1]) if j - 1 < len(alloc) else base
+        prompt = str(sc.get("prompt", "")).strip() or "cinematic documentary b-roll, realistic lighting"
 
-    # Rough progress accounting
-    total_units = max(1, sum(max_scenes for _ in to_run) + (len(to_run) * 6))
-    done = int((start_idx / max(1, len(to_run))) * total_units)
+        clip_path = os.path.join(paths["dir"], f"scene_{sc_no:02d}.mp4")
 
-    try:
-        for idx in range(start_idx, len(to_run)):
-            p = to_run[idx]
-            title = p["title_guess"]
-            seg_slug = f"seg_{idx+1:02d}_{safe_slug(title)}"
-            seg_dir = os.path.join(out_dir, seg_slug)
-            os.makedirs(seg_dir, exist_ok=True)
-
-            status.write(f"### {idx+1}/{len(to_run)} — {segment_label(p)}: {title}")
-
-            script_text = read_script_file(p["script_path"])
-            audio_path = p["audio_path"]
-
-            seg_duration = float(get_media_duration_seconds(audio_path))
-            if seg_duration <= 0:
-                raise RuntimeError(f"Could not read duration for: {audio_path}")
-
-            seg_max_scenes = segment_scene_cap(title, max_scenes, intro_cap, outro_cap)
-
-            # 1) plan scenes
-            scenes = plan_scenes(
-                client,
-                chapter_title=title,
-                chapter_text=script_text,
-                max_scenes=seg_max_scenes,
-                seconds_per_scene=8,
-                model=text_model,
-            )
-            scene_count = max(1, len(scenes))
-
-            # stretch allocation to cover audio
-            total_needed = int(math.ceil(seg_duration)) + 2
-            base = max(6, total_needed // scene_count)
-            rem = total_needed % scene_count
-
-            st.info(
-                f"{segment_label(p)} audio ≈ {seg_duration:.2f}s | scenes={scene_count} (cap={seg_max_scenes}) "
-                f"→ target={total_needed}s (base={base}s, remainder={rem}s)"
-            )
-
-            write_text(os.path.join(seg_dir, "scene_plan.json"), json.dumps(scenes, ensure_ascii=False, indent=2))
-
-            # 2) generate clips
-            scene_paths = []
-            for j, sc in enumerate(scenes, start=1):
-                sc_no = int(sc.get("scene", j))
-                sc_seconds = base + (1 if j <= rem else 0)
-                prompt = str(sc.get("prompt", "")).strip()
-
-                clip_path = os.path.join(seg_dir, f"scene_{sc_no:02d}.mp4")
-
-                status.write(f"Generating visuals — {segment_label(p)} Scene {sc_no} ({sc_seconds}s)")
-                if not os.path.exists(clip_path):
+        status.write(f"Generating scene {sc_no}/{len(scenes)} ({sc_seconds}s)")
+        if not os.path.exists(clip_path):
+            last_err = None
+            attempts = 3 if retry_images else 1
+            for a in range(1, attempts + 1):
+                try:
                     generate_video_clip(
                         client,
                         prompt=prompt,
@@ -465,165 +403,136 @@ if (build_clicked or resume_clicked):
                         model="unused",
                         out_path=clip_path,
                     )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(1.25 * a)
+            if last_err is not None:
+                raise RuntimeError(f"Scene {sc_no} generation failed: {last_err}")
 
-                scene_paths.append(clip_path)
-                done += 1
-                progress.progress(min(done / total_units, 1.0))
+        scene_paths.append(clip_path)
+        progress.progress(min(1.0, j / max(1, len(scenes))))
 
-            # 3) stitch scenes
-            status.write("Stitching scenes…")
-            stitched_path = os.path.join(seg_dir, f"{seg_slug}_stitched.mp4")
-            try:
-                safe_concat_mp4s(scene_paths, stitched_path)
-            except Exception:
-                status.write("Concat-copy failed; re-encoding scenes for compatibility…")
-                reencoded = []
-                for sp in scene_paths:
-                    rp = sp.replace(".mp4", "_reencoded.mp4")
-                    if not os.path.exists(rp):
-                        reencode_mp4(sp, rp)
-                    reencoded.append(rp)
-                safe_concat_mp4s(reencoded, stitched_path)
+    # 4) stitch scenes
+    status.write("Stitching scenes…")
+    stitched_path = os.path.join(paths["dir"], "stitched.mp4")
+    try:
+        safe_concat_mp4s(scene_paths, stitched_path)
+    except Exception:
+        status.write("Concat-copy failed; re-encoding scenes for compatibility…")
+        reencoded = []
+        for sp in scene_paths:
+            rp = sp.replace(".mp4", "_reencoded.mp4")
+            if not os.path.exists(rp):
+                reencode_mp4(sp, rp)
+            reencoded.append(rp)
+        safe_concat_mp4s(reencoded, stitched_path)
 
-            done += 1
-            progress.progress(min(done / total_units, 1.0))
+    # 5) mux audio
+    status.write("Adding narration audio…")
+    with_audio = os.path.join(paths["dir"], "with_audio.mp4")
+    mux_audio(stitched_path, audio_path, with_audio)
 
-            # 4) mux audio
-            status.write("Adding narration audio…")
-            with_audio = os.path.join(seg_dir, f"{seg_slug}_with_audio.mp4")
-            mux_audio(stitched_path, audio_path, with_audio)
+    # 6) transcribe + burn subtitles
+    status.write("Transcribing subtitles…")
+    srt_text = transcribe_audio_to_srt(client, audio_path, model=stt_model, language=language)
+    write_text(paths["srt"], srt_text)
 
-            done += 1
-            progress.progress(min(done / total_units, 1.0))
+    status.write("Burning subtitles into MP4…")
+    final_mp4 = paths["final_mp4"]
+    embed_srt_softsubs(with_audio, paths["srt"], final_mp4)
 
-            # 5) subtitles (SRT)
-            status.write("Transcribing subtitles…")
-            srt_text = transcribe_audio_to_srt(client, audio_path, model=stt_model, language=language)
-            srt_path = os.path.join(seg_dir, f"{seg_slug}.srt")
-            write_text(srt_path, srt_text)
+    if force_reencode:
+        final_re = final_mp4.replace(".mp4", "_reencoded.mp4")
+        final_mp4 = reencode_mp4(final_mp4, final_re)
+        # keep canonical pointer
+        paths["final_mp4"] = final_mp4
 
-            shifted = shift_srt(srt_text, cumulative_offset)
-            full_srt_parts.append(shifted)
-            cumulative_offset += seg_duration
+    status.write("✅ Segment ready.")
+    progress.empty()
+    return paths
 
-            done += 1
-            progress.progress(min(done / total_units, 1.0))
 
-            # 6) optional: burn subs into segment (default OFF)
-            if burn_segment_subs:
-                status.write("Burning subtitles into SEGMENT MP4…")
-                seg_final = os.path.join(seg_dir, f"{seg_slug}_final_subs.mp4")
-                embed_srt_softsubs(with_audio, srt_path, seg_final)
-                if force_reencode:
-                    seg_re = os.path.join(seg_dir, f"{seg_slug}_final_subs_reencoded.mp4")
-                    seg_final = reencode_mp4(seg_final, seg_re)
-                segment_mp4 = seg_final
-                st.success(f"Ready (segment w/ burned subs): {os.path.basename(segment_mp4)}")
-            else:
-                segment_mp4 = with_audio
-                st.success(f"Ready (segment, no burned subs): {os.path.basename(segment_mp4)}")
+st.subheader("2) Segments (Generate any order)")
+st.caption("Tip: Generate one segment, download it, then move to the next. Each MP4 includes burned subtitles.")
 
-            final_mp4s.append(segment_mp4)
+for idx, p in enumerate(pairs, start=1):
+    title = p["title_guess"]
+    label = segment_label(p)
+    seg_slug = f"{safe_slug(label)}_{safe_slug(title)}"
 
-            # ✅ checkpoint after each segment
-            save_checkpoint(out_dir, {
-                "next_index": idx + 1,
-                "final_mp4s": final_mp4s,
-                "full_srt_parts": full_srt_parts,
-                "cumulative_offset": cumulative_offset,
-            })
+    with st.container(border=True):
+        st.markdown(f"### {idx}. [{label}] {title}")
 
-            # Optional downloads tucked away (so UI doesn’t explode)
-            with st.expander(f"Downloads for {segment_label(p)} ({title})", expanded=False):
-                with open(segment_mp4, "rb") as f:
+        st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
+
+        # Discover existing outputs (if built previously)
+        try:
+            paths_guess = segment_output_paths(cache_dir, seg_slug, p["audio_path"])
+            built_already = os.path.exists(paths_guess["final_mp4"]) and os.path.exists(paths_guess["srt"])
+        except Exception:
+            paths_guess = None
+            built_already = False
+
+        status_box = st.empty()
+        cols = st.columns([1, 1, 2])
+
+        gen_key = f"gen_{idx}_{seg_slug}"
+        dl_key  = f"dl_{idx}_{seg_slug}"
+        srt_key = f"srt_{idx}_{seg_slug}"
+
+        with cols[0]:
+            do_gen = st.button("⚙️ Generate", key=gen_key, type="primary")
+
+        with cols[1]:
+            if built_already and paths_guess:
+                with open(paths_guess["final_mp4"], "rb") as f:
                     st.download_button(
-                        label=f"Download {segment_label(p)} MP4",
+                        "⬇️ Download MP4",
                         data=f,
-                        file_name=os.path.basename(segment_mp4),
+                        file_name=os.path.basename(paths_guess["final_mp4"]),
                         mime="video/mp4",
-                        key=f"dl_seg_mp4_{idx}",
+                        key=dl_key,
                     )
-                with open(srt_path, "rb") as f:
-                    st.download_button(
-                        label=f"Download {segment_label(p)} SRT",
-                        data=f,
-                        file_name=os.path.basename(srt_path),
-                        mime="text/plain",
-                        key=f"dl_seg_srt_{idx}",
-                    )
+            else:
+                st.button("⬇️ Download MP4", disabled=True, key=f"dl_disabled_{gen_key}")
 
-            done += 1
-            progress.progress(min(done / total_units, 1.0))
+        with cols[2]:
+            if built_already and paths_guess:
+                status_box.success("Ready (already generated).")
+            else:
+                status_box.info("Not generated yet.")
 
-        # Build full SRT
-        status.write("Building full SRT…")
-        full_srt_text = "\n\n".join([p.strip() for p in full_srt_parts if p.strip()])
-        full_srt_text = renumber_srt_blocks(full_srt_text)
-        full_srt_path = os.path.join(out_dir, "uappress_full_documentary.srt")
-        write_text(full_srt_path, full_srt_text)
-
-        # Build full movie (default ON)
-        if build_full_movie and len(final_mp4s) >= 1:
-            status.write("Concatenating full movie…")
-            full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
-            try:
-                safe_concat_mp4s(final_mp4s, full_mp4)
-            except Exception:
-                status.write("Full concat-copy failed; re-encoding segments for compatibility…")
-                reencoded = []
-                for mp in final_mp4s:
-                    rp = mp.replace(".mp4", "_reencoded.mp4")
-                    if not os.path.exists(rp):
-                        reencode_mp4(mp, rp)
-                    reencoded.append(rp)
-                safe_concat_mp4s(reencoded, full_mp4)
-
-            status.write("Burning subtitles into full movie…")
-            full_mp4_subs = os.path.join(out_dir, "uappress_full_documentary_subs.mp4")
-            embed_srt_softsubs(full_mp4, full_srt_path, full_mp4_subs)
-
-            if force_reencode:
-                full_re = os.path.join(out_dir, "uappress_full_documentary_subs_reencoded.mp4")
-                full_mp4_subs = reencode_mp4(full_mp4_subs, full_re)
-
-            st.success("✅ FULL YouTube-ready MP4 is ready!")
-            with open(full_mp4_subs, "rb") as f:
+        # Optional SRT download (useful even though subs are burned-in)
+        if built_already and paths_guess:
+            with open(paths_guess["srt"], "rb") as f:
                 st.download_button(
-                    label="Download FULL Documentary MP4 (burned subs)",
+                    "⬇️ Download SRT (optional)",
                     data=f,
-                    file_name=os.path.basename(full_mp4_subs),
-                    mime="video/mp4",
-                    key="dl_full_mp4",
-                )
-            with open(full_srt_path, "rb") as f:
-                st.download_button(
-                    label="Download FULL Documentary SRT",
-                    data=f,
-                    file_name=os.path.basename(full_srt_path),
+                    file_name=os.path.basename(paths_guess["srt"]),
                     mime="text/plain",
-                    key="dl_full_srt",
+                    key=srt_key,
                 )
 
-        # Package outputs
-        status.write("Packaging outputs into ZIP…")
-        out_zip_path = os.path.join(out_dir, "uappress_video_outputs.zip")
-        zip_dir(out_dir, out_zip_path)
+        if do_gen:
+            if not (os.environ.get("OPENAI_API_KEY") or api_key):
+                st.error("Enter your OpenAI API key in the sidebar.")
+                st.stop()
 
-        st.success("All outputs packaged.")
-        with open(out_zip_path, "rb") as f:
-            st.download_button(
-                label="Download Output ZIP (MP4s + SRTs + plans)",
-                data=f,
-                file_name="uappress_video_outputs.zip",
-                mime="application/zip",
-                key="dl_outputs_zip",
-            )
+            try:
+                status_box.warning("Generating… (this segment only)")
+                paths = generate_segment(p)
+                status_box.success("✅ Segment generated. Use Download buttons above.")
+                st.rerun()
+            except Exception as e:
+                status_box.error("❌ Segment failed. You can retry Generate.")
+                st.exception(e)
 
-        # Done – clear checkpoint so Resume doesn’t appear incorrectly
-        clear_checkpoint(out_dir)
-        status.write("✅ Done.")
-
-    except Exception as e:
-        # Keep checkpoint intact so Resume works
-        st.error("Build stopped due to an error. Fix the issue and click **Resume from last checkpoint**.")
-        st.exception(e)
+st.divider()
+st.subheader("3) Notes")
+st.write(
+    "- This app is intentionally *one-segment-per-click* to avoid Streamlit Cloud long-run instability.\n"
+    "- Each segment MP4 includes burned subtitles.\n"
+    "- Outputs persist under your cache folder so reruns keep the downloads."
+)
