@@ -699,7 +699,10 @@ for idx, p in enumerate(pairs, start=1):
             else:
                 st.button("⬇️ Download MP4", disabled=True, key=f"dl_disabled_{idx}_{seg_slug}")
         with cols[2]:
-            st.success("Ready (already generated).") if built else st.info("Not generated yet.")
+            if built:
+    st.success("Ready (already generated).")
+else:
+    st.info("Not generated yet.")
 
         if built and paths_guess:
             with open(paths_guess["srt"], "rb") as f:
