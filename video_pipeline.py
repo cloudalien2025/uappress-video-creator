@@ -520,15 +520,15 @@ def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
     z0 = max(1.0, min(1.25, z0))
     z1 = max(z0, min(1.35, z1))
 
-    shake = _safe_int_env("UAPPRESS_MOTION_SHAKE", 0) == 1
+    shake = False  # hard-disable shake (no rotate)
     grain = _safe_int_env("UAPPRESS_MOTION_GRAIN", 1) == 1
 
     # Smooth linear zoom over full frames using on (output frame index)
     # zoompan evaluates per output frame; on starts at 0.
     # add a tiny drift so it doesn't feel like a pure center zoom.
     zoom_expr = f"{z0}+({z1}-{z0})*on/max(1\\,{frames-1})"
-    x_expr = "iw/2-(iw/zoom/2) + (sin(on/23)*iw*0.002)"
-    y_expr = "ih/2-(ih/zoom/2) + (cos(on/19)*ih*0.002)"
+    x_expr = "iw/2-(iw/zoom/2) + (sin(on/31)*iw*0.0008)"
+    y_expr = "ih/2-(ih/zoom/2) + (cos(on/29)*ih*0.0008)"
 
     vf = (
         f"scale={W}:{H}:force_original_aspect_ratio=increase,"
