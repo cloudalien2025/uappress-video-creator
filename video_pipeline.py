@@ -513,14 +513,14 @@ def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
       UAPPRESS_ZOOM_START (default 1.00)
       UAPPRESS_ZOOM_END   (default 1.08)
       UAPPRESS_MOTION_SHAKE (0/1, default 0) -> tiny handheld feel
-      UAPPRESS_MOTION_GRAIN (0/1, default 0) -> subtle grain
+      UAPPRESS_MOTION_GRAIN (0/1, default 1) -> subtle grain
     """
     z0 = _safe_float_env("UAPPRESS_ZOOM_START", 1.00)
     z1 = _safe_float_env("UAPPRESS_ZOOM_END", 1.08)
     z0 = max(1.0, min(1.25, z0))
     z1 = max(z0, min(1.35, z1))
 
-    shake = _safe_int_env("UAPPRESS_MOTION_SHAKE", 1) == 1
+    shake = _safe_int_env("UAPPRESS_MOTION_SHAKE", 0) == 1
     grain = _safe_int_env("UAPPRESS_MOTION_GRAIN", 1) == 1
 
     # Smooth linear zoom over full frames using on (output frame index)
