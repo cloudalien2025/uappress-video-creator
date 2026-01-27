@@ -392,8 +392,22 @@ with st.sidebar:
 
     st.divider()
     st.header("🎬 Scene pacing (stability)")
-    max_scene_seconds = st.slider("Max seconds per scene (hard cap)", 8, 25, 18, 1)
-    min_scene_seconds = st.slider("Min seconds per scene", 6, 15, 10, 1)
+    max_scene_seconds = st.slider(
+    "Max seconds per scene (hard cap)",
+    min_value=10,
+    max_value=40,
+    value=30,
+    step=1,
+)
+
+min_scene_seconds = st.slider(
+    "Min seconds per scene",
+    min_value=10,
+    max_value=30,
+    value=20,
+    step=1,
+)
+
 
     st.divider()
     st.header("🧠 Models")
