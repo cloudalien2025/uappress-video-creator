@@ -1,4 +1,4 @@
-# video_pipeline.py
+# video_pipeline.py (Tier 1 optimized)
 from __future__ import annotations
 
 import io
@@ -18,32 +18,95 @@ from openai import OpenAI
 
 
 # ----------------------------
-# Cache
+# Cache (Tier 1 optimized)
 # ----------------------------
-# NOTE: Streamlit Cloud usually persists filesystem across reruns, but may reset on rebuilds.
-# This cache speeds up testing and prevents repeated OpenAI + ffmpeg work for identical scenes.
-CACHE_DIR = os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache")
+# Key change: DO NOT freeze cache dir at import time.
+# Read env each call, because Streamlit sets env AFTER import sometimes.
 
+def _get_cache_dir() -> str:
+    return os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache")
 
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
-
 def _cache_key(*parts: str) -> str:
     s = "||".join([str(p).strip() for p in parts if p is not None])
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
-
 
 def _copy_file(src: str, dst: str) -> None:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
         fdst.write(fsrc.read())
 
+def _safe_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)).strip())
+    except Exception:
+        return default
+
+def _safe_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)).strip())
+    except Exception:
+        return default
+
+def _prune_cache(cache_dir: str) -> None:
+    """
+    Evict oldest files if cache grows beyond limit.
+    This prevents Streamlit Cloud restarts/crashes due to disk bloat.
+
+    Env:
+      UAPPRESS_CACHE_MAX_MB (default 1200)  -> ~1.2 GB
+      UAPPRESS_CACHE_PRUNE_MIN_FREE_MB (default 150) -> keep headroom
+    """
+    max_mb = _safe_int_env("UAPPRESS_CACHE_MAX_MB", 1200)
+    min_free_mb = _safe_int_env("UAPPRESS_CACHE_PRUNE_MIN_FREE_MB", 150)
+
+    if max_mb <= 0:
+        return
+
+    try:
+        _ensure_dir(cache_dir)
+        files: List[Tuple[float, int, str]] = []
+        total = 0
+
+        for name in os.listdir(cache_dir):
+            path = os.path.join(cache_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                st = os.stat(path)
+                size = int(st.st_size)
+                mtime = float(st.st_mtime)
+            except Exception:
+                continue
+            total += size
+            files.append((mtime, size, path))
+
+        max_bytes = max_mb * 1024 * 1024
+        if total <= max_bytes:
+            return
+
+        # Delete oldest first
+        files.sort(key=lambda x: x[0])
+
+        target = max(0, max_bytes - (min_free_mb * 1024 * 1024))
+        for _, size, path in files:
+            try:
+                os.remove(path)
+                total -= size
+            except Exception:
+                pass
+            if total <= target:
+                break
+    except Exception:
+        # never crash pipeline due to prune issues
+        return
+
 
 # ----------------------------
 # Extensions / discovery
 # ----------------------------
-
 SCRIPT_EXTS = {".txt", ".md", ".json"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".mpeg", ".mpga", ".ogg", ".webm", ".flac"}
 
@@ -51,10 +114,8 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".mpeg", ".mpga", ".ogg", ".webm",
 # ----------------------------
 # OS / ffmpeg helpers
 # ----------------------------
-
 def ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
-
 
 def run_cmd(cmd: List[str]) -> None:
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -68,12 +129,10 @@ def run_cmd(cmd: List[str]) -> None:
             + (p.stdout or "")
         )
 
-
 def safe_slug(s: str, max_len: int = 80) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return (s[:max_len] if s else "chapter")
-
 
 def extract_int_prefix(name: str) -> Optional[int]:
     base = os.path.basename(name)
@@ -84,7 +143,6 @@ def extract_int_prefix(name: str) -> Optional[int]:
         return int(m.group(2))
     except Exception:
         return None
-
 
 def get_media_duration_seconds(path: str) -> float:
     """
@@ -105,7 +163,6 @@ def get_media_duration_seconds(path: str) -> float:
 # ----------------------------
 # ZIP + file discovery
 # ----------------------------
-
 def extract_zip_to_temp(zip_bytes: bytes) -> Tuple[str, str]:
     """
     Returns (workdir, extract_dir)
@@ -119,7 +176,6 @@ def extract_zip_to_temp(zip_bytes: bytes) -> Tuple[str, str]:
 
     return workdir, extract_dir
 
-
 def find_files(root_dir: str) -> Tuple[List[str], List[str]]:
     scripts, audios = [], []
     for r, _, files in os.walk(root_dir):
@@ -131,7 +187,6 @@ def find_files(root_dir: str) -> Tuple[List[str], List[str]]:
             elif ext in AUDIO_EXTS:
                 audios.append(path)
     return scripts, audios
-
 
 def read_script_file(path: str) -> str:
     ext = os.path.splitext(path.lower())[1]
@@ -146,7 +201,6 @@ def read_script_file(path: str) -> str:
     else:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read().strip()
-
 
 def best_match_pairs(scripts: List[str], audios: List[str]) -> List[Dict]:
     """
@@ -199,7 +253,6 @@ def best_match_pairs(scripts: List[str], audios: List[str]) -> List[Dict]:
 # ----------------------------
 # Scene planning (text -> JSON scenes)
 # ----------------------------
-
 SCENE_PLANNER_SYSTEM = (
     "You convert a documentary narration chapter into a list of short visual scenes for AI generation. "
     "Return STRICT JSON only: a list of objects with keys: scene, seconds, prompt, on_screen_text(optional). "
@@ -207,7 +260,6 @@ SCENE_PLANNER_SYSTEM = (
     "Avoid brand names, copyrighted characters, celebrity likeness, and explicit violence/gore. "
     "Keep prompts concise (1–3 sentences)."
 )
-
 
 def plan_scenes(
     client: OpenAI,
@@ -243,7 +295,6 @@ def plan_scenes(
     out: List[Dict] = []
     for i, sc in enumerate(scenes, start=1):
         out.append({
-            # Robust: always trust loop index, not model-provided labels
             "scene": i,
             "seconds": int(sc.get("seconds", seconds_per_scene)),
             "prompt": str(sc.get("prompt", "")).strip(),
@@ -259,7 +310,6 @@ def plan_scenes(
 # ----------------------------
 # Transcription -> SRT
 # ----------------------------
-
 def transcribe_audio_to_srt(
     client: OpenAI,
     audio_path: str,
@@ -284,7 +334,6 @@ def transcribe_audio_to_srt(
         return tr.text
     return str(tr)
 
-
 def write_text(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -294,12 +343,10 @@ def write_text(path: str, text: str) -> None:
 # ----------------------------
 # SRT shifting / merging
 # ----------------------------
-
 def srt_time_to_seconds(t: str) -> float:
     hh, mm, rest = t.split(":")
     ss, ms = rest.split(",")
     return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
-
 
 def seconds_to_srt_time(x: float) -> str:
     if x < 0:
@@ -321,7 +368,6 @@ def seconds_to_srt_time(x: float) -> str:
         mm -= 60
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
-
 def shift_srt(srt_text: str, offset_seconds: float) -> str:
     def repl(match: re.Match) -> str:
         start = match.group(1)
@@ -332,7 +378,6 @@ def shift_srt(srt_text: str, offset_seconds: float) -> str:
 
     pattern = re.compile(r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})")
     return pattern.sub(repl, srt_text)
-
 
 def renumber_srt_blocks(srt_text: str) -> str:
     blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.S)
@@ -352,7 +397,6 @@ def renumber_srt_blocks(srt_text: str) -> str:
 # ----------------------------
 # ffmpeg assembly: concat, mux, subtitles
 # ----------------------------
-
 def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
     ff = ffmpeg_exe()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -372,7 +416,6 @@ def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
 
     return out_path
 
-
 def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     ff = ffmpeg_exe()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -388,10 +431,8 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     ])
     return out_path
 
-
 def _escape_for_ffmpeg_filter(path: str) -> str:
     return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-
 
 def burn_in_subtitles(video_path: str, srt_path: str, out_path: str) -> str:
     """
@@ -407,6 +448,9 @@ def burn_in_subtitles(video_path: str, srt_path: str, out_path: str) -> str:
         "-i", video_path,
         "-vf", f"subtitles='{srt_escaped}'",
         "-c:v", "libx264",
+        "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
+        "-crf", os.environ.get("UAPPRESS_X264_CRF", "23"),
+        "-tune", "stillimage",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-movflags", "+faststart",
@@ -414,13 +458,11 @@ def burn_in_subtitles(video_path: str, srt_path: str, out_path: str) -> str:
     ])
     return out_path
 
-
 def embed_srt_softsubs(video_path: str, srt_path: str, out_path: str) -> str:
     """
     Keep signature for app.py compatibility. Burns subtitles in.
     """
     return burn_in_subtitles(video_path, srt_path, out_path)
-
 
 def reencode_mp4(in_path: str, out_path: str) -> str:
     ff = ffmpeg_exe()
@@ -429,6 +471,8 @@ def reencode_mp4(in_path: str, out_path: str) -> str:
         ff, "-y",
         "-i", in_path,
         "-c:v", "libx264",
+        "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
+        "-crf", os.environ.get("UAPPRESS_X264_CRF", "23"),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-movflags", "+faststart",
@@ -438,9 +482,8 @@ def reencode_mp4(in_path: str, out_path: str) -> str:
 
 
 # ----------------------------
-# Image -> Ken Burns MP4 generation (with retries + safe sizing + CACHE)
+# Image -> Ken Burns MP4 generation (Tier 1 optimized)
 # ----------------------------
-
 def _parse_size(size: str) -> Tuple[int, int]:
     if "x" not in size:
         return 1280, 720
@@ -449,7 +492,6 @@ def _parse_size(size: str) -> Tuple[int, int]:
         return int(w), int(h)
     except Exception:
         return 1280, 720
-
 
 def _best_image_size_for_video(w: int, h: int) -> str:
     """
@@ -463,6 +505,47 @@ def _best_image_size_for_video(w: int, h: int) -> str:
         return "1536x1024"
     return "1024x1536"
 
+def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
+    """
+    Continuous motion for full duration (fixes "stops early then static").
+
+    Env knobs:
+      UAPPRESS_ZOOM_START (default 1.00)
+      UAPPRESS_ZOOM_END   (default 1.08)
+      UAPPRESS_MOTION_SHAKE (0/1, default 1) -> tiny handheld feel
+      UAPPRESS_MOTION_GRAIN (0/1, default 1) -> subtle grain
+    """
+    z0 = _safe_float_env("UAPPRESS_ZOOM_START", 1.00)
+    z1 = _safe_float_env("UAPPRESS_ZOOM_END", 1.08)
+    z0 = max(1.0, min(1.25, z0))
+    z1 = max(z0, min(1.35, z1))
+
+    shake = _safe_int_env("UAPPRESS_MOTION_SHAKE", 1) == 1
+    grain = _safe_int_env("UAPPRESS_MOTION_GRAIN", 1) == 1
+
+    # Smooth linear zoom over full frames using on (output frame index)
+    # zoompan evaluates per output frame; on starts at 0.
+    # add a tiny drift so it doesn't feel like a pure center zoom.
+    zoom_expr = f"{z0}+({z1}-{z0})*on/max(1\\,{frames-1})"
+    x_expr = "iw/2-(iw/zoom/2) + (sin(on/23)*iw*0.002)"
+    y_expr = "ih/2-(ih/zoom/2) + (cos(on/19)*ih*0.002)"
+
+    vf = (
+        f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"crop={W}:{H},"
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={W}x{H},"
+        f"fps={fps},"
+        f"format=yuv420p"
+    )
+
+    # Optional “cinematic” feel (cheap, no API cost)
+    # Handheld-ish micro shake: slight rotate back/forth (very subtle)
+    if shake:
+        vf += ",rotate=0.002*sin(2*PI*t/3):bilinear=1:fillcolor=black@0"
+    if grain:
+        vf += ",noise=alls=10:allf=t+u"
+
+    return vf
 
 def generate_video_clip(
     client: OpenAI,
@@ -476,15 +559,19 @@ def generate_video_clip(
     """
     Generates a scene clip WITHOUT OpenAI video endpoint.
     Flow:
-      prompt -> OpenAI image -> ffmpeg Ken Burns motion -> mp4
+      prompt -> OpenAI image -> ffmpeg motion -> mp4
 
-    Includes:
-    - Cache reuse (PNG + MP4)
-    - Image retries + fallback to size="auto"
-    - Consistent MP4 encoding for concat stability
+    Tier 1 optimizations:
+    - Continuous motion for full duration (no static tail)
+    - Lower default FPS (env configurable) for speed
+    - Faster x264 preset+crf+tune stillimage
+    - Cache eviction to avoid Streamlit disk crashes
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    _ensure_dir(CACHE_DIR)
+
+    cache_dir = _get_cache_dir()
+    _ensure_dir(cache_dir)
+    _prune_cache(cache_dir)
 
     # Final prompt should be stable (cache key depends on it)
     img_prompt = (
@@ -493,17 +580,25 @@ def generate_video_clip(
           "photorealistic, no text overlays, no logos, no watermarks."
     )
 
+    seconds = max(1, int(seconds))
+    W, H = _parse_size(size)
+    img_size = _best_image_size_for_video(W, H)
+
+    # FPS defaults lower for speed (you can override in env)
+    fps = _safe_int_env("UAPPRESS_KB_FPS", 15)   # default 15 (faster than 30)
+    fps = max(10, min(30, fps))
+    frames = max(1, int(seconds * fps))
+
     # ----------------------------
-    # CACHE: reuse MP4 if already generated for same prompt/seconds/size
+    # CACHE: reuse MP4 if already generated for same prompt/seconds/size/fps
     # ----------------------------
-    cache_id = _cache_key("gpt-image-1", img_prompt, str(seconds), size)
-    cached_png = os.path.join(CACHE_DIR, f"{cache_id}.png")
-    cached_mp4 = os.path.join(CACHE_DIR, f"{cache_id}.mp4")
+    cache_id = _cache_key("gpt-image-1", img_prompt, str(seconds), size, f"fps={fps}")
+    cached_png = os.path.join(cache_dir, f"{cache_id}.png")
+    cached_mp4 = os.path.join(cache_dir, f"{cache_id}.mp4")
 
     if os.path.exists(cached_mp4):
         if not os.path.exists(out_path):
             _copy_file(cached_mp4, out_path)
-        # Optional: also copy cached PNG next to the clip for transparency/debugging
         png_path = out_path.replace(".mp4", ".png")
         if os.path.exists(cached_png) and not os.path.exists(png_path):
             _copy_file(cached_png, png_path)
@@ -512,14 +607,11 @@ def generate_video_clip(
     # If MP4 not cached but PNG is, we'll reuse it and only run ffmpeg
     png_path = out_path.replace(".mp4", ".png")
 
-    W, H = _parse_size(size)
-    img_size = _best_image_size_for_video(W, H)
-
     if os.path.exists(cached_png) and not os.path.exists(png_path):
         _copy_file(cached_png, png_path)
 
     if not os.path.exists(png_path):
-        # ✅ Retry image generation (handles intermittent 429/5xx)
+        # Retry image generation (handles intermittent 429/5xx)
         img = None
         last_err = None
         for attempt in range(1, 4):
@@ -535,7 +627,7 @@ def generate_video_clip(
                 last_err = e
                 time.sleep(2 * attempt)
 
-        # ✅ Fallback to size="auto" if size-specific fails
+        # Fallback to size="auto"
         if img is None and last_err is not None:
             try:
                 img = client.images.generate(
@@ -560,40 +652,38 @@ def generate_video_clip(
         with open(cached_png, "wb") as f:
             f.write(img_bytes)
 
-    # 2) Animate image into video (Ken Burns zoom/pan)
+    # Animate image into video
     ff = ffmpeg_exe()
-    fps = 30
-    frames = max(1, int(seconds * fps))
+    vf = _build_motion_vf(W, H, fps=fps, frames=frames)
 
-    vf = (
-        f"scale={W}:{H}:force_original_aspect_ratio=increase,"
-        f"crop={W}:{H},"
-        f"zoompan=z='min(zoom+0.0008,1.08)':"
-        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"d={frames}:s={W}x{H},"
-        f"fps={fps},"
-        f"format=yuv420p"
-    )
+    # Faster encode settings (big win)
+    preset = os.environ.get("UAPPRESS_X264_PRESET", "veryfast")
+    crf = os.environ.get("UAPPRESS_X264_CRF", "23")
 
-    # ✅ Consistent encoding (reduces concat failures)
     run_cmd([
         ff, "-y",
+        "-hide_banner",
+        "-loglevel", "error",
         "-loop", "1",
         "-i", png_path,
         "-t", str(seconds),
         "-vf", vf,
-        "-r", "30",
+        "-r", str(fps),
         "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", crf,
+        "-tune", "stillimage",
         "-profile:v", "high",
         "-level", "4.1",
         "-pix_fmt", "yuv420p",
-        "-g", "60",
+        "-g", str(max(30, fps * 2)),
         "-movflags", "+faststart",
         out_path
     ])
 
-    # Save MP4 into cache
+    # Save MP4 into cache + prune again
     _copy_file(out_path, cached_mp4)
+    _prune_cache(cache_dir)
 
     return out_path
 
@@ -601,7 +691,6 @@ def generate_video_clip(
 # ----------------------------
 # Packaging outputs
 # ----------------------------
-
 def zip_dir(dir_path: str, zip_path: str) -> str:
     os.makedirs(os.path.dirname(zip_path), exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
