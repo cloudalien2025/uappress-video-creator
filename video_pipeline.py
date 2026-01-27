@@ -512,8 +512,8 @@ def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
     Env knobs:
       UAPPRESS_ZOOM_START (default 1.00)
       UAPPRESS_ZOOM_END   (default 1.08)
-      UAPPRESS_MOTION_SHAKE (0/1, default 1) -> tiny handheld feel
-      UAPPRESS_MOTION_GRAIN (0/1, default 1) -> subtle grain
+      UAPPRESS_MOTION_SHAKE (0/1, default 0) -> tiny handheld feel
+      UAPPRESS_MOTION_GRAIN (0/1, default 0) -> subtle grain
     """
     z0 = _safe_float_env("UAPPRESS_ZOOM_START", 1.00)
     z1 = _safe_float_env("UAPPRESS_ZOOM_END", 1.08)
