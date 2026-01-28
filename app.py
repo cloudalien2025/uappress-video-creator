@@ -1,128 +1,109 @@
 # ============================
-# PART 1/5 — Core Setup, Sidebar Key, Config, Imports, Session State
+# PART 1/5 — Core Setup, Imports, Sidebar Key, Session State
 # ============================
-# app.py — UAPpress Video Creator (TTS ZIP → Generate Videos → MP4 Segments for CapCut)
-#
-# GOALS (current plan):
-# ✅ Upload ONE TTS Studio ZIP (scripts + audio)
-# ✅ Generate MP4 segments (Intro → Chapters → Outro) for CapCut to finish
-# ✅ NO subtitles (no Whisper, no SRT)
-# ✅ NO logos
-# ✅ NO final stitching
-# ✅ OpenAI API key entered manually in sidebar per run (public GitHub safe)
-# ✅ Code broken into 5 labeled parts for easier troubleshooting
-#
-# Repo expects: app.py + video_pipeline.py in same folder
+# app.py — UAPpress Video Creator
+# Purpose: Generate MP4 segments ONLY (CapCut handles subs, logos, transitions)
 
 from __future__ import annotations
 
 import os
-import io
-import re
-import json
-import time
-import zipfile
 import shutil
-import hashlib
-import tempfile
-import subprocess
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import streamlit as st
 from openai import OpenAI
 import imageio_ffmpeg
 
-# ✅ IMPORTANT: your repo has video_pipeline.py (NOT video_creator.py)
+# ----------------------------
+# SAFE imports — confirmed to exist in video_pipeline.py
+# ----------------------------
 from video_pipeline import (
-    # ZIP ingestion + reading
     extract_zip_to_temp,
     find_files,
     read_script_file,
     safe_slug,
     get_media_duration_seconds,
-
-    # Visual generation primitives
     plan_scenes,
     generate_video_clip,
-
-    # ffmpeg helpers
     mux_audio,
     reencode_mp4,
 )
-
-# ffmpeg binary path
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ----------------------------
 # Streamlit page setup
 # ----------------------------
 st.set_page_config(page_title="UAPpress — Video Creator", layout="wide")
 st.title("🛸 UAPpress — Video Creator")
-st.caption("Upload TTS ZIP → Generate MP4 segments only (CapCut handles subs/logo/transitions).")
+st.caption("Generate clean MP4 segments only. Finish everything in CapCut.")
 
 # ----------------------------
-# Sidebar: OpenAI API key (manual per run)
+# Sidebar — OpenAI API key (manual per run)
 # ----------------------------
 with st.sidebar:
-    st.header("🔑 OpenAI")
-    api_key = st.text_input("OpenAI API Key", type="password", value="")
-    if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
+    st.header("🔑 OpenAI API Key")
+    api_key = st.text_input("Paste your OpenAI API key", type="password")
+
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
 
 def get_client() -> OpenAI:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("Missing OpenAI API key. Paste it in the sidebar.")
+        raise RuntimeError("OpenAI API key is required.")
     return OpenAI(api_key=key)
 
 # ----------------------------
-# Basic config knobs
+# Sidebar — Output config
 # ----------------------------
 with st.sidebar:
     st.divider()
     st.header("🎞 Output")
-    resolution = st.selectbox("Resolution", ["1280x720", "1920x1080", "720x1280"], index=0)
+    resolution = st.selectbox(
+        "Video resolution",
+        ["1280x720", "1920x1080", "720x1280"],
+        index=0,
+    )
 
     cache_dir = st.text_input(
-        "Cache folder (persistent)",
+        "Cache directory",
         value=os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache"),
-        help="Used by video_pipeline.py for caching images/mp4s. Safe to delete anytime."
     ).strip() or ".uappress_cache"
 
     os.environ["UAPPRESS_CACHE_DIR"] = cache_dir
     os.makedirs(cache_dir, exist_ok=True)
 
-    if st.button("🧹 Clear cache folder"):
-        try:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            os.makedirs(cache_dir, exist_ok=True)
-            st.success("Cache cleared.")
-        except Exception as e:
-            st.error(f"Could not clear cache: {e}")
+    if st.button("🧹 Clear cache"):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(cache_dir, exist_ok=True)
+        st.success("Cache cleared.")
 
     st.divider()
-    st.header("🎬 Scene pacing")
-    max_scene_seconds = st.slider("Max seconds per scene", 10, 40, 30, 1)
-    min_scene_seconds = st.slider("Min seconds per scene", 5, 30, 20, 1)
+    st.header("🎬 Scene timing")
+    min_scene_seconds = st.slider("Min seconds per scene", 5, 30, 20)
+    max_scene_seconds = st.slider("Max seconds per scene", 10, 40, 30)
 
     st.divider()
-    st.header("🧠 Models")
-    text_model = st.selectbox("Scene planning model", ["gpt-5-mini", "gpt-5"], index=0)
+    st.header("🧠 Model")
+    text_model = st.selectbox("Scene planning model", ["gpt-5-mini", "gpt-5"])
 
 # ----------------------------
-# Session state (single source of truth)
+# ffmpeg path
 # ----------------------------
-def ensure_state() -> None:
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+# ----------------------------
+# Session state
+# ----------------------------
+def init_state() -> None:
     st.session_state.setdefault("zip_bytes", None)
     st.session_state.setdefault("workdir", "")
     st.session_state.setdefault("extract_dir", "")
     st.session_state.setdefault("scripts", [])
     st.session_state.setdefault("audios", [])
-    st.session_state.setdefault("pairs", [])          # list[dict] built in Part 2
-    st.session_state.setdefault("scripts_by_path", {})# dict[path]=text
-    st.session_state.setdefault("run_manifest", {})   # Part 3+ will track per-segment progress
+    st.session_state.setdefault("pairs", [])
+    st.session_state.setdefault("manifest", {})
 
-ensure_state()
+init_state()
 
 # ============================
 # PART 2/5 — ZIP Upload + Extraction + Pairing + Job Manifest (Resume-Safe)
