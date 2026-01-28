@@ -246,8 +246,26 @@ def _default_out_dir(extract_dir: str) -> str:
     return _safe_mkdir(str(Path(extract_dir) / "_mp4_segments"))
 
 
-def _segment_out_path(out_dir: str, segment_key: str) -> str:
-    return str(Path(out_dir) / f"{segment_key}.mp4")
+def _segment_out_path(out_dir: str, seg: dict) -> str:
+    """
+    Option A naming:
+      01_intro.mp4
+      02_chapter_01_some-title.mp4
+      99_outro.mp4
+    Uses seg['index'], seg['key'], and optional seg['title'] slug.
+    """
+    idx = int(seg.get("index", 0) or 0)
+    key = (seg.get("key") or f"segment_{idx:02d}").strip()
+
+    title = (seg.get("title") or "").strip()
+    slug = vp.safe_slug(title, max_len=40) if title else ""
+
+    if slug and slug not in key:
+        filename = f"{idx:02d}_{key}_{slug}.mp4"
+    else:
+        filename = f"{idx:02d}_{key}.mp4"
+
+    return str(Path(out_dir) / filename)
 
 
 def _request_stop() -> None:
@@ -301,7 +319,7 @@ def generate_all_segments_sequential(
 
         seg_key = seg.get("key", f"segment_{i:02d}")
         seg_label = seg.get("label", seg_key)
-        out_path = _segment_out_path(out_dir, seg_key)
+        out_path = _segment_out_path(out_dir, seg)
 
         # Skip if already exists unless overwrite
         if (not overwrite) and Path(out_path).exists():
@@ -396,32 +414,35 @@ with colC:
         disabled=st.session_state["is_generating"],
     )
 
-# ✅ Low-cost defaults (edit here if desired)
+# ✅ Scene timing controls (20s min / 40s max requested)
 colD, colE, colF = st.columns([1, 1, 1])
+
 with colD:
     max_scenes = st.number_input(
         "Max scenes per segment",
         min_value=3,
-        max_value=20,
-        value=6,  # 👈 default (lower cost)
+        max_value=60,
+        value=9,
         step=1,
         disabled=st.session_state["is_generating"],
     )
+
 with colE:
-    min_scene_seconds = st.number_input(
+    min_scene_seconds = st.slider(
         "Min seconds per scene",
-        min_value=2,
-        max_value=20,
-        value=5,  # 👈 default
+        min_value=5,
+        max_value=40,
+        value=20,
         step=1,
         disabled=st.session_state["is_generating"],
     )
+
 with colF:
-    max_scene_seconds = st.number_input(
+    max_scene_seconds = st.slider(
         "Max seconds per scene",
         min_value=int(min_scene_seconds),
-        max_value=30,
-        value=9,  # 👈 default
+        max_value=90,
+        value=40,
         step=1,
         disabled=st.session_state["is_generating"],
     )
@@ -461,7 +482,7 @@ if generate_clicked:
 
 
 # ----------------------------
-# Output previews
+# Output previews + Downloads (named files)
 # ----------------------------
 st.markdown("---")
 st.subheader("✅ Generated MP4s")
@@ -475,8 +496,18 @@ else:
         seg_key = seg.get("key")
         mp4_path = generated.get(seg_key)
         if mp4_path and Path(mp4_path).exists():
-            st.write(f"**{seg.get('label', seg_key)}**")
+            st.write(f"**{seg.get('label', seg_key)}** — `{Path(mp4_path).name}`")
             st.video(mp4_path)
+
+            # ✅ Real download button with correct filename
+            with open(mp4_path, "rb") as f:
+                st.download_button(
+                    label="⬇️ Download MP4",
+                    data=f,
+                    file_name=Path(mp4_path).name,
+                    mime="video/mp4",
+                    key=f"dl_{seg_key}",
+                )
 
 
 st.markdown("---")
