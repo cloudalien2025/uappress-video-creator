@@ -1,159 +1,236 @@
 # ============================
-# PART 1/5 — Core Setup (NO multi-line imports)
+# PART 1/5 — Core Setup (NO ZIP HASH) + Sidebar + Safe Session State + ZIP saved to disk
 # ============================
+# app.py — UAPpress Video Creator (TTS ZIP → Generate segment MP4s)
+#
+# ✅ NO ZIP hash logic (deleted)
+# ✅ Never store big ZIP bytes in session_state
+# ✅ Upload ZIP → immediately save to a temp file on disk
+# ✅ session_state stores only small strings (paths), avoiding Streamlit crashes
+# ✅ Safe session_state init (no AttributeError ever)
 
 from __future__ import annotations
 
 import os
+import io
+import re
+import json
+import time
+import zipfile
 import shutil
-from typing import Dict, List
+import tempfile
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 from openai import OpenAI
 import imageio_ffmpeg
 
-# ✅ IMPORTANT: do NOT use "from video_pipeline import ( ... )"
-# It’s too easy to break and it’s what is currently crashing your app.
-import video_pipeline as vp
+import video_pipeline as vp  # <-- your shared helpers live in video_pipeline.py
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ----------------------------
-# Streamlit page setup
+# Page setup
 # ----------------------------
 st.set_page_config(page_title="UAPpress — Video Creator", layout="wide")
-st.title("🛸 UAPpress — Video Creator")
-st.caption("Generate clean MP4 segments only. Finish subtitles/logos/transitions in CapCut.")
+st.title("🛸 UAPpress — Video Creator (TTS ZIP → Segment MP4s)")
+st.caption("Upload a TTS Studio ZIP (scripts + audio). Generate segment MP4s. (No subs, no logos, no final stitch.)")
 
 # ----------------------------
-# Sidebar — API Key + Output Config
+# Safe session_state init
+# ----------------------------
+DEFAULTS = {
+    "api_key": "",
+    "zip_local_path": "",     # where the uploaded zip is saved on disk
+    "workdir": "",            # temp working folder (optional)
+    "extract_dir": "",        # extracted zip folder (optional)
+    "segments": [],           # list[dict] pairs from vp.pair_segments
+    "zip_uploaded_name": "",  # UI only
+    "last_error": "",
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ----------------------------
+# Sidebar
 # ----------------------------
 with st.sidebar:
     st.header("🔑 OpenAI API Key")
-    api_key = st.text_input("Paste your OpenAI API key", type="password")
-
-    if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
+    st.session_state.api_key = st.text_input(
+        "Paste your OpenAI API key",
+        value=st.session_state.api_key,
+        type="password",
+        help="This is not saved anywhere except this session.",
+    )
 
     st.divider()
-    st.header("🎞 Output")
-    resolution = st.selectbox("Resolution", ["1280x720", "1920x1080", "720x1280"], index=0)
+    st.header("📦 Output")
+    resolution = st.selectbox(
+        "Resolution",
+        options=["1280x720", "1920x1080"],
+        index=0,
+        help="Applied to generated scene clips (Ken Burns).",
+        key="ui_resolution",
+    )
 
     cache_dir = st.text_input(
         "Cache directory",
         value=os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache"),
-    ).strip() or ".uappress_cache"
-
+        help="Disk cache for generated images/clips. Keeping it helps cost/speed.",
+        key="ui_cache_dir",
+    )
     os.environ["UAPPRESS_CACHE_DIR"] = cache_dir
-    os.makedirs(cache_dir, exist_ok=True)
 
-    if st.button("🧹 Clear cache"):
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        os.makedirs(cache_dir, exist_ok=True)
-        st.success("Cache cleared.")
-
-    st.divider()
-    st.header("🎬 Scene timing")
-    min_scene_seconds = st.slider("Min seconds per scene", 5, 30, 20)
-    max_scene_seconds = st.slider("Max seconds per scene", 10, 40, 30)
-
-    st.divider()
-    st.header("🧠 Model")
-    text_model = st.selectbox("Scene planning model", ["gpt-5-mini", "gpt-5"], index=0)
-
-def get_client() -> OpenAI:
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("OpenAI API key is required.")
-    return OpenAI(api_key=key)
+    if st.button("🧹 Clear cache", use_container_width=True):
+        try:
+            if os.path.isdir(cache_dir):
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            os.makedirs(cache_dir, exist_ok=True)
+            st.success("Cache cleared.")
+        except Exception as e:
+            st.error(f"Could not clear cache: {e}")
 
 # ----------------------------
-# Session State
+# Helpers (ZIP persistence)
 # ----------------------------
-st.session_state.setdefault("zip_bytes", None)
-st.session_state.setdefault("workdir", "")
-st.session_state.setdefault("extract_dir", "")
-st.session_state.setdefault("scripts", [])
-st.session_state.setdefault("audios", [])
-st.session_state.setdefault("pairs", [])
-st.session_state.setdefault("manifest", {})
+def _save_uploaded_zip_to_disk(uploaded_file) -> str:
+    """
+    Save uploaded ZIP to a stable temp folder.
+    Returns the full path. Stores NO bytes in session_state.
+    """
+    if uploaded_file is None:
+        return ""
+
+    root = tempfile.mkdtemp(prefix="uappress_zip_")
+    zip_path = os.path.join(root, "tts_studio_upload.zip")
+
+    # Streamlit UploadedFile supports getbuffer()
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    return zip_path
+
+def _reset_zip_state() -> None:
+    # Cleanup old workdir if present
+    try:
+        if st.session_state.workdir and os.path.isdir(st.session_state.workdir):
+            shutil.rmtree(st.session_state.workdir, ignore_errors=True)
+    except Exception:
+        pass
+
+    st.session_state.zip_local_path = ""
+    st.session_state.workdir = ""
+    st.session_state.extract_dir = ""
+    st.session_state.segments = []
+    st.session_state.zip_uploaded_name = ""
+    st.session_state.last_error = ""
+
+# ----------------------------
+# Upload ZIP
+# ----------------------------
+st.subheader("1) Upload ZIP from TTS Studio (scripts + audio)")
+uploaded = st.file_uploader(
+    "TTS Studio ZIP",
+    type=["zip"],
+    accept_multiple_files=False,
+    help="Must contain scripts (txt/md/json) and audio (mp3/wav/m4a...).",
+)
+
+colA, colB = st.columns([1, 1])
+
+with colA:
+    if st.button("❌ Remove ZIP", disabled=(uploaded is None and not st.session_state.zip_local_path), use_container_width=True):
+        _reset_zip_state()
+        st.rerun()
+
+# If user uploads a ZIP, immediately save it to disk and extract+detect segments.
+if uploaded is not None:
+    try:
+        # If this is a new file name, reset previous state first
+        if st.session_state.zip_uploaded_name and st.session_state.zip_uploaded_name != uploaded.name:
+            _reset_zip_state()
+
+        st.session_state.zip_uploaded_name = uploaded.name
+        st.session_state.zip_local_path = _save_uploaded_zip_to_disk(uploaded)
+
+        # Extract + discover + pair (this is cheap; no OpenAI calls)
+        with open(st.session_state.zip_local_path, "rb") as f:
+            zip_bytes = f.read()
+
+        workdir, extract_dir = vp.extract_zip_to_temp(zip_bytes)
+        scripts, audios = vp.find_files(extract_dir)
+        pairs = vp.pair_segments(scripts, audios)
+
+        st.session_state.workdir = workdir
+        st.session_state.extract_dir = extract_dir
+        st.session_state.segments = pairs
+        st.session_state.last_error = ""
+
+    except Exception as e:
+        st.session_state.last_error = f"{type(e).__name__}: {e}"
+
+# Status + segment preview
+if st.session_state.last_error:
+    st.error(st.session_state.last_error)
+
+if st.session_state.zip_local_path:
+    st.success(f"ZIP saved to disk: {st.session_state.zip_uploaded_name}")
+    st.write(f"Detected **{len(st.session_state.segments)}** segments.")
+    if st.session_state.segments:
+        with st.expander("Show detected segments"):
+            for i, p in enumerate(st.session_state.segments, start=1):
+                st.write(f"{i}. **{vp.segment_label(p)}** — {p.get('title_guess','')}")
+
+# NOTE:
+# Part 2 will add scene timing controls + the OpenAI client initializer.
+# Part 3 will be the ONE button "Generate Videos" sequential loop (no subs, no logos).
 
 # ============================
-# PART 2/5 — ZIP Upload + Extraction + Pairing + Job Manifest (Resume-Safe)
+# PART 2/5 — ZIP Upload + Extraction + Pairing (Path-only, No Manifest)
 # ============================
 
-# ----------------------------
-# Helpers: stable IDs + manifest persistence
-# ----------------------------
+import os
+import time
+import tempfile
+from pathlib import Path
+import streamlit as st
+
+# Assumes you already have these from video_pipeline.py:
+# - extract_zip_to_temp(zip_path_or_bytes, ...)  (we will call a file-path version)
+# - find_files(extract_dir)
+# - pair_segments(scripts, audios)
+# - segment_label(p)
+# - safe_slug(text)
+# - read_script_file(path)  (optional preview)
+
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
-
-def _sha1_bytes(b: bytes, max_bytes: int = 2_000_000) -> str:
-    h = hashlib.sha1()
-    h.update(b[:max_bytes])
-    return h.hexdigest()[:12]
-
-
-def _sha1_file(path: str, max_bytes: int = 2_000_000) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        h.update(f.read(max_bytes))
-    return h.hexdigest()[:12]
-
-
-def _manifest_dir(cache_dir: str) -> str:
-    d = os.path.join(cache_dir, "uappress_video_creator")
-    _ensure_dir(d)
-    return d
-
-
-def _manifest_path(cache_dir: str, zip_hash: str) -> str:
-    return os.path.join(_manifest_dir(cache_dir), f"manifest_{zip_hash}.json")
-
-
-def _load_manifest(cache_dir: str, zip_hash: str) -> Dict[str, dict]:
-    p = _manifest_path(cache_dir, zip_hash)
-    if not os.path.exists(p):
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
-    except Exception:
-        return {}
-
-
-def _save_manifest(cache_dir: str, zip_hash: str, manifest: Dict[str, dict]) -> None:
-    p = _manifest_path(cache_dir, zip_hash)
-    _ensure_dir(os.path.dirname(p))
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-
-
-def _segment_id(p: dict) -> str:
+def _save_uploaded_zip_to_disk(uploaded_file, base_dir: str) -> str:
     """
-    Deterministic segment ID: order+slug+audio hash.
-    We hash audio file so re-uploads with different audio produce new IDs.
+    Save uploaded ZIP immediately; return absolute file path.
+    Uses timestamped filename to avoid collisions without hashing.
     """
-    label = segment_label(p)
-    title = p.get("title_guess") or "segment"
-    audio_path = p.get("audio_path") or ""
-    ah = _sha1_file(audio_path) if (audio_path and os.path.exists(audio_path)) else "noaudio"
-    return f"{safe_slug(label)}__{safe_slug(title)}__{ah}"
+    _ensure_dir(base_dir)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    zip_path = os.path.join(base_dir, f"tts_studio_{ts}.zip")
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return zip_path
 
+def _build_segments(pairs: list[dict]) -> list[dict]:
+    """
+    Convert pair dicts to a stable segment structure used by Part 3.
+    Enforce order: Intro -> Chapter 1..N -> Outro -> others
+    """
+    def label_of(p): return segment_label(p)  # expected "INTRO", "CHAPTER 1", "OUTRO", etc.
 
-def _build_ordered_job_list(pairs: List[dict]) -> List[dict]:
-    """
-    Enforces strict generation order:
-      Intro → Chapters (ascending) → Outro
-    `pair_segments` already sorts well, but we lock the order explicitly.
-    """
-    intro = [p for p in pairs if segment_label(p) == "INTRO"]
-    outro = [p for p in pairs if segment_label(p) == "OUTRO"]
-    chapters = [p for p in pairs if segment_label(p).startswith("CHAPTER")]
+    intro = [p for p in pairs if label_of(p) == "INTRO"]
+    outro = [p for p in pairs if label_of(p) == "OUTRO"]
+    chapters = [p for p in pairs if label_of(p).startswith("CHAPTER")]
     others = [p for p in pairs if p not in intro + chapters + outro]
 
-    # Chapters sorted by extracted chapter_no if present; fallback title
     def ch_key(p: dict):
         n = p.get("chapter_no")
         if n is None:
@@ -161,43 +238,68 @@ def _build_ordered_job_list(pairs: List[dict]) -> List[dict]:
         return (int(n), (p.get("title_guess") or "").lower())
 
     chapters = sorted(chapters, key=ch_key)
-    # Keep others last (rare) — still deterministic
     others = sorted(others, key=lambda p: (p.get("title_guess") or "").lower())
 
-    return intro + chapters + outro + others
+    ordered = intro + chapters + outro + others
 
+    segments = []
+    for idx, p in enumerate(ordered, start=1):
+        label = label_of(p)  # e.g. "INTRO" / "CHAPTER 1" / "OUTRO"
+        title = p.get("title_guess") or ""
+        # stable key for filenames
+        key = safe_slug(label.lower().replace(" ", "_"))
+        if key.startswith("chapter_") and p.get("chapter_no") is not None:
+            key = f"chapter_{int(p['chapter_no']):02d}"
+
+        segments.append({
+            "index": idx,
+            "key": key,
+            "label": label.title() if label.isupper() else label,
+            "title": title,
+            # keep original pipeline pair for rendering
+            "pair": p,
+        })
+    return segments
 
 # ----------------------------
-# 1) Upload ZIP (TTS Studio)
+# 1) Upload ZIP
 # ----------------------------
 st.subheader("1) Upload ZIP from TTS Studio (scripts + audio)")
 zip_file = st.file_uploader("TTS Studio ZIP", type=["zip"], key="tts_zip_video_creator")
 
+# Base workspace where we store uploaded zips + extracted folders
+# (Could be a cache dir you already use; keep it path-based)
+WORK_BASE = os.environ.get("UAPPRESS_WORK_DIR", str(Path(tempfile.gettempdir()) / "uappress_video_creator"))
+_ensure_dir(WORK_BASE)
+
+# Reset on new upload
 if zip_file:
-    # Store raw bytes in session (fast)
-    st.session_state.tts_zip_bytes = zip_file.getvalue()
+    zip_path = _save_uploaded_zip_to_disk(zip_file, base_dir=WORK_BASE)
 
-    # Reset runtime state for new ZIP
-    st.session_state.pairs = []
-    st.session_state.scripts_by_path = {}
-    st.session_state.last_public_urls = []
-    st.session_state.job_manifest = {}
+    st.session_state["zip_path"] = zip_path
+    st.session_state["extract_dir"] = ""
+    st.session_state["segments"] = []
+    st.session_state["generated"] = {}     # segment_key -> mp4_path
+    st.session_state["gen_log"] = []
 
-# If no ZIP, stop early
-if not st.session_state.get("tts_zip_bytes"):
+# If no zip_path, stop early
+if not st.session_state.get("zip_path"):
     st.info("Upload the TTS Studio ZIP to detect segments.")
     st.stop()
 
-zip_hash = _sha1_bytes(st.session_state.tts_zip_bytes)
+zip_path = st.session_state["zip_path"]
 
 # ----------------------------
-# 2) Extract + pair segments
+# 2) Extract + pair segments (ONLY if not done yet)
 # ----------------------------
-if not st.session_state.pairs:
+if not st.session_state.get("segments"):
     with st.spinner("Extracting ZIP and detecting segments…"):
-        workdir, extract_dir = extract_zip_to_temp(st.session_state.tts_zip_bytes)
-        scripts, audios = find_files(extract_dir)
+        # IMPORTANT: this must accept a FILE PATH, not zip bytes.
+        # If your current extract_zip_to_temp expects bytes, we should update it
+        # or add a new helper in video_pipeline.py like extract_zip_path_to_temp(zip_path).
+        workdir, extract_dir = extract_zip_to_temp(zip_path)  # <-- must support zip_path
 
+        scripts, audios = find_files(extract_dir)
         if not scripts:
             st.error("No scripts found in ZIP. Expected scripts/*.txt")
             st.stop()
@@ -206,216 +308,267 @@ if not st.session_state.pairs:
             st.stop()
 
         pairs = pair_segments(scripts, audios)
+        segments = _build_segments(pairs)
 
-        # Cache script text for preview/metadata
-        scripts_by_path = {p: read_script_file(p) for p in scripts}
+        st.session_state["extract_dir"] = extract_dir
+        st.session_state["segments"] = segments
 
-        # Build manifest by resuming if it exists
-        manifest = _load_manifest(cache_dir, zip_hash)
-
-        # Ensure every pair has a manifest entry
-        ordered = _build_ordered_job_list(pairs)
-        for p in ordered:
-            sid = _segment_id(p)
-            manifest.setdefault(
-                sid,
-                {
-                    "label": segment_label(p),
-                    "title": p.get("title_guess") or "",
-                    "status": "pending",  # pending | done | failed
-                    "public_url": "",
-                    "error": "",
-                    "updated_at": "",
-                },
-            )
-
-        _save_manifest(cache_dir, zip_hash, manifest)
-
-        st.session_state.pairs = ordered
-        st.session_state.scripts_by_path = scripts_by_path
-        st.session_state.job_manifest = manifest
-
-        st.success(f"Detected {len(ordered)} segment(s). Manifest loaded for resume support.")
-
-pairs = st.session_state.pairs
-manifest = st.session_state.job_manifest
-scripts_by_path = st.session_state.scripts_by_path
+    st.success(f"Detected {len(st.session_state['segments'])} segment(s).")
 
 # ----------------------------
-# 3) Preview detected order + manifest status
+# 3) Preview detected order
 # ----------------------------
 st.markdown("### Detected generation order")
-for i, p in enumerate(pairs, start=1):
-    sid = _segment_id(p)
-    m = manifest.get(sid, {})
-    status = (m.get("status") or "pending").upper()
-    label = segment_label(p)
-    title = p.get("title_guess") or "Untitled"
-    st.write(f"{i}. [{label}] {title} — **{status}**")
+for s in st.session_state["segments"]:
+    label = s["label"]
+    title = s.get("title") or "Untitled"
+    st.write(f"{s['index']}. [{label}] {title}")
 
-st.caption("Next: Part 3 will add the ONE button **Generate Videos** + sequential loop + Spaces upload per segment.")
-
-# ----------------------------
-# 3) Segment generation (segments ONLY — no subs, no logo)
-# ----------------------------
-
-st.divider()
-st.subheader("3) Generate Segment MP4s (clean output for CapCut)")
-st.caption(
-    "Each segment generates a clean MP4 with narration audio only. "
-    "No subtitles, no logos, no final stitching. Finish everything in CapCut."
-)
-
-def compute_desired_scenes(seg_seconds: float) -> int:
-    total_needed = int(math.ceil(seg_seconds)) + 2
-    desired = int(math.ceil(total_needed / max_scene_seconds))
-    return max(3, min(desired, 18))
+st.caption("Next: Part 3 adds the ONE button **Generate Videos** + sequential loop.")
 
 
-def generate_segment(p: dict) -> Dict[str, str]:
-    client = get_client()
+# ============================================================
+# Part 3 — Generate Videos (sequential, stable, no crashes)
+# ============================================================
 
-    title = p["title_guess"]
-    label = segment_label(p)
-    audio_path = p["audio_path"]
-    script_path = p["script_path"]
+import gc
+import time
+from pathlib import Path
+import streamlit as st
 
-    seg_slug = f"{safe_slug(label)}_{safe_slug(title)}"
-    paths = _segment_output_paths(cache_dir, seg_slug, audio_path)
+# ---- Expected session_state from Part 1/2 (already set earlier) ----
+# st.session_state["zip_path"]        -> str (path to uploaded zip saved on disk)
+# st.session_state["extract_dir"]     -> str (path to extracted zip folder)
+# st.session_state["segments"]        -> list[dict] (detected segments in order)
+#   Each segment dict should have at least:
+#     - "key"   (e.g., "intro", "chapter_01", "outro")
+#     - "label" (e.g., "Intro", "Chapter 1", "Outro")
 
-    # If already generated, skip work
-    if os.path.exists(paths["with_audio"]):
-        return paths
+# ---- State for generation ----
+if "is_generating" not in st.session_state:
+    st.session_state["is_generating"] = False
+if "generated" not in st.session_state:
+    st.session_state["generated"] = {}  # segment_key -> mp4_path (strings only)
+if "gen_log" not in st.session_state:
+    st.session_state["gen_log"] = []    # list[str]
+if "stop_requested" not in st.session_state:
+    st.session_state["stop_requested"] = False
 
-    script_text = read_script_file(script_path)
-    seg_duration = float(get_media_duration_seconds(audio_path))
-    if seg_duration <= 0:
-        raise RuntimeError(f"Could not read duration for audio: {audio_path}")
 
-    desired_scenes = compute_desired_scenes(seg_duration)
-    st.info(f"{label} audio ≈ {seg_duration:.1f}s → up to {desired_scenes} scenes")
+def _log(msg: str) -> None:
+    st.session_state["gen_log"].append(msg)
 
-    # ---- Scene planning (LLM)
-    scenes = plan_scenes(
-        client,
-        chapter_title=title,
-        chapter_text=script_text,
-        max_scenes=desired_scenes,
-        seconds_per_scene=min_scene_seconds,
-        model=text_model,
-    )
 
-    scene_count = max(1, len(scenes))
-    total_needed = int(math.ceil(seg_duration)) + 2
+def _safe_mkdir(p: str) -> str:
+    Path(p).mkdir(parents=True, exist_ok=True)
+    return p
 
-    base = max(min_scene_seconds, int(math.floor(total_needed / scene_count)))
-    base = min(base, max_scene_seconds)
 
-    alloc = [base] * scene_count
-    remaining = total_needed - sum(alloc)
+def _default_out_dir(extract_dir: str) -> str:
+    # Keep outputs inside extracted workspace so everything stays local + path-based
+    return _safe_mkdir(str(Path(extract_dir) / "_mp4_segments"))
 
-    i = 0
-    while remaining > 0 and i < 5000:
-        idx = i % scene_count
-        if alloc[idx] < max_scene_seconds:
-            alloc[idx] += 1
-            remaining -= 1
-        i += 1
 
-    # ---- Generate scene clips
-    prog = st.progress(0.0)
+def _segment_out_path(out_dir: str, segment_key: str) -> str:
+    # Stable filenames so resume/re-run is predictable
+    return str(Path(out_dir) / f"{segment_key}.mp4")
+
+
+def _reset_generation_state() -> None:
+    st.session_state["is_generating"] = False
+    st.session_state["stop_requested"] = False
+
+
+def _request_stop() -> None:
+    st.session_state["stop_requested"] = True
+    _log("Stop requested — will stop after current segment finishes.")
+
+
+def generate_all_segments_sequential(
+    *,
+    segments: list,
+    extract_dir: str,
+    out_dir: str,
+    overwrite: bool,
+    zoom_strength: float,
+    fps: int,
+    width: int,
+    height: int,
+) -> None:
+    """
+    Generates one MP4 at a time in a single run.
+    Avoids storing large objects in session_state.
+    Updates Streamlit UI incrementally to reduce crash risk.
+    """
+    st.session_state["is_generating"] = True
+    st.session_state["stop_requested"] = False
+
+    progress = st.progress(0.0)
     status = st.empty()
-    scene_paths: List[str] = []
+    detail = st.empty()
 
-    for j, sc in enumerate(scenes, start=1):
-        sc_no = int(sc.get("scene", j))
-        sc_seconds = int(alloc[j - 1]) if j - 1 < len(alloc) else base
-        prompt = str(sc.get("prompt", "")).strip() or "cinematic documentary b-roll"
+    n = len(segments)
+    if n == 0:
+        status.error("No segments detected.")
+        _reset_generation_state()
+        return
 
-        clip_path = os.path.join(paths["dir"], f"scene_{sc_no:02d}.mp4")
+    for i, seg in enumerate(segments):
+        if st.session_state.get("stop_requested"):
+            _log("Stopped before starting next segment.")
+            break
 
-        status.write(f"Generating scene {sc_no}/{len(scenes)} ({sc_seconds}s)")
-        if not os.path.exists(clip_path):
-            generate_video_clip(
-                client,
-                prompt=prompt,
-                seconds=sc_seconds,
-                size=resolution,
-                model="unused",   # kept for compatibility
-                out_path=clip_path,
+        seg_key = seg.get("key") or f"segment_{i+1:02d}"
+        seg_label = seg.get("label") or seg_key
+        out_path = _segment_out_path(out_dir, seg_key)
+
+        # Skip if already generated (unless overwrite)
+        if (not overwrite) and Path(out_path).exists():
+            st.session_state["generated"][seg_key] = out_path
+            status.info(f"Skipping (already exists): {seg_label}")
+            progress.progress(min(1.0, (i + 1) / n))
+            continue
+
+        status.info(f"Generating {seg_label} ({i+1}/{n})…")
+        detail.caption(f"Output: {out_path}")
+
+        t0 = time.time()
+        try:
+            # ============================================================
+            # ✅ THE ONLY LINE YOU MAY NEED TO CHANGE:
+            # Call your video_pipeline function that renders ONE segment MP4.
+            #
+            # Example expected signature (adapt as needed):
+            #   render_segment_mp4(
+            #       segment=seg,
+            #       extract_dir=extract_dir,
+            #       out_path=out_path,
+            #       ken_burns=True,
+            #       zoom_only=True,
+            #       zoom_strength=zoom_strength,
+            #       fps=fps,
+            #       width=width,
+            #       height=height,
+            #   )
+            #
+            # Replace `render_segment_mp4` with your actual function name.
+            # ============================================================
+
+            render_segment_mp4(   # <-- CHANGE THIS NAME IF YOUR PIPELINE CALL DIFFERS
+                segment=seg,
+                extract_dir=extract_dir,
+                out_path=out_path,
+                ken_burns=True,
+                zoom_only=True,
+                zoom_strength=zoom_strength,
+                fps=fps,
+                width=width,
+                height=height,
             )
 
-        scene_paths.append(clip_path)
-        prog.progress(j / max(1, len(scenes)))
+            # Persist only the path (string)
+            st.session_state["generated"][seg_key] = out_path
 
-    prog.empty()
+            dt = time.time() - t0
+            _log(f"✅ Generated {seg_label} in {dt:.1f}s")
 
-    # ---- Stitch scenes
-    status.write("Stitching scenes…")
-    stitched_path = os.path.join(paths["dir"], "stitched.mp4")
+        except Exception as e:
+            _log(f"❌ Failed {seg_label}: {type(e).__name__}: {e}")
+            status.error(f"Failed generating {seg_label}. See log below.")
+            # Stop on first failure to keep state clean + avoid cascade crashes
+            break
+        finally:
+            # Aggressively free memory between segments (helps Streamlit stability)
+            gc.collect()
+            time.sleep(0.05)
 
-    try:
-        safe_concat_mp4s(scene_paths, stitched_path)
-    except Exception:
-        # Fallback: re-encode then concat
-        reencoded = []
-        for sp in scene_paths:
-            rp = sp.replace(".mp4", "_re.mp4")
-            if not os.path.exists(rp):
-                reencode_mp4(sp, rp)
-            reencoded.append(rp)
-        safe_concat_mp4s(reencoded, stitched_path)
+        progress.progress(min(1.0, (i + 1) / n))
 
-    # ---- Add narration audio (FINAL output)
-    status.write("Adding narration audio…")
-    mux_audio(stitched_path, audio_path, paths["with_audio"])
+    _reset_generation_state()
 
-    status.write("✅ Segment ready (clean MP4, no subs, no logo).")
-    status.empty()
+# ----------------------------
+# UI controls + single button
+# ----------------------------
 
-    return paths
+st.subheader("🎬 Generate Segment MP4s")
 
+extract_dir = st.session_state.get("extract_dir", "")
+segments = st.session_state.get("segments", [])
 
-# ---- UI per segment
-for idx, p in enumerate(pairs, start=1):
-    title = p["title_guess"]
-    label = segment_label(p)
-    seg_slug = f"{safe_slug(label)}_{safe_slug(title)}"
+colA, colB, colC = st.columns([1, 1, 1])
+with colA:
+    overwrite = st.checkbox("Overwrite existing MP4s", value=False, disabled=st.session_state["is_generating"])
+with colB:
+    fps = st.number_input("FPS", min_value=12, max_value=60, value=30, step=1, disabled=st.session_state["is_generating"])
+with colC:
+    zoom_strength = st.slider("Ken Burns zoom strength (zoom-only)", min_value=1.00, max_value=1.20, value=1.06, step=0.01, disabled=st.session_state["is_generating"])
 
-    with st.container(border=True):
-        st.markdown(f"### {idx}. [{label}] {title}")
-        st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
+colD, colE = st.columns([1, 1])
+with colD:
+    width = st.number_input("Width", min_value=640, max_value=3840, value=1920, step=10, disabled=st.session_state["is_generating"])
+with colE:
+    height = st.number_input("Height", min_value=360, max_value=2160, value=1080, step=10, disabled=st.session_state["is_generating"])
 
-        paths_guess = _segment_output_paths(cache_dir, seg_slug, p["audio_path"])
-        built = os.path.exists(paths_guess["with_audio"])
+if not extract_dir or not Path(extract_dir).exists():
+    st.warning("Upload/extract a ZIP first (Part 1/2).")
+else:
+    out_dir = _default_out_dir(extract_dir)
+    st.caption(f"Segments will be saved to: {out_dir}")
 
-        col1, col2, col3 = st.columns([1, 1, 2])
-        with col1:
-            do_gen = st.button("⚙️ Generate", key=f"gen_{idx}_{seg_slug}", type="primary")
-        with col2:
-            if built:
-                with open(paths_guess["with_audio"], "rb") as f:
-                    st.download_button(
-                        "⬇️ Download MP4",
-                        data=f,
-                        file_name=os.path.basename(paths_guess["with_audio"]),
-                        mime="video/mp4",
-                        key=f"dl_{idx}_{seg_slug}",
-                    )
-            else:
-                st.button("⬇️ Download MP4", disabled=True)
-        with col3:
-            st.success("Ready") if built else st.info("Not generated yet")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        generate_clicked = st.button(
+            "🚀 Generate Videos",
+            type="primary",
+            disabled=st.session_state["is_generating"] or (len(segments) == 0),
+        )
+    with col2:
+        st.button(
+            "🛑 Stop after current segment",
+            disabled=not st.session_state["is_generating"],
+            on_click=_request_stop,
+        )
 
-        if do_gen:
-            try:
-                st.warning("Generating segment…")
-                generate_segment(p)
-                st.success("Segment generated.")
-                st.rerun()
-            except Exception as e:
-                st.error("Segment failed.")
-                st.exception(e)
+    if generate_clicked:
+        # Clear stop flag + run sequential generation in this single execution
+        st.session_state["stop_requested"] = False
+        _log("Starting sequential generation…")
+        generate_all_segments_sequential(
+            segments=segments,
+            extract_dir=extract_dir,
+            out_dir=out_dir,
+            overwrite=overwrite,
+            zoom_strength=float(zoom_strength),
+            fps=int(fps),
+            width=int(width),
+            height=int(height),
+        )
+
+# ----------------------------
+# Output section
+# ----------------------------
+st.markdown("---")
+st.subheader("✅ Generated MP4s")
+
+generated = st.session_state.get("generated", {})
+if not generated:
+    st.info("No MP4s generated yet.")
+else:
+    # Display in the same order as segments
+    for seg in segments:
+        seg_key = seg.get("key")
+        seg_label = seg.get("label", seg_key)
+        mp4_path = generated.get(seg_key)
+        if mp4_path and Path(mp4_path).exists():
+            st.write(f"**{seg_label}**")
+            st.video(mp4_path)
+
+st.markdown("---")
+st.subheader("🧾 Log")
+if st.session_state.get("gen_log"):
+    st.code("\n".join(st.session_state["gen_log"][-200:]))
+else:
+    st.caption("Log will appear here.")
 
 # ============================
 # PART 4/5 — Local Artifact Browser + Troubleshooting Tools + Guardrails
