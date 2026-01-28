@@ -474,23 +474,26 @@ def write_text(path: str, text: str) -> None:
 
 def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
     """
-    Concatenate MP4 clips using ffmpeg concat demuxer.
-    Assumes all clips share codec / geometry.
+    Concatenate MP4 clips using ffmpeg concat demuxer with stream copy.
+    Assumes all MP4 clips were generated with consistent codec/settings.
     """
     if not mp4_paths:
-        raise ValueError("concat_mp4s: no input clips")
+        raise ValueError("concat_mp4s: no input mp4_paths")
 
     for p in mp4_paths:
         if not os.path.exists(p):
-            raise FileNotFoundError(f"concat_mp4s: missing clip {p}")
+            raise FileNotFoundError(f"concat_mp4s: missing input: {p}")
 
     ff = ffmpeg_exe()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
+    # concat demuxer list file
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
         list_path = tf.name
         for p in mp4_paths:
-            tf.write(f"file '{p.replace('\'', '\'\\\'\')}'\n")
+            # Correct escaping for concat file format
+            safe_p = p.replace("'", "'\\''")
+            tf.write(f"file '{safe_p}'\n")
 
     try:
         run_cmd([
@@ -506,11 +509,10 @@ def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
     finally:
         try:
             os.remove(list_path)
-        except Exception:
+        except OSError:
             pass
 
     return out_path
-
 
 def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     """
