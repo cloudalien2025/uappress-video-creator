@@ -487,7 +487,7 @@ for idx, p in enumerate(pairs, start=1):
                 st.exception(e)
 
 # ============================
-# PART 5/5 — Local Artifact Browser + Troubleshooting Tools + Guardrails
+# PART 4/5 — Local Artifact Browser + Troubleshooting Tools + Guardrails
 # ============================
 
 st.divider()
