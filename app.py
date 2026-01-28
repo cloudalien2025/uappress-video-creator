@@ -1,8 +1,6 @@
 # ============================
-# PART 1/5 — Core Setup, Imports, Sidebar Key, Session State
+# PART 1/5 — Core Setup (NO multi-line imports)
 # ============================
-# app.py — UAPpress Video Creator
-# Purpose: Generate MP4 segments ONLY (CapCut handles subs, logos, transitions)
 
 from __future__ import annotations
 
@@ -14,55 +12,32 @@ import streamlit as st
 from openai import OpenAI
 import imageio_ffmpeg
 
-# ----------------------------
-# SAFE imports — confirmed to exist in video_pipeline.py
-# ----------------------------
-from video_pipeline import (
-    extract_zip_to_temp,
-    find_files,
-    read_script_file,
-    safe_slug,
-    get_media_duration_seconds,
-    plan_scenes,
-    generate_video_clip,
-    mux_audio,
-    reencode_mp4,
-)
+# ✅ IMPORTANT: do NOT use "from video_pipeline import ( ... )"
+# It’s too easy to break and it’s what is currently crashing your app.
+import video_pipeline as vp
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ----------------------------
 # Streamlit page setup
 # ----------------------------
 st.set_page_config(page_title="UAPpress — Video Creator", layout="wide")
 st.title("🛸 UAPpress — Video Creator")
-st.caption("Generate clean MP4 segments only. Finish everything in CapCut.")
+st.caption("Generate clean MP4 segments only. Finish subtitles/logos/transitions in CapCut.")
 
 # ----------------------------
-# Sidebar — OpenAI API key (manual per run)
+# Sidebar — API Key + Output Config
 # ----------------------------
 with st.sidebar:
     st.header("🔑 OpenAI API Key")
     api_key = st.text_input("Paste your OpenAI API key", type="password")
 
-if api_key:
-    os.environ["OPENAI_API_KEY"] = api_key
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
 
-def get_client() -> OpenAI:
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("OpenAI API key is required.")
-    return OpenAI(api_key=key)
-
-# ----------------------------
-# Sidebar — Output config
-# ----------------------------
-with st.sidebar:
     st.divider()
     st.header("🎞 Output")
-    resolution = st.selectbox(
-        "Video resolution",
-        ["1280x720", "1920x1080", "720x1280"],
-        index=0,
-    )
+    resolution = st.selectbox("Resolution", ["1280x720", "1920x1080", "720x1280"], index=0)
 
     cache_dir = st.text_input(
         "Cache directory",
@@ -84,26 +59,24 @@ with st.sidebar:
 
     st.divider()
     st.header("🧠 Model")
-    text_model = st.selectbox("Scene planning model", ["gpt-5-mini", "gpt-5"])
+    text_model = st.selectbox("Scene planning model", ["gpt-5-mini", "gpt-5"], index=0)
+
+def get_client() -> OpenAI:
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OpenAI API key is required.")
+    return OpenAI(api_key=key)
 
 # ----------------------------
-# ffmpeg path
+# Session State
 # ----------------------------
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-
-# ----------------------------
-# Session state
-# ----------------------------
-def init_state() -> None:
-    st.session_state.setdefault("zip_bytes", None)
-    st.session_state.setdefault("workdir", "")
-    st.session_state.setdefault("extract_dir", "")
-    st.session_state.setdefault("scripts", [])
-    st.session_state.setdefault("audios", [])
-    st.session_state.setdefault("pairs", [])
-    st.session_state.setdefault("manifest", {})
-
-init_state()
+st.session_state.setdefault("zip_bytes", None)
+st.session_state.setdefault("workdir", "")
+st.session_state.setdefault("extract_dir", "")
+st.session_state.setdefault("scripts", [])
+st.session_state.setdefault("audios", [])
+st.session_state.setdefault("pairs", [])
+st.session_state.setdefault("manifest", {})
 
 # ============================
 # PART 2/5 — ZIP Upload + Extraction + Pairing + Job Manifest (Resume-Safe)
