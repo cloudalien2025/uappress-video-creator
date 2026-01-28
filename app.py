@@ -31,15 +31,15 @@ from openai import OpenAI
 import imageio_ffmpeg
 
 from video_pipeline import (
-    # ZIP ingestion + pairing
     extract_zip_to_temp,
     find_files,
     read_script_file,
     safe_slug,
-    pair_segments,      # expects your existing pairing helper (intro/outro/chapter matching)
-    segment_label,      # expects your existing label helper
-    # Single-segment builder (NO subtitle burn-in)
-    build_segment_mp4_no_subs,  # to be defined/updated in video_creator.py in later parts
+    plan_scenes,
+    generate_video_clip,
+    get_media_duration_seconds,
+    mux_audio,
+    reencode_mp4,
 )
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
