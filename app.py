@@ -725,17 +725,61 @@ for idx, p in enumerate(pairs, start=1):
                 st.exception(e)
 
 # ----------------------------
-# 4) Build FINAL MP4 from ZIP of segment MP4s
+# 4) Build FINAL MP4 from URL (DigitalOcean) or ZIP upload
+#    + Upload FINAL MP4 to DigitalOcean Spaces (recommended for large files)
 # ----------------------------
 
 st.divider()
-st.subheader("4) Build FINAL MP4 (stitch + logo + safe delivery)")
+st.subheader("4) Build FINAL MP4 (from URL or ZIP) — stitch + logo + safe delivery")
 st.caption(
-    "Upload a ZIP of your generated segment MP4s. "
-    "This step stitches them, applies the logo ONCE, and delivers safely."
+    "Recommended: paste a public DigitalOcean Spaces URL to your ZIP of segment MP4s. "
+    "The app downloads to server disk, stitches, applies the logo once, and can upload the FINAL MP4 back to Spaces."
 )
 
-final_zip = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="final_zip")
+source_mode = st.radio(
+    "Source",
+    ["DigitalOcean URL (recommended)", "Upload ZIP (fallback)"],
+    index=0,
+    horizontal=True,
+)
+
+zip_url = ""
+zip_upload = None
+
+if source_mode == "DigitalOcean URL (recommended)":
+    zip_url = st.text_input(
+        "Public ZIP URL (DigitalOcean Spaces)",
+        placeholder="https://YOUR-BUCKET.nyc3.digitaloceanspaces.com/uappress/exports/segments.zip",
+    )
+else:
+    zip_upload = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="final_zip_upload")
+
+def _download_zip_stream(url: str, dest_path: str) -> None:
+    import requests
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("Please paste a ZIP URL.")
+    prog = st.progress(0.0)
+    status = st.empty()
+
+    with requests.get(url, stream=True, timeout=(15, 900)) as r:
+        r.raise_for_status()
+        total = r.headers.get("Content-Length")
+        total_bytes = int(total) if total and total.isdigit() else None
+
+        downloaded = 0
+        status.write("Downloading ZIP to server disk…")
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_bytes:
+                    prog.progress(min(1.0, downloaded / max(1, total_bytes)))
+
+    prog.empty()
+    status.empty()
 
 def _probe_streams(path: str) -> str:
     r = subprocess.run(
@@ -764,8 +808,7 @@ def _sort_mp4(path: str):
     return (500000, name)
 
 def _concat_reencode(mp4s: List[str], out_path: str):
-    inputs = []
-    streams = []
+    inputs, streams = [], []
     for i, m in enumerate(mp4s):
         inputs += ["-i", m]
         streams.append(f"[{i}:v][{i}:a]")
@@ -808,21 +851,80 @@ def _overlay_logo_png_safe(in_mp4, logo_png, out_mp4):
         check=True,
     )
 
-build_final = st.button("🎬 Build FINAL MP4", type="primary", disabled=final_zip is None)
+def _get_spaces_config():
+    # Prefer Streamlit secrets; fallback to env vars
+    def _sec(k, default=None):
+        try:
+            return st.secrets.get(k, default)
+        except Exception:
+            return default
 
-if build_final and final_zip is not None:
+    do_key = _sec("DO_SPACES_KEY") or os.environ.get("DO_SPACES_KEY")
+    do_secret = _sec("DO_SPACES_SECRET") or os.environ.get("DO_SPACES_SECRET")
+    do_region = _sec("DO_SPACES_REGION", "nyc3") or os.environ.get("DO_SPACES_REGION", "nyc3")
+    do_bucket = _sec("DO_SPACES_BUCKET") or os.environ.get("DO_SPACES_BUCKET")
+    do_base = _sec("DO_SPACES_PUBLIC_BASE") or os.environ.get("DO_SPACES_PUBLIC_BASE")
+    return do_key, do_secret, do_region, do_bucket, do_base
+
+def _upload_to_spaces(local_path: str, object_key: str) -> str:
+    # Import lazily so app doesn't crash if boto3 isn't installed
+    try:
+        import boto3
+        from botocore.client import Config
+    except ModuleNotFoundError:
+        raise RuntimeError("Missing boto3. Add boto3 + botocore to requirements.txt and redeploy.")
+
+    do_key, do_secret, do_region, do_bucket, do_base = _get_spaces_config()
+    if not all([do_key, do_secret, do_region, do_bucket, do_base]):
+        raise RuntimeError("Missing Spaces config. Set DO_SPACES_KEY/SECRET/REGION/BUCKET/PUBLIC_BASE in Secrets.")
+
+    endpoint = f"https://{do_region}.digitaloceanspaces.com"
+    s3 = boto3.client(
+        "s3",
+        region_name=do_region,
+        endpoint_url=endpoint,
+        aws_access_key_id=do_key,
+        aws_secret_access_key=do_secret,
+        config=Config(signature_version="s3v4"),
+    )
+
+    object_key = (object_key or "").lstrip("/")
+    s3.upload_file(
+        local_path,
+        do_bucket,
+        object_key,
+        ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
+    )
+
+    return f"{do_base.rstrip('/')}/{object_key}"
+
+disabled = True
+if source_mode == "DigitalOcean URL (recommended)":
+    disabled = not bool((zip_url or "").strip())
+else:
+    disabled = zip_upload is None
+
+build_final = st.button("🎬 Build FINAL MP4", type="primary", disabled=disabled)
+
+if build_final:
     try:
         with tempfile.TemporaryDirectory() as td:
             zip_path = os.path.join(td, "segments.zip")
-            with open(zip_path, "wb") as f:
-                f.write(final_zip.getvalue())
 
+            # 1) Acquire ZIP onto disk
+            if source_mode == "DigitalOcean URL (recommended)":
+                _download_zip_stream(zip_url, zip_path)
+            else:
+                with open(zip_path, "wb") as f:
+                    f.write(zip_upload.getvalue())
+
+            # 2) Extract ZIP
             extract_dir = os.path.join(td, "unzipped")
             os.makedirs(extract_dir, exist_ok=True)
-
             with zipfile.ZipFile(zip_path, "r") as z:
                 z.extractall(extract_dir)
 
+            # 3) Collect MP4s
             mp4s = []
             for root, _, files in os.walk(extract_dir):
                 for fn in files:
@@ -830,12 +932,13 @@ if build_final and final_zip is not None:
                         mp4s.append(os.path.join(root, fn))
 
             if not mp4s:
-                st.error("No MP4 files found in ZIP.")
+                st.error("No MP4 files found in the ZIP.")
                 st.stop()
 
+            # 4) Validate video+audio
             valid = [m for m in mp4s if _has_video(m) and _has_audio(m)]
             if not valid:
-                st.error("No valid MP4s with video+audio found.")
+                st.error("No valid MP4s with BOTH video+audio found in the ZIP.")
                 st.stop()
 
             mp4s = sorted(valid, key=_sort_mp4)
@@ -844,20 +947,21 @@ if build_final and final_zip is not None:
             for m in mp4s:
                 st.write(f"- {os.path.basename(m)}")
 
+            # 5) Stitch
             out_dir = os.path.join(td, "out")
             os.makedirs(out_dir, exist_ok=True)
-
             full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
 
-            st.info("Stitching segments…")
+            st.info("Stitching segments (re-encode)…")
             _concat_reencode(mp4s, full_mp4)
 
             if not _has_video(full_mp4):
-                st.error("Stitched file has no video stream.")
+                st.error("Stitched output has NO video stream.")
                 st.stop()
 
             final_out = full_mp4
 
+            # 6) Apply logo once (optional)
             if apply_logo_on_final and logo_file is not None:
                 logo_path = os.path.join(out_dir, "logo.png")
                 with open(logo_path, "wb") as f:
@@ -875,23 +979,46 @@ if build_final and final_zip is not None:
             st.success("✅ Final movie ready")
             st.video(final_out)
 
+            # 7) Safe delivery
             size_mb = os.path.getsize(final_out) / (1024 * 1024)
             st.caption(f"Final size: {size_mb:.1f} MB")
 
+            st.subheader("Deliver FINAL MP4")
+
+            # Direct download only for smaller files
             BIG_MB = 200
             if size_mb < BIG_MB:
                 with open(final_out, "rb") as f:
                     st.download_button(
-                        "⬇️ Download FINAL MP4",
+                        "⬇️ Download FINAL MP4 (direct)",
                         data=f.read(),
                         file_name=os.path.basename(final_out),
                         mime="video/mp4",
                     )
             else:
-                st.warning(
-                    "File is large. Direct download may crash Streamlit.\n"
-                    "Use DigitalOcean Spaces upload (recommended)."
+                st.warning("Large file: direct download may crash Streamlit. Upload to Spaces instead.")
+
+            # Upload to Spaces (recommended)
+            do_key, do_secret, do_region, do_bucket, do_base = _get_spaces_config()
+            spaces_ready = all([do_key, do_secret, do_bucket, do_base, do_region])
+
+            if not spaces_ready:
+                st.info(
+                    "To enable 1-click Spaces upload, set Streamlit Secrets (or env vars):\n"
+                    "DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_REGION, DO_SPACES_BUCKET, DO_SPACES_PUBLIC_BASE"
                 )
+            else:
+                default_prefix = "uappress/final"
+                prefix = st.text_input("Spaces folder (prefix)", value=default_prefix).strip().strip("/")
+                filename = os.path.basename(final_out)
+                object_key = f"{prefix}/{filename}" if prefix else filename
+
+                if st.button("☁️ Upload FINAL MP4 to DigitalOcean Spaces", type="primary"):
+                    st.info("Uploading to Spaces…")
+                    url = _upload_to_spaces(final_out, object_key)
+                    st.success("✅ Uploaded!")
+                    st.write("Public URL:")
+                    st.code(url)
 
     except Exception as e:
         st.error(f"Final build failed: {e}")
