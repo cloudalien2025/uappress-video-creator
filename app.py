@@ -324,347 +324,167 @@ for i, p in enumerate(pairs, start=1):
 
 st.caption("Next: Part 3 will add the ONE button **Generate Videos** + sequential loop + Spaces upload per segment.")
 
-# ============================
-# PART 3/5 — DigitalOcean Spaces Uploader + Sequential Orchestrator (Generate Videos)
-# ============================
-
 # ----------------------------
-# Spaces config + upload helper
+# 3) Segment generation (segments ONLY — no subs, no logo)
 # ----------------------------
-def _get_spaces_config() -> Tuple[str, str, str, str, str]:
-    """
-    Returns: (do_key, do_secret, do_region, do_bucket, do_public_base)
-    Secrets/env only — do NOT request these via UI for a public repo.
-    """
-    do_key = _sec_get("DO_SPACES_KEY") or os.getenv("DO_SPACES_KEY", "")
-    do_secret = _sec_get("DO_SPACES_SECRET") or os.getenv("DO_SPACES_SECRET", "")
-    do_region = _sec_get("DO_SPACES_REGION", os.getenv("DO_SPACES_REGION", "nyc3"))
-    do_bucket = _sec_get("DO_SPACES_BUCKET") or os.getenv("DO_SPACES_BUCKET", "")
-    do_base = _sec_get("DO_SPACES_PUBLIC_BASE") or os.getenv("DO_SPACES_PUBLIC_BASE", "")
-    return do_key, do_secret, do_region, do_bucket, do_base
 
-
-def upload_to_spaces(local_path: str, object_key: str, content_type: str = "video/mp4") -> str:
-    """
-    Uploads a file to DigitalOcean Spaces and returns a public URL.
-    Requires boto3 + botocore in requirements.txt.
-
-    NOTE: If your bucket policy already makes objects public, you can remove ACL below.
-    """
-    try:
-        import boto3
-        from botocore.client import Config
-    except ModuleNotFoundError:
-        raise RuntimeError("Missing boto3/botocore. Add them to requirements.txt and redeploy.")
-
-    do_key, do_secret, do_region, do_bucket, do_base = _get_spaces_config()
-    if not all([do_key, do_secret, do_region, do_bucket]):
-        raise RuntimeError(
-            "Missing DigitalOcean Spaces config. Set DO_SPACES_KEY, DO_SPACES_SECRET, "
-            "DO_SPACES_REGION, DO_SPACES_BUCKET (and optionally DO_SPACES_PUBLIC_BASE) in Secrets/env."
-        )
-
-    endpoint = f"https://{do_region}.digitaloceanspaces.com"
-    s3 = boto3.client(
-        "s3",
-        region_name=do_region,
-        endpoint_url=endpoint,
-        aws_access_key_id=do_key,
-        aws_secret_access_key=do_secret,
-        config=Config(signature_version="s3v4"),
-    )
-
-    object_key = (object_key or "").lstrip("/")
-    extra = {"ContentType": content_type}
-
-    # If your Space blocks ACLs, remove this and rely on bucket policy.
-    extra["ACL"] = "public-read"
-
-    s3.upload_file(local_path, do_bucket, object_key, ExtraArgs=extra)
-
-    if do_base:
-        return f"{do_base.rstrip('/')}/{object_key}"
-    return f"{endpoint}/{do_bucket}/{object_key}"
-
-
-# ----------------------------
-# Per-segment temp cleanup (keeps manifest)
-# ----------------------------
-def clear_segment_workdir(cache_dir: str, segment_id: str) -> None:
-    """
-    Delete only per-segment working artifacts.
-    We keep the manifest so the run can resume.
-    """
-    seg_dir = os.path.join(_manifest_dir(cache_dir), "work", segment_id)
-    if os.path.exists(seg_dir):
-        shutil.rmtree(seg_dir, ignore_errors=True)
-
-
-def segment_object_key(prefix: str, segment_id: str, label: str, title: str) -> str:
-    """
-    Stable object naming for Spaces.
-    """
-    safe_name = f"{safe_slug(label)}_{safe_slug(title)}_{segment_id[:10]}.mp4"
-    prefix = (prefix or "").strip().strip("/")
-    return f"{prefix}/{safe_name}" if prefix else safe_name
-
-
-# ----------------------------
-# UI — Generate Videos
-# ----------------------------
 st.divider()
-st.subheader("2) Generate Videos (Sequential Upload to Spaces)")
+st.subheader("3) Generate Segment MP4s (clean output for CapCut)")
 st.caption(
-    "One-click sequential generation: Intro → Chapters → Outro. "
-    "After each MP4: upload to Spaces → clear per-segment cache → continue."
+    "Each segment generates a clean MP4 with narration audio only. "
+    "No subtitles, no logos, no final stitching. Finish everything in CapCut."
 )
 
-# Show basic readiness
-do_key, do_secret, do_region, do_bucket, do_base = _get_spaces_config()
-spaces_ready = bool(do_key and do_secret and do_region and do_bucket)
+def compute_desired_scenes(seg_seconds: float) -> int:
+    total_needed = int(math.ceil(seg_seconds)) + 2
+    desired = int(math.ceil(total_needed / max_scene_seconds))
+    return max(3, min(desired, 18))
 
-if not spaces_ready:
-    st.warning(
-        "Spaces is not fully configured. Add DO_SPACES_KEY / DO_SPACES_SECRET / DO_SPACES_REGION / DO_SPACES_BUCKET "
-        "to Streamlit Secrets or environment variables."
+
+def generate_segment(p: dict) -> Dict[str, str]:
+    client = get_client()
+
+    title = p["title_guess"]
+    label = segment_label(p)
+    audio_path = p["audio_path"]
+    script_path = p["script_path"]
+
+    seg_slug = f"{safe_slug(label)}_{safe_slug(title)}"
+    paths = _segment_output_paths(cache_dir, seg_slug, audio_path)
+
+    # If already generated, skip work
+    if os.path.exists(paths["with_audio"]):
+        return paths
+
+    script_text = read_script_file(script_path)
+    seg_duration = float(get_media_duration_seconds(audio_path))
+    if seg_duration <= 0:
+        raise RuntimeError(f"Could not read duration for audio: {audio_path}")
+
+    desired_scenes = compute_desired_scenes(seg_duration)
+    st.info(f"{label} audio ≈ {seg_duration:.1f}s → up to {desired_scenes} scenes")
+
+    # ---- Scene planning (LLM)
+    scenes = plan_scenes(
+        client,
+        chapter_title=title,
+        chapter_text=script_text,
+        max_scenes=desired_scenes,
+        seconds_per_scene=min_scene_seconds,
+        model=text_model,
     )
 
-# Options: resume behavior
-colR1, colR2, colR3 = st.columns([1, 1, 2])
-with colR1:
-    resume_done = st.checkbox("Skip segments already marked DONE", value=True)
-with colR2:
-    stop_on_fail = st.checkbox("Stop on first failure", value=True)
-with colR3:
-    st.caption("Tip: leave 'Skip DONE' enabled so you can resume after crashes.")
+    scene_count = max(1, len(scenes))
+    total_needed = int(math.ceil(seg_duration)) + 2
 
-run_btn = st.button("🚀 Generate Videos", type="primary", disabled=not spaces_ready)
+    base = max(min_scene_seconds, int(math.floor(total_needed / scene_count)))
+    base = min(base, max_scene_seconds)
 
-# Progress UI placeholders
-prog = st.progress(0.0)
-status = st.empty()
-log_box = st.container(border=True)
+    alloc = [base] * scene_count
+    remaining = total_needed - sum(alloc)
 
-if run_btn:
-    ordered_urls: List[str] = []
-    total = len(pairs)
-    manifest = _load_manifest(cache_dir, zip_hash)
+    i = 0
+    while remaining > 0 and i < 5000:
+        idx = i % scene_count
+        if alloc[idx] < max_scene_seconds:
+            alloc[idx] += 1
+            remaining -= 1
+        i += 1
 
-    for idx, p in enumerate(pairs, start=1):
-        sid = _segment_id(p)
-        label = segment_label(p)
-        title = p.get("title_guess") or "segment"
-        m = manifest.get(sid, {})
-        current_status = (m.get("status") or "pending").lower()
+    # ---- Generate scene clips
+    prog = st.progress(0.0)
+    status = st.empty()
+    scene_paths: List[str] = []
 
-        if resume_done and current_status == "done" and (m.get("public_url") or "").strip():
-            ordered_urls.append(m["public_url"])
-            with log_box:
-                st.write(f"✅ Skipping DONE: [{label}] {title}")
-            prog.progress(min(1.0, idx / max(1, total)))
-            continue
+    for j, sc in enumerate(scenes, start=1):
+        sc_no = int(sc.get("scene", j))
+        sc_seconds = int(alloc[j - 1]) if j - 1 < len(alloc) else base
+        prompt = str(sc.get("prompt", "")).strip() or "cinematic documentary b-roll"
 
-        status.write(f"Generating {idx}/{total}: [{label}] {title}")
+        clip_path = os.path.join(paths["dir"], f"scene_{sc_no:02d}.mp4")
 
-        try:
-            # Per-segment workdir so we can delete it after upload
-            work_root = os.path.join(_manifest_dir(cache_dir), "work")
-            seg_workdir = os.path.join(work_root, sid)
-            _ensure_dir(seg_workdir)
-
-            # Build MP4 (NO subtitles) — implemented in video_creator.py
-            # This function must:
-            # - generate visuals
-            # - stitch
-            # - mux audio
-            # - return the local final mp4 path
-            mp4_path = build_segment_mp4_no_subs(
-                client=client,
-                segment=p,
-                scripts_by_path=scripts_by_path,
-                resolution=resolution,
-                cache_dir=cache_dir,
-                segment_workdir=seg_workdir,
+        status.write(f"Generating scene {sc_no}/{len(scenes)} ({sc_seconds}s)")
+        if not os.path.exists(clip_path):
+            generate_video_clip(
+                client,
+                prompt=prompt,
+                seconds=sc_seconds,
+                size=resolution,
+                model="unused",   # kept for compatibility
+                out_path=clip_path,
             )
 
-            if not mp4_path or not os.path.exists(mp4_path):
-                raise RuntimeError("Segment builder returned no MP4 path (or file missing).")
+        scene_paths.append(clip_path)
+        prog.progress(j / max(1, len(scenes)))
 
-            # Upload to Spaces
-            obj_key = segment_object_key(upload_prefix, sid, label, title)
-            public_url = upload_to_spaces(mp4_path, obj_key)
+    prog.empty()
 
-            # Update manifest
-            manifest[sid] = {
-                "label": label,
-                "title": title,
-                "status": "done",
-                "public_url": public_url,
-                "error": "",
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            _save_manifest(cache_dir, zip_hash, manifest)
+    # ---- Stitch scenes
+    status.write("Stitching scenes…")
+    stitched_path = os.path.join(paths["dir"], "stitched.mp4")
 
-            ordered_urls.append(public_url)
+    try:
+        safe_concat_mp4s(scene_paths, stitched_path)
+    except Exception:
+        # Fallback: re-encode then concat
+        reencoded = []
+        for sp in scene_paths:
+            rp = sp.replace(".mp4", "_re.mp4")
+            if not os.path.exists(rp):
+                reencode_mp4(sp, rp)
+            reencoded.append(rp)
+        safe_concat_mp4s(reencoded, stitched_path)
 
-            # Clear only per-segment cache/workdir to keep disk small
-            clear_segment_workdir(cache_dir, sid)
+    # ---- Add narration audio (FINAL output)
+    status.write("Adding narration audio…")
+    mux_audio(stitched_path, audio_path, paths["with_audio"])
 
-            with log_box:
-                st.write(f"✅ DONE: [{label}] {title}")
-                st.write(f"   → {public_url}")
+    status.write("✅ Segment ready (clean MP4, no subs, no logo).")
+    status.empty()
 
-        except Exception as e:
-            manifest[sid] = {
-                "label": label,
-                "title": title,
-                "status": "failed",
-                "public_url": "",
-                "error": str(e),
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            _save_manifest(cache_dir, zip_hash, manifest)
-
-            with log_box:
-                st.write(f"❌ FAILED: [{label}] {title}")
-                st.write(f"   error: {e}")
-
-            if stop_on_fail:
-                status.write("Stopped due to failure (Stop on fail enabled).")
-                break
-
-        prog.progress(min(1.0, idx / max(1, total)))
-
-    st.session_state.job_manifest = manifest
-    st.session_state.last_public_urls = ordered_urls
-
-    status.write("Run complete (see URLs below).")
-
-# Persistently show last results
-if st.session_state.get("last_public_urls"):
-    st.markdown("### Uploaded segment URLs (in order)")
-    for u in st.session_state["last_public_urls"]:
-        st.write(u)
-
-# ============================
-# PART 4/5 — Status Dashboard + Manifest Viewer + Retry Controls
-# ============================
-
-st.divider()
-st.subheader("3) Status Dashboard (Resume + Troubleshoot)")
-
-st.caption(
-    "This dashboard reads the manifest so you can see what completed, what failed, and what’s pending. "
-    "Use it to troubleshoot without digging through logs."
-)
-
-# Always read from disk (source of truth) so reruns are consistent
-manifest = _load_manifest(cache_dir, zip_hash)
-
-# Quick stats
-total = len(pairs)
-done = sum(1 for v in manifest.values() if (v.get("status") or "").lower() == "done")
-failed = sum(1 for v in manifest.values() if (v.get("status") or "").lower() == "failed")
-pending = total - done - failed
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total", total)
-c2.metric("Done", done)
-c3.metric("Failed", failed)
-c4.metric("Pending", pending)
-
-# Controls
-colA, colB, colC = st.columns([1, 1, 2])
-with colA:
-    show_only = st.selectbox("Filter", ["All", "Pending", "Failed", "Done"], index=0)
-with colB:
-    if st.button("🔄 Reload manifest"):
-        st.rerun()
-with colC:
-    st.caption("Tip: after fixing an error, mark the failed segment back to PENDING, then rerun Generate Videos.")
-
-# Helper to render a single segment row
-def _should_show(status: str) -> bool:
-    s = (status or "pending").lower()
-    if show_only == "All":
-        return True
-    if show_only == "Pending":
-        return s == "pending"
-    if show_only == "Failed":
-        return s == "failed"
-    if show_only == "Done":
-        return s == "done"
-    return True
+    return paths
 
 
-# Display each segment in order (pairs is already ordered Intro → Chapters → Outro)
-for i, p in enumerate(pairs, start=1):
-    sid = _segment_id(p)
-    m = manifest.get(sid, {})
-    status = (m.get("status") or "pending").lower()
-    if not _should_show(status):
-        continue
-
+# ---- UI per segment
+for idx, p in enumerate(pairs, start=1):
+    title = p["title_guess"]
     label = segment_label(p)
-    title = p.get("title_guess") or "segment"
-    url = (m.get("public_url") or "").strip()
-    err = (m.get("error") or "").strip()
-    updated = (m.get("updated_at") or "").strip()
+    seg_slug = f"{safe_slug(label)}_{safe_slug(title)}"
 
     with st.container(border=True):
-        st.markdown(f"**{i}. [{label}] {title}**")
-        st.write(f"Status: `{status.upper()}`" + (f" • Updated: {updated}" if updated else ""))
+        st.markdown(f"### {idx}. [{label}] {title}")
+        st.code(f"SCRIPT: {p['script_path']}\nAUDIO:  {p['audio_path']}", language="text")
 
-        # Show pairing paths for debugging
-        st.code(
-            f"SCRIPT: {p.get('script_path','')}\nAUDIO:  {p.get('audio_path','')}",
-            language="text",
-        )
+        paths_guess = _segment_output_paths(cache_dir, seg_slug, p["audio_path"])
+        built = os.path.exists(paths_guess["with_audio"])
 
-        if url:
-            st.write("Public URL:")
-            st.write(url)
+        col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            do_gen = st.button("⚙️ Generate", key=f"gen_{idx}_{seg_slug}", type="primary")
+        with col2:
+            if built:
+                with open(paths_guess["with_audio"], "rb") as f:
+                    st.download_button(
+                        "⬇️ Download MP4",
+                        data=f,
+                        file_name=os.path.basename(paths_guess["with_audio"]),
+                        mime="video/mp4",
+                        key=f"dl_{idx}_{seg_slug}",
+                    )
+            else:
+                st.button("⬇️ Download MP4", disabled=True)
+        with col3:
+            st.success("Ready") if built else st.info("Not generated yet")
 
-        if err:
-            st.error("Last error:")
-            st.code(err, language="text")
-
-        # Actions
-        a1, a2, a3 = st.columns([1, 1, 2])
-
-        with a1:
-            if st.button("Mark PENDING", key=f"mk_pending_{sid}"):
-                m2 = manifest.get(sid, {})
-                m2["status"] = "pending"
-                m2["public_url"] = ""
-                m2["error"] = ""
-                m2["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                manifest[sid] = m2
-                _save_manifest(cache_dir, zip_hash, manifest)
-                st.success("Marked pending.")
+        if do_gen:
+            try:
+                st.warning("Generating segment…")
+                generate_segment(p)
+                st.success("Segment generated.")
                 st.rerun()
-
-        with a2:
-            if st.button("Clear Workdir", key=f"clr_work_{sid}"):
-                clear_segment_workdir(cache_dir, sid)
-                st.success("Workdir cleared.")
-                st.rerun()
-
-        with a3:
-            st.caption("Use 'Generate Videos' to run sequentially. Mark a failed one to PENDING to retry.")
-
-
-# Optional: export manifest JSON
-st.divider()
-st.subheader("Export")
-
-manifest_json = json.dumps(manifest, indent=2, ensure_ascii=False)
-st.download_button(
-    "⬇️ Download manifest JSON",
-    data=manifest_json.encode("utf-8"),
-    file_name=f"manifest_{zip_hash}.json",
-    mime="application/json",
-)
+            except Exception as e:
+                st.error("Segment failed.")
+                st.exception(e)
 
 # ============================
 # PART 5/5 — Local Artifact Browser + Troubleshooting Tools + Guardrails
