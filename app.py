@@ -726,16 +726,23 @@ for idx, p in enumerate(pairs, start=1):
 
 # ----------------------------
 # 4) Build final MP4 from ZIP of segment MP4s (logo applied once)
-#    ✅ URL streaming + validates MP4s contain VIDEO + safer concat (re-encode)
+#    ✅ PATCHES INCLUDED:
+#       - URL (DigitalOcean) streaming download to disk (avoids Streamlit RAM crashes)
+#       - Scan/probe extracted MP4s and ONLY stitch ones that have REAL VIDEO
+#       - Reliable concat using concat filter + re-encode (not concat-copy)
+#       - Safer PNG logo overlay (no scale2ref) + sanity checks before/after logo
+#       - If logo output is audio-only, auto-fallback to unbranded video
+#
+#    NOTE: Ensure you have `import requests` ONCE near the top of your file.
 # ----------------------------
 
-import requests  # keep only one import in your whole file
+import requests  # REMOVE this line if requests is already imported elsewhere in your file.
 
 st.divider()
 st.subheader("4) Build FINAL MP4 from ZIP (stitching + optional logo ONCE)")
 st.caption(
-    "Provide a ZIP URL (recommended) or upload a small ZIP for testing. "
-    "This step validates that each MP4 actually contains video before stitching."
+    "Recommended: paste a public DigitalOcean Spaces ZIP URL so the app streams to disk. "
+    "This step validates MP4 streams and prevents audio-only finals."
 )
 
 mode = st.radio(
@@ -779,7 +786,7 @@ def _download_zip_streaming(url: str, dest_path: str) -> None:
     prog = st.progress(0.0)
     status = st.empty()
 
-    with requests.get(url, stream=True, timeout=(15, 300), headers=headers) as r:
+    with requests.get(url, stream=True, timeout=(15, 600), headers=headers) as r:
         r.raise_for_status()
         total = r.headers.get("Content-Length")
         total_bytes = int(total) if total and total.isdigit() else None
@@ -801,35 +808,86 @@ def _download_zip_streaming(url: str, dest_path: str) -> None:
     prog.empty()
     status.empty()
 
-def _has_stream_marker(mp4_path: str, marker: str) -> bool:
-    # Uses ffmpeg probe output (no ffprobe dependency)
+def _ffmpeg_probe_stderr(path: str) -> str:
     p = subprocess.run(
-        [FFMPEG, "-hide_banner", "-i", mp4_path],
+        [FFMPEG, "-hide_banner", "-i", path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    return marker in (p.stderr or "")
+    return p.stderr or ""
 
-def _has_video(mp4_path: str) -> bool:
-    return _has_stream_marker(mp4_path, "Video:")
+def _has_video_stream(path: str) -> bool:
+    return "Video:" in _ffmpeg_probe_stderr(path)
 
-def _has_audio(mp4_path: str) -> bool:
-    return _has_stream_marker(mp4_path, "Audio:")
+def _has_audio_stream(path: str) -> bool:
+    return "Audio:" in _ffmpeg_probe_stderr(path)
 
-def concat_mp4s_reencode(mp4s: List[str], out_path: str) -> None:
+def _overlay_logo_png_safe(
+    in_mp4: str,
+    logo_png: str,
+    out_mp4: str,
+    *,
+    size_pct: int = 10,
+    margin_px: int = 30,
+    opacity: float = 0.9,
+) -> None:
     """
-    Safer than concat-copy: re-encodes and forces a proper video+audio output.
-    Requires that each input has BOTH video and audio streams.
+    Safer PNG overlay: avoids scale2ref and explicitly maps video+audio.
+    """
+    opacity = max(0.0, min(1.0, float(opacity)))
+    size_pct = max(3, min(30, int(size_pct)))
+    margin_px = max(0, int(margin_px))
+
+    # Scale logo relative to its own dimensions, then overlay on base video.
+    filter_complex = (
+        f"[1:v]format=rgba,"
+        f"scale=iw*{size_pct}/100:-1,"
+        f"colorchannelmixer=aa={opacity}[lg];"
+        f"[0:v][lg]overlay=x=W-w-{margin_px}:y={margin_px}:format=auto[v]"
+    )
+
+    subprocess.run(
+        [
+            FFMPEG, "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", in_mp4,
+            "-i", logo_png,
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "0:a?",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            "-shortest",
+            out_mp4,
+        ],
+        check=True,
+    )
+
+def _concat_mp4s_filter_reencode(mp4s: List[str], out_path: str) -> None:
+    """
+    Most reliable stitch: concat filter + re-encode.
+    Requires every input to have both video+audio streams.
     """
     if not mp4s:
-        raise ValueError("No MP4s to concat.")
+        raise ValueError("No MP4s to stitch.")
 
-    inputs = []
+    missing_video = [m for m in mp4s if not _has_video_stream(m)]
+    if missing_video:
+        raise RuntimeError("Some inputs have NO video stream:\n" + "\n".join(os.path.basename(x) for x in missing_video[:25]))
+
+    missing_audio = [m for m in mp4s if not _has_audio_stream(m)]
+    if missing_audio:
+        raise RuntimeError("Some inputs have NO audio stream:\n" + "\n".join(os.path.basename(x) for x in missing_audio[:25]))
+
+    inputs: List[str] = []
     for m in mp4s:
         inputs += ["-i", m]
 
-    # Build concat filter: [0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[v][a]
+    # [0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[v][a]
     parts = []
     for i in range(len(mp4s)):
         parts.append(f"[{i}:v:0][{i}:a:0]")
@@ -881,52 +939,79 @@ if build_final:
             with zipfile.ZipFile(zip_path, "r") as z:
                 z.extractall(extract_dir)
 
-            # 3) Find MP4s
-            mp4s: List[str] = []
+            # 3) Collect MP4s and probe streams
+            st.info("Scanning MP4s and validating streams…")
+
+            all_mp4s: List[str] = []
             for root, _, files in os.walk(extract_dir):
                 for fn in files:
                     if fn.lower().endswith(".mp4"):
-                        mp4s.append(os.path.join(root, fn))
+                        all_mp4s.append(os.path.join(root, fn))
+
+            if not all_mp4s:
+                st.error("No .mp4 files found in the ZIP.")
+                st.stop()
+
+            report_rows = []
+            video_mp4s: List[str] = []
+            audio_only_mp4s: List[str] = []
+            no_stream_mp4s: List[str] = []
+
+            for p in sorted(all_mp4s, key=lambda x: os.path.basename(x).lower()):
+                hv = _has_video_stream(p)
+                ha = _has_audio_stream(p)
+                report_rows.append(
+                    {"file": os.path.basename(p), "video": "YES" if hv else "NO", "audio": "YES" if ha else "NO"}
+                )
+                if hv:
+                    video_mp4s.append(p)
+                elif ha:
+                    audio_only_mp4s.append(p)
+                else:
+                    no_stream_mp4s.append(p)
+
+            st.write(f"Found {len(all_mp4s)} total .mp4 files")
+            st.write(f"✅ Video MP4s: {len(video_mp4s)}")
+            st.write(f"⚠️ Audio-only MP4s: {len(audio_only_mp4s)}")
+            if no_stream_mp4s:
+                st.write(f"⚠️ Empty/unknown MP4s: {len(no_stream_mp4s)}")
+
+            st.dataframe(report_rows, use_container_width=True, height=320)
+
+            if audio_only_mp4s:
+                st.warning("Ignoring audio-only MP4s (these would produce an audio-only final). Examples:")
+                for p in audio_only_mp4s[:25]:
+                    st.write(f"- {os.path.basename(p)}")
+
+            mp4s = sorted(video_mp4s, key=lambda p: _sort_key_mp4(os.path.basename(p)))
 
             if not mp4s:
-                st.error("No MP4 files found in the ZIP.")
+                st.error(
+                    "ZERO usable video MP4s were found in this ZIP. "
+                    "Your ZIP does not contain real video segments."
+                )
                 st.stop()
 
-            mp4s.sort(key=_sort_key_mp4)
-
-            # 4) Validate streams (THIS IS THE KEY FIX)
-            st.info("Validating MP4 streams…")
-            bad_no_video = [m for m in mp4s if not _has_video(m)]
-            bad_no_audio = [m for m in mp4s if not _has_audio(m)]
-
-            if bad_no_video:
-                st.error("Some MP4s in your ZIP have NO VIDEO stream (audio-only). Remove/regenerate these:")
-                for b in bad_no_video[:50]:
-                    st.write(f"- {os.path.basename(b)}")
-                st.stop()
-
-            if bad_no_audio:
-                st.error("Some MP4s in your ZIP have NO AUDIO stream. Remove/regenerate these:")
-                for b in bad_no_audio[:50]:
-                    st.write(f"- {os.path.basename(b)}")
-                st.stop()
-
-            st.write("MP4 order:")
+            st.write("✅ Stitch order (VIDEO MP4s only):")
             for m in mp4s:
                 st.write(f"- {os.path.basename(m)}")
 
             out_dir = os.path.join(td, "out")
             os.makedirs(out_dir, exist_ok=True)
-
             full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
 
-            # 5) Concat (re-encode, safest)
-            st.info("Stitching segments (re-encode concat)…")
-            concat_mp4s_reencode(mp4s, full_mp4)
+            # 4) Stitch (re-encode concat)
+            st.info("Stitching segments (concat filter + re-encode)…")
+            _concat_mp4s_filter_reencode(mp4s, full_mp4)
+
+            # Sanity check: stitched file MUST have video
+            if not _has_video_stream(full_mp4):
+                st.error("🚨 Stitched FULL MP4 is missing video. Something is wrong with input segments.")
+                st.stop()
 
             final_out = full_mp4
 
-            # 6) Apply logo ONCE
+            # 5) Apply logo ONCE (PNG overlay) with sanity checks + fallback
             if apply_logo_on_final and logo_file is not None:
                 st.info("Applying logo watermark to FINAL movie…")
                 logo_path = os.path.join(out_dir, "logo_upload.png")
@@ -934,7 +1019,7 @@ if build_final:
                     f.write(logo_file.getvalue())
 
                 branded = os.path.join(out_dir, "uappress_full_documentary_logo.mp4")
-                overlay_logo_mp4(
+                _overlay_logo_png_safe(
                     full_mp4,
                     logo_path,
                     branded,
@@ -942,8 +1027,15 @@ if build_final:
                     margin_px=logo_margin,
                     opacity=logo_opacity,
                 )
-                final_out = branded
 
+                # If branding breaks video, fallback
+                if not _has_video_stream(branded):
+                    st.error("🚨 Logo output became audio-only. Falling back to unbranded FULL MP4.")
+                    final_out = full_mp4
+                else:
+                    final_out = branded
+
+            # 6) Optional force re-encode (your existing helper)
             if force_reencode:
                 st.info("Force re-encoding FINAL movie…")
                 final_re = final_out.replace(".mp4", "_reencoded.mp4")
