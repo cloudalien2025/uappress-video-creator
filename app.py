@@ -1,12 +1,12 @@
 # ============================
-# PART 1/5 — ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
+# PART 1/5 — Sidebar + ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
 # ============================
 # app.py — UAPpress Video Creator
 #
-# ✅ ONE upload flow
-# ✅ ZIP saved immediately to disk
-# ✅ session_state stores only paths + small dicts
-# ✅ NO hashing, NO manifest, NO ZIP bytes in memory
+# ✅ Sidebar exists (API key + resolution)
+# ✅ ZIP saved immediately to disk (path-only in session)
+# ✅ We read ZIP bytes ONLY when extracting (not stored in session)
+# ✅ NO hashing, NO manifest, NO ZIP bytes in session_state
 # ✅ Segments normalized for Part 3
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import List, Dict
+from typing import List
 
 import streamlit as st
 import video_pipeline as vp
@@ -31,6 +31,8 @@ st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos
 # Safe session_state init
 # ----------------------------
 DEFAULTS = {
+    "api_key": "",         # OpenAI key (session only)
+    "ui_resolution": "1280x720",
     "zip_path": "",        # path to uploaded zip on disk
     "workdir": "",         # temp working directory
     "extract_dir": "",     # extracted zip folder
@@ -40,6 +42,28 @@ DEFAULTS = {
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ----------------------------
+# Sidebar (THIS is what you were missing)
+# ----------------------------
+with st.sidebar:
+    st.header("🔑 API Settings")
+    api_key_input = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        value=st.session_state.get("api_key", ""),
+        help="Required for image generation (gpt-image-1). Stored only in this session.",
+    )
+    st.session_state["api_key"] = (api_key_input or "").strip()
+
+    st.divider()
+    st.header("🎞️ Video Settings")
+    st.session_state["ui_resolution"] = st.selectbox(
+        "Resolution",
+        options=["1280x720", "1920x1080"],
+        index=0 if st.session_state.get("ui_resolution", "1280x720") == "1280x720" else 1,
+        help="Final segment MP4 resolution.",
+    )
 
 # ----------------------------
 # Helpers
@@ -74,8 +98,7 @@ def _normalize_segments(pairs: List[dict]) -> List[dict]:
     expected by Part 3.
     Enforces order: Intro → Chapters → Outro → Others
     """
-
-    def label_of(p): 
+    def label_of(p):
         return vp.segment_label(p)
 
     intro = [p for p in pairs if label_of(p) == "INTRO"]
@@ -115,7 +138,6 @@ def _normalize_segments(pairs: List[dict]) -> List[dict]:
             "title": title,
             "pair": p,  # original pipeline pair (audio + script paths)
         })
-
     return segments
 
 # ----------------------------
@@ -145,9 +167,13 @@ if uploaded is not None:
         zip_path = _save_uploaded_zip(uploaded)
         st.session_state.zip_path = zip_path
 
-        # IMPORTANT:
-        # extract_zip_to_temp MUST accept a ZIP FILE PATH
-        workdir, extract_dir = vp.extract_zip_to_temp(zip_path)
+        # ✅ IMPORTANT FIX:
+        # video_pipeline.extract_zip_to_temp expects ZIP BYTES (not a file path).
+        # So read bytes from disk (without storing them in session_state).
+        with open(zip_path, "rb") as f:
+            zip_bytes = f.read()
+
+        workdir, extract_dir = vp.extract_zip_to_temp(zip_bytes)
 
         scripts, audios = vp.find_files(extract_dir)
         if not scripts:
@@ -180,7 +206,8 @@ if st.session_state.zip_path:
         for s in st.session_state.segments:
             st.write(f"{s['index']}. **{s['label']}** — {s['title'] or 'Untitled'}")
 
-st.caption("Next: Part 3 adds the ONE **Generate Videos** button (sequential, crash-safe).")
+st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, crash-safe).")
+
 # ============================
 # PART 3/5 — Generate Segment MP4s (Sequential, Crash-Safe)
 # ============================
