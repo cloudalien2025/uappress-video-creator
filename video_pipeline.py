@@ -783,6 +783,7 @@ def generate_video_clip(
 # ✅ Auto-fit: scene count + per-scene seconds are derived from narration length
 # ✅ Enforces min/max seconds per scene
 # ✅ Still generates sequentially (app.py controls the loop)
+# ✅ FIX: removes NameError by using shutil.rmtree directly (no safe_rmtree dependency)
 #
 # REQUIRES (already in earlier parts):
 # - get_media_duration_seconds()
@@ -791,8 +792,9 @@ def generate_video_clip(
 # - concat_mp4s()
 # - mux_audio()
 # - read_script_file()
-# - safe_rmtree()
 # - _allocate_scene_seconds()   <-- must exist (add in Part 3 as discussed)
+
+import shutil  # ✅ PATCH: for cleanup
 
 def render_segment_mp4(
     *,
@@ -873,9 +875,7 @@ def render_segment_mp4(
         prompt = str(sc.get("prompt") or "").strip()
         if not prompt:
             continue
-        scenes.append(
-            {"scene": i + 1, "seconds": int(alloc[i]), "prompt": prompt}
-        )
+        scenes.append({"scene": i + 1, "seconds": int(alloc[i]), "prompt": prompt})
 
     if not scenes:
         raise RuntimeError("No usable scenes after allocation.")
@@ -919,4 +919,5 @@ def render_segment_mp4(
         return out_path
 
     finally:
-        safe_rmtree(seg_work)
+        # ✅ PATCH: no safe_rmtree() dependency, prevents NameError
+        shutil.rmtree(seg_work, ignore_errors=True)
