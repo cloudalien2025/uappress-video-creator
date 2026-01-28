@@ -726,18 +726,16 @@ for idx, p in enumerate(pairs, start=1):
 
 # ----------------------------
 # 4) Build final MP4 from ZIP of segment MP4s (logo applied once)
-#    ✅ PATCH: Use DigitalOcean (or any) ZIP URL + STREAM download to disk (no RAM blowup)
-#    NOTE: Add this near the top of your file if not already present:
-#          import requests
+#    ✅ URL streaming + validates MP4s contain VIDEO + safer concat (re-encode)
 # ----------------------------
 
-import requests  # <-- if you already have this import at the top, remove this line here.
+import requests  # keep only one import in your whole file
 
 st.divider()
 st.subheader("4) Build FINAL MP4 from ZIP (stitching + optional logo ONCE)")
 st.caption(
-    "Best practice on Streamlit Cloud: provide a ZIP URL (DigitalOcean Spaces) so the app can stream-download to disk. "
-    "Upload is kept for small test ZIPs only."
+    "Provide a ZIP URL (recommended) or upload a small ZIP for testing. "
+    "This step validates that each MP4 actually contains video before stitching."
 )
 
 mode = st.radio(
@@ -752,24 +750,21 @@ uploaded_zip = None
 
 if mode == "URL (recommended)":
     zip_url = st.text_input(
-        "ZIP URL (e.g., https://cloud-alien.nyc3.digitaloceanspaces.com/episodes/roswell/segments.zip)",
+        "ZIP URL (DigitalOcean Spaces public link)",
         value="",
-        placeholder="Paste your public DigitalOcean Spaces URL here…",
+        placeholder="https://cloud-alien.nyc3.digitaloceanspaces.com/episodes/roswell/segments.zip",
     )
 else:
     uploaded_zip = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="zip_segments_small")
 
 def _sort_key_mp4(name: str) -> Tuple[int, str]:
     base = os.path.basename(name).lower()
-    # prefer seg_01..., seg_02...
     m = re.search(r"seg[\s_\-]*0*(\d{1,4})", base)
     if m:
         return (int(m.group(1)), base)
-    # fallback: chapter number
     m2 = re.search(r"(?:chapter|ch)[\s_\-]*0*(\d{1,4})", base)
     if m2:
         return (1000 + int(m2.group(1)), base)
-    # intro/outro
     if "intro" in base:
         return (-1, base)
     if "outro" in base:
@@ -777,14 +772,9 @@ def _sort_key_mp4(name: str) -> Tuple[int, str]:
     return (500000, base)
 
 def _download_zip_streaming(url: str, dest_path: str) -> None:
-    """
-    Streams a remote ZIP to disk to avoid holding the full file in RAM.
-    Shows a progress bar when Content-Length is available.
-    """
     url = (url or "").strip()
     if not url:
         raise ValueError("Please paste a ZIP URL.")
-
     headers = {"User-Agent": "uappress-streamlit/1.0"}
     prog = st.progress(0.0)
     status = st.empty()
@@ -811,6 +801,58 @@ def _download_zip_streaming(url: str, dest_path: str) -> None:
     prog.empty()
     status.empty()
 
+def _has_stream_marker(mp4_path: str, marker: str) -> bool:
+    # Uses ffmpeg probe output (no ffprobe dependency)
+    p = subprocess.run(
+        [FFMPEG, "-hide_banner", "-i", mp4_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return marker in (p.stderr or "")
+
+def _has_video(mp4_path: str) -> bool:
+    return _has_stream_marker(mp4_path, "Video:")
+
+def _has_audio(mp4_path: str) -> bool:
+    return _has_stream_marker(mp4_path, "Audio:")
+
+def concat_mp4s_reencode(mp4s: List[str], out_path: str) -> None:
+    """
+    Safer than concat-copy: re-encodes and forces a proper video+audio output.
+    Requires that each input has BOTH video and audio streams.
+    """
+    if not mp4s:
+        raise ValueError("No MP4s to concat.")
+
+    inputs = []
+    for m in mp4s:
+        inputs += ["-i", m]
+
+    # Build concat filter: [0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[v][a]
+    parts = []
+    for i in range(len(mp4s)):
+        parts.append(f"[{i}:v:0][{i}:a:0]")
+    flt = "".join(parts) + f"concat=n={len(mp4s)}:v=1:a=1[v][a]"
+
+    subprocess.run(
+        [
+            FFMPEG, "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            *inputs,
+            "-filter_complex", flt,
+            "-map", "[v]",
+            "-map", "[a]",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            out_path,
+        ],
+        check=True,
+    )
+
 build_final_disabled = True
 if mode == "URL (recommended)":
     build_final_disabled = not bool((zip_url or "").strip())
@@ -822,17 +864,16 @@ build_final = st.button("🎞 Build FINAL MP4", type="primary", disabled=build_f
 if build_final:
     try:
         with tempfile.TemporaryDirectory() as td:
-            # 1) Get ZIP onto disk (NOT in RAM)
             zip_path = os.path.join(td, "segments.zip")
 
+            # 1) Get ZIP onto disk
             if mode == "URL (recommended)":
                 _download_zip_streaming(zip_url, zip_path)
             else:
-                # Small test ZIP only; still arrives in memory, but we write it to disk immediately.
                 with open(zip_path, "wb") as f:
                     f.write(uploaded_zip.getvalue())
 
-            # 2) Extract ZIP
+            # 2) Extract
             extract_dir = os.path.join(td, "unzipped")
             os.makedirs(extract_dir, exist_ok=True)
 
@@ -853,32 +894,39 @@ if build_final:
 
             mp4s.sort(key=_sort_key_mp4)
 
+            # 4) Validate streams (THIS IS THE KEY FIX)
+            st.info("Validating MP4 streams…")
+            bad_no_video = [m for m in mp4s if not _has_video(m)]
+            bad_no_audio = [m for m in mp4s if not _has_audio(m)]
+
+            if bad_no_video:
+                st.error("Some MP4s in your ZIP have NO VIDEO stream (audio-only). Remove/regenerate these:")
+                for b in bad_no_video[:50]:
+                    st.write(f"- {os.path.basename(b)}")
+                st.stop()
+
+            if bad_no_audio:
+                st.error("Some MP4s in your ZIP have NO AUDIO stream. Remove/regenerate these:")
+                for b in bad_no_audio[:50]:
+                    st.write(f"- {os.path.basename(b)}")
+                st.stop()
+
             st.write("MP4 order:")
             for m in mp4s:
                 st.write(f"- {os.path.basename(m)}")
 
-            # 4) Concat
             out_dir = os.path.join(td, "out")
             os.makedirs(out_dir, exist_ok=True)
 
             full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
 
-            st.info("Concatenating segments…")
-            try:
-                safe_concat_mp4s(mp4s, full_mp4)
-            except Exception:
-                st.info("Concat-copy failed; re-encoding segments for compatibility…")
-                reencoded = []
-                for mp in mp4s:
-                    rp = mp.replace(".mp4", "_reencoded.mp4")
-                    if not os.path.exists(rp):
-                        reencode_mp4(mp, rp)
-                    reencoded.append(rp)
-                safe_concat_mp4s(reencoded, full_mp4)
+            # 5) Concat (re-encode, safest)
+            st.info("Stitching segments (re-encode concat)…")
+            concat_mp4s_reencode(mp4s, full_mp4)
 
             final_out = full_mp4
 
-            # 5) Apply logo ONCE (Option A)
+            # 6) Apply logo ONCE
             if apply_logo_on_final and logo_file is not None:
                 st.info("Applying logo watermark to FINAL movie…")
                 logo_path = os.path.join(out_dir, "logo_upload.png")
@@ -896,7 +944,6 @@ if build_final:
                 )
                 final_out = branded
 
-            # 6) Optional force re-encode
             if force_reencode:
                 st.info("Force re-encoding FINAL movie…")
                 final_re = final_out.replace(".mp4", "_reencoded.mp4")
