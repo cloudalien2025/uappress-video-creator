@@ -178,7 +178,6 @@ def get_media_duration_seconds(path: str) -> float:
     ss = float(m.group(3))
     return hh * 3600 + mm * 60 + ss
 
-
 # ----------------------------
 # ZIP + file discovery
 # ----------------------------
