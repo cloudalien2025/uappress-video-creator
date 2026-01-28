@@ -206,6 +206,14 @@ def best_match_pairs(scripts: List[str], audios: List[str]) -> List[Dict]:
     """
     Pair script + audio by chapter number if possible; fallback to token overlap.
     """
+    def is_chapter_file(p: str) -> bool:
+        base = os.path.basename(p).lower()
+        return base.startswith("chapter_") and (extract_int_prefix(base) is not None)
+
+    # Only pair real chapter files — prevents intro/topic/outro stealing audio
+    scripts = [s for s in scripts if is_chapter_file(s)]
+    audios  = [a for a in audios  if is_chapter_file(a)]
+
     audio_by_num: Dict[int, List[str]] = {}
     for a in audios:
         n = extract_int_prefix(a)
