@@ -8,11 +8,10 @@
 # ✅ Cache pruning to prevent Streamlit disk bloat
 # ✅ No “shake” (hard disabled)
 # ✅ Keeps compatibility helpers used by app.py / video_creator.py
-# ✅ Pairing supports Intro / Chapters / Outro (your new sequential generation needs this)
+# ✅ Pairing supports Intro / Chapters / Outro
 #
-# NOTE: Subtitle functions still exist for compatibility, but the *video creator app*
-# will not call them (CapCut will handle subtitles). We keep them here because other
-# code may import them.
+# NOTE: Subtitle functions still exist for compatibility, but the video creator app
+# will not call them (CapCut will handle subtitles).
 
 from __future__ import annotations
 
@@ -26,7 +25,7 @@ import base64
 import tempfile
 import subprocess
 import hashlib
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import imageio_ffmpeg
 from openai import OpenAI
@@ -35,9 +34,8 @@ from openai import OpenAI
 # ----------------------------
 # Cache (Tier 1 optimized)
 # ----------------------------
-# Key change: DO NOT freeze cache dir at import time.
-# Read env each call, because Streamlit sets env AFTER import sometimes.
 def _get_cache_dir() -> str:
+    # DO NOT freeze cache dir at import time
     return os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache")
 
 
@@ -51,7 +49,7 @@ def _cache_key(*parts: str) -> str:
 
 
 def _copy_file(src: str, dst: str) -> None:
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
     with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
         fdst.write(fsrc.read())
 
@@ -73,11 +71,11 @@ def _safe_float_env(name: str, default: float) -> float:
 def _prune_cache(cache_dir: str) -> None:
     """
     Evict oldest files if cache grows beyond limit.
-    This prevents Streamlit Cloud restarts/crashes due to disk bloat.
+    Prevents Streamlit Cloud restarts/crashes due to disk bloat.
 
     Env:
-      UAPPRESS_CACHE_MAX_MB (default 1200)  -> ~1.2 GB
-      UAPPRESS_CACHE_PRUNE_MIN_FREE_MB (default 150) -> keep headroom
+      UAPPRESS_CACHE_MAX_MB (default 1200)
+      UAPPRESS_CACHE_PRUNE_MIN_FREE_MB (default 150)
     """
     max_mb = _safe_int_env("UAPPRESS_CACHE_MAX_MB", 1200)
     min_free_mb = _safe_int_env("UAPPRESS_CACHE_PRUNE_MIN_FREE_MB", 150)
@@ -106,8 +104,7 @@ def _prune_cache(cache_dir: str) -> None:
         if total <= max_bytes:
             return
 
-        # Delete oldest first
-        files.sort(key=lambda x: x[0])
+        files.sort(key=lambda x: x[0])  # oldest first
 
         target = max(0, max_bytes - (min_free_mb * 1024 * 1024))
         for _, size, path in files:
@@ -119,7 +116,6 @@ def _prune_cache(cache_dir: str) -> None:
             if total <= target:
                 break
     except Exception:
-        # never crash pipeline due to prune issues
         return
 
 
@@ -229,9 +225,7 @@ def read_script_file(path: str) -> str:
 
 
 # ----------------------------
-# Pairing helpers (TTS ZIP: scripts + audio)
-#   - Supports Intro / Outro / Chapter N
-#   - Falls back to token overlap
+# Pairing helpers (Intro / Chapter N / Outro)
 # ----------------------------
 def _is_intro_name(name: str) -> bool:
     b = os.path.splitext(os.path.basename(name))[0].lower()
@@ -261,7 +255,6 @@ def _chapter_no_from_name(name: str) -> Optional[int]:
 
 
 def segment_label(p: dict) -> str:
-    # Used by app.py ordering + naming
     if _is_intro_name(p.get("title_guess", "")) or _is_intro_name(p.get("script_path", "")) or _is_intro_name(p.get("audio_path", "")):
         return "INTRO"
     if _is_outro_name(p.get("title_guess", "")) or _is_outro_name(p.get("script_path", "")) or _is_outro_name(p.get("audio_path", "")):
@@ -275,13 +268,13 @@ def segment_label(p: dict) -> str:
 def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict]:
     """
     Creates pairs:
-      - intro script ↔ intro audio (by name)
-      - outro script ↔ outro audio (by name)
-      - chapter_N script ↔ chapter_N audio (by extracted chapter number)
-    Falls back to token overlap if needed.
+      - intro script ↔ intro audio
+      - outro script ↔ outro audio
+      - chapter_N script ↔ chapter_N audio
+    Falls back to token overlap.
     """
 
-    def norm_tokens(s: str) -> set[str]:
+    def norm_tokens(s: str) -> Set[str]:
         s = (s or "").lower()
         toks = set(re.split(r"[^a-z0-9]+", s))
         toks.discard("")
