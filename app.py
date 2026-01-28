@@ -1,16 +1,18 @@
 # ============================
-# PART 1/5 — Core Setup, Sidebar Keys, Config, Imports, Session State
+# PART 1/5 — Core Setup, Sidebar Key, Config, Imports, Session State
 # ============================
-# app.py — UAPpress Video Creator (TTS ZIP → Generate Videos → Upload each MP4 to Spaces)
+# app.py — UAPpress Video Creator (TTS ZIP → Generate Videos → MP4 Segments for CapCut)
 #
-# GOALS (per your new plan):
+# GOALS (current plan):
 # ✅ Upload ONE TTS Studio ZIP (scripts + audio)
-# ✅ ONE button: "Generate Videos"
-# ✅ Sequential generation order: Intro → Chapters 1..N → Outro
-# ✅ After each MP4: upload to DigitalOcean Spaces → clear per-segment cache → continue
-# ✅ NO subtitle burn-in (you’ll do subtitles in CapCut)
+# ✅ Generate MP4 segments (Intro → Chapters → Outro) for CapCut to finish
+# ✅ NO subtitles (no Whisper, no SRT)
+# ✅ NO logos
+# ✅ NO final stitching
 # ✅ OpenAI API key entered manually in sidebar per run (public GitHub safe)
-# ✅ app.py broken into 5+ labeled parts for easier troubleshooting
+# ✅ Code broken into 5 labeled parts for easier troubleshooting
+#
+# Repo expects: app.py + video_pipeline.py in same folder
 
 from __future__ import annotations
 
@@ -30,122 +32,97 @@ import streamlit as st
 from openai import OpenAI
 import imageio_ffmpeg
 
+# ✅ IMPORTANT: your repo has video_pipeline.py (NOT video_creator.py)
 from video_pipeline import (
+    # ZIP ingestion + reading
     extract_zip_to_temp,
     find_files,
     read_script_file,
     safe_slug,
+    get_media_duration_seconds,
+
+    # Visual generation primitives
     plan_scenes,
     generate_video_clip,
-    get_media_duration_seconds,
+
+    # ffmpeg helpers
     mux_audio,
     reencode_mp4,
 )
 
+# ffmpeg binary path
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-
 # ----------------------------
-# Page setup
+# Streamlit page setup
 # ----------------------------
 st.set_page_config(page_title="UAPpress — Video Creator", layout="wide")
-st.title("🛸 UAPpress — Video Creator (TTS ZIP → MP4s → Spaces)")
-st.caption(
-    "Upload the ZIP from TTS Studio. Click **Generate Videos** to build Intro → Chapters → Outro sequentially. "
-    "Each MP4 uploads to DigitalOcean Spaces immediately. Subtitles are NOT burned in (CapCut later)."
-)
-
+st.title("🛸 UAPpress — Video Creator")
+st.caption("Upload TTS ZIP → Generate MP4 segments only (CapCut handles subs/logo/transitions).")
 
 # ----------------------------
-# Sidebar — API key + Spaces config + output options
+# Sidebar: OpenAI API key (manual per run)
 # ----------------------------
-def _sec_get(key: str, default=None):
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-
-
 with st.sidebar:
-    st.header("🔐 Keys (not saved)")
-    st.caption("OpenAI key is kept only in session memory. Spaces creds come from Secrets/env.")
+    st.header("🔑 OpenAI")
+    api_key = st.text_input("OpenAI API Key", type="password", value="")
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
 
-    st.session_state.setdefault("OPENAI_API_KEY_INPUT", "")
-    api_key_input = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        key="OPENAI_API_KEY_INPUT",
-        placeholder="sk-...",
-        help="Stored only in st.session_state for this run (not written to disk).",
-    )
+def get_client() -> OpenAI:
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Missing OpenAI API key. Paste it in the sidebar.")
+    return OpenAI(api_key=key)
 
-    st.divider()
-    st.header("☁️ DigitalOcean Spaces")
-    st.caption("Set these in Streamlit Secrets for safety (recommended).")
-
-    # Prefer secrets/env; do NOT ask user to type Spaces secrets in a public app.
-    DO_SPACES_REGION = _sec_get("DO_SPACES_REGION", os.getenv("DO_SPACES_REGION", "nyc3"))
-    DO_SPACES_BUCKET = _sec_get("DO_SPACES_BUCKET", os.getenv("DO_SPACES_BUCKET", ""))
-    DO_SPACES_PUBLIC_BASE = _sec_get("DO_SPACES_PUBLIC_BASE", os.getenv("DO_SPACES_PUBLIC_BASE", ""))
-
-    st.text_input("Region", value=DO_SPACES_REGION, disabled=True)
-    st.text_input("Bucket", value=DO_SPACES_BUCKET, disabled=True)
-    st.text_input("Public base URL (optional)", value=DO_SPACES_PUBLIC_BASE, disabled=True)
-
+# ----------------------------
+# Basic config knobs
+# ----------------------------
+with st.sidebar:
     st.divider()
     st.header("🎞 Output")
     resolution = st.selectbox("Resolution", ["1280x720", "1920x1080", "720x1280"], index=0)
 
-    # Persistent cache directory
     cache_dir = st.text_input(
         "Cache folder (persistent)",
         value=os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache"),
-        help="Used for temporary assets and checkpoints. Safe to clear if needed.",
-    )
-    os.environ["UAPPRESS_CACHE_DIR"] = cache_dir
+        help="Used by video_pipeline.py for caching images/mp4s. Safe to delete anytime."
+    ).strip() or ".uappress_cache"
 
-    # Where to upload each segment MP4 in Spaces
-    upload_prefix = st.text_input(
-        "Spaces upload folder (prefix)",
-        value="uappress/segments",
-        help="Example: uappress/segments",
-    ).strip().strip("/")
+    os.environ["UAPPRESS_CACHE_DIR"] = cache_dir
+    os.makedirs(cache_dir, exist_ok=True)
+
+    if st.button("🧹 Clear cache folder"):
+        try:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            os.makedirs(cache_dir, exist_ok=True)
+            st.success("Cache cleared.")
+        except Exception as e:
+            st.error(f"Could not clear cache: {e}")
 
     st.divider()
-    st.header("🧹 Utilities")
-    if st.button("Clear cache folder"):
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir, ignore_errors=True)
-        os.makedirs(cache_dir, exist_ok=True)
-        st.success("Cache cleared.")
+    st.header("🎬 Scene pacing")
+    max_scene_seconds = st.slider("Max seconds per scene", 10, 40, 30, 1)
+    min_scene_seconds = st.slider("Min seconds per scene", 5, 30, 20, 1)
 
-
-# ----------------------------
-# OpenAI client (requires sidebar key)
-# ----------------------------
-api_key = (api_key_input or "").strip()
-if not api_key:
-    st.warning("Enter your OpenAI API key in the sidebar to begin.")
-    st.stop()
-
-client = OpenAI(api_key=api_key)
-
+    st.divider()
+    st.header("🧠 Models")
+    text_model = st.selectbox("Scene planning model", ["gpt-5-mini", "gpt-5"], index=0)
 
 # ----------------------------
-# Minimal session state (job + results)
+# Session state (single source of truth)
 # ----------------------------
-st.session_state.setdefault("tts_zip_bytes", None)
-st.session_state.setdefault("pairs", [])
-st.session_state.setdefault("scripts_by_path", {})
-st.session_state.setdefault("job_manifest", {})  # segment_id -> {status, url, error}
-st.session_state.setdefault("last_public_urls", [])  # list of uploaded URLs (ordered)
+def ensure_state() -> None:
+    st.session_state.setdefault("zip_bytes", None)
+    st.session_state.setdefault("workdir", "")
+    st.session_state.setdefault("extract_dir", "")
+    st.session_state.setdefault("scripts", [])
+    st.session_state.setdefault("audios", [])
+    st.session_state.setdefault("pairs", [])          # list[dict] built in Part 2
+    st.session_state.setdefault("scripts_by_path", {})# dict[path]=text
+    st.session_state.setdefault("run_manifest", {})   # Part 3+ will track per-segment progress
 
-
-# NOTE:
-# Part 2 will cover:
-# - ZIP uploader + extraction
-# - segment pairing Intro/Chapters/Outro
-# - building a deterministic job list + checkpoint manifest
+ensure_state()
 
 # ============================
 # PART 2/5 — ZIP Upload + Extraction + Pairing + Job Manifest (Resume-Safe)
