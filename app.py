@@ -726,13 +726,38 @@ for idx, p in enumerate(pairs, start=1):
 
 # ----------------------------
 # 4) Build final MP4 from ZIP of segment MP4s (logo applied once)
+#    ✅ PATCH: Use DigitalOcean (or any) ZIP URL + STREAM download to disk (no RAM blowup)
+#    NOTE: Add this near the top of your file if not already present:
+#          import requests
 # ----------------------------
+
+import requests  # <-- if you already have this import at the top, remove this line here.
 
 st.divider()
 st.subheader("4) Build FINAL MP4 from ZIP (stitching + optional logo ONCE)")
-st.caption("Upload a ZIP containing your already-generated segment MP4s. This step does NO OpenAI calls.")
+st.caption(
+    "Best practice on Streamlit Cloud: provide a ZIP URL (DigitalOcean Spaces) so the app can stream-download to disk. "
+    "Upload is kept for small test ZIPs only."
+)
 
-final_zip = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="zip_segments")
+mode = st.radio(
+    "ZIP source",
+    ["URL (recommended)", "Upload (small test ZIP only)"],
+    index=0,
+    horizontal=True,
+)
+
+zip_url = ""
+uploaded_zip = None
+
+if mode == "URL (recommended)":
+    zip_url = st.text_input(
+        "ZIP URL (e.g., https://cloud-alien.nyc3.digitaloceanspaces.com/episodes/roswell/segments.zip)",
+        value="",
+        placeholder="Paste your public DigitalOcean Spaces URL here…",
+    )
+else:
+    uploaded_zip = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="zip_segments_small")
 
 def _sort_key_mp4(name: str) -> Tuple[int, str]:
     base = os.path.basename(name).lower()
@@ -751,19 +776,76 @@ def _sort_key_mp4(name: str) -> Tuple[int, str]:
         return (999999, base)
     return (500000, base)
 
-build_final = st.button("🎞 Build FINAL MP4", type="primary", disabled=(final_zip is None))
+def _download_zip_streaming(url: str, dest_path: str) -> None:
+    """
+    Streams a remote ZIP to disk to avoid holding the full file in RAM.
+    Shows a progress bar when Content-Length is available.
+    """
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("Please paste a ZIP URL.")
 
-if build_final and final_zip is not None:
+    headers = {"User-Agent": "uappress-streamlit/1.0"}
+    prog = st.progress(0.0)
+    status = st.empty()
+
+    with requests.get(url, stream=True, timeout=(15, 300), headers=headers) as r:
+        r.raise_for_status()
+        total = r.headers.get("Content-Length")
+        total_bytes = int(total) if total and total.isdigit() else None
+
+        downloaded = 0
+        chunk_size = 1024 * 1024  # 1MB
+
+        status.write("Downloading ZIP to server disk…")
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_bytes:
+                    prog.progress(min(1.0, downloaded / max(1, total_bytes)))
+
+    prog.empty()
+    status.empty()
+
+build_final_disabled = True
+if mode == "URL (recommended)":
+    build_final_disabled = not bool((zip_url or "").strip())
+else:
+    build_final_disabled = uploaded_zip is None
+
+build_final = st.button("🎞 Build FINAL MP4", type="primary", disabled=build_final_disabled)
+
+if build_final:
     try:
         with tempfile.TemporaryDirectory() as td:
-            with zipfile.ZipFile(final_zip, "r") as z:
-                z.extractall(td)
+            # 1) Get ZIP onto disk (NOT in RAM)
+            zip_path = os.path.join(td, "segments.zip")
 
-            mp4s = []
-            for root, _, files in os.walk(td):
-                for f in files:
-                    if f.lower().endswith(".mp4"):
-                        mp4s.append(os.path.join(root, f))
+            if mode == "URL (recommended)":
+                _download_zip_streaming(zip_url, zip_path)
+            else:
+                # Small test ZIP only; still arrives in memory, but we write it to disk immediately.
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_zip.getvalue())
+
+            # 2) Extract ZIP
+            extract_dir = os.path.join(td, "unzipped")
+            os.makedirs(extract_dir, exist_ok=True)
+
+            st.info("Extracting ZIP…")
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(extract_dir)
+
+            # 3) Find MP4s
+            mp4s: List[str] = []
+            for root, _, files in os.walk(extract_dir):
+                for fn in files:
+                    if fn.lower().endswith(".mp4"):
+                        mp4s.append(os.path.join(root, fn))
 
             if not mp4s:
                 st.error("No MP4 files found in the ZIP.")
@@ -775,12 +857,13 @@ if build_final and final_zip is not None:
             for m in mp4s:
                 st.write(f"- {os.path.basename(m)}")
 
+            # 4) Concat
             out_dir = os.path.join(td, "out")
             os.makedirs(out_dir, exist_ok=True)
 
             full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
 
-            st.info("Concatenating…")
+            st.info("Concatenating segments…")
             try:
                 safe_concat_mp4s(mp4s, full_mp4)
             except Exception:
@@ -795,7 +878,7 @@ if build_final and final_zip is not None:
 
             final_out = full_mp4
 
-            # Apply logo ONCE (Option A)
+            # 5) Apply logo ONCE (Option A)
             if apply_logo_on_final and logo_file is not None:
                 st.info("Applying logo watermark to FINAL movie…")
                 logo_path = os.path.join(out_dir, "logo_upload.png")
@@ -813,6 +896,7 @@ if build_final and final_zip is not None:
                 )
                 final_out = branded
 
+            # 6) Optional force re-encode
             if force_reencode:
                 st.info("Force re-encoding FINAL movie…")
                 final_re = final_out.replace(".mp4", "_reencoded.mp4")
