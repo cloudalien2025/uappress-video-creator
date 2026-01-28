@@ -30,7 +30,7 @@ import streamlit as st
 from openai import OpenAI
 import imageio_ffmpeg
 
-from video_creator import (
+from video_pipeline import (
     # ZIP ingestion + pairing
     extract_zip_to_temp,
     find_files,
