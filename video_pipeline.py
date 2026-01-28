@@ -540,6 +540,76 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     ])
     return out_path
 
+def _allocate_scene_seconds(total_seconds: int, n_scenes: int, *, min_scene: int, max_scene: int) -> List[int]:
+    """
+    Distribute total_seconds across n_scenes with per-scene bounds.
+    Returns list length n_scenes that sums to total_seconds (best effort).
+    """
+    total_seconds = max(1, int(total_seconds))
+    n_scenes = max(1, int(n_scenes))
+    min_scene = max(1, int(min_scene))
+    max_scene = max(min_scene, int(max_scene))
+
+    # Start equal split
+    base = total_seconds // n_scenes
+    secs = [base] * n_scenes
+
+    # Remainder
+    rem = total_seconds - sum(secs)
+    i = 0
+    while rem > 0:
+        secs[i % n_scenes] += 1
+        rem -= 1
+        i += 1
+
+    # Cap at max_scene by redistributing overflow
+    for i in range(n_scenes):
+        if secs[i] > max_scene:
+            overflow = secs[i] - max_scene
+            secs[i] = max_scene
+            j = 1
+            while overflow > 0 and j <= n_scenes:
+                k = (i + j) % n_scenes
+                room = max_scene - secs[k]
+                if room > 0:
+                    add = min(room, overflow)
+                    secs[k] += add
+                    overflow -= add
+                j += 1
+
+    # Raise to min_scene by borrowing from largest
+    for i in range(n_scenes):
+        if secs[i] < min_scene:
+            need = min_scene - secs[i]
+            secs[i] = min_scene
+            while need > 0:
+                donor = max(range(n_scenes), key=lambda d: secs[d])
+                if secs[donor] <= min_scene:
+                    break
+                take = min(need, secs[donor] - min_scene)
+                secs[donor] -= take
+                need -= take
+
+    # Final nudge to match total_seconds
+    diff = total_seconds - sum(secs)
+    if diff > 0:
+        for i in range(n_scenes):
+            if diff == 0:
+                break
+            if secs[i] < max_scene:
+                secs[i] += 1
+                diff -= 1
+    elif diff < 0:
+        diff = -diff
+        for i in range(n_scenes):
+            if diff == 0:
+                break
+            if secs[i] > min_scene:
+                secs[i] -= 1
+                diff -= 1
+
+    return secs
+
 # ============================
 # PART 4/5 — Image → Ken Burns MP4 (ZOOM ONLY)
 # ============================
@@ -580,7 +650,25 @@ def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
         f"fps={fps},"
         f"format=yuv420p"
     )
-
+colD, colE = st.columns([1, 1])
+with colD:
+    max_scenes = st.number_input(
+        "Max scenes per segment",
+        min_value=3,
+        max_value=20,
+        value=8,
+        step=1,
+        disabled=st.session_state["is_generating"],
+    )
+with colE:
+    seconds_per_scene = st.number_input(
+        "Seconds per scene",
+        min_value=2,
+        max_value=20,
+        value=6,
+        step=1,
+        disabled=st.session_state["is_generating"],
+    )
 
 def generate_video_clip(
     client: OpenAI,
@@ -653,26 +741,45 @@ def generate_video_clip(
     return out_path
 
 # ============================
-# PART 5/5 — render_segment_mp4 (ONE SEGMENT → ONE MP4)
+# PART 5/5 — Segment Orchestrator (ONE SEGMENT → ONE MP4) + Auto-fit to narration duration
 # ============================
+# ✅ Auto-fit: scene count + per-scene seconds are derived from narration length
+# ✅ Enforces min/max seconds per scene
+# ✅ Still generates sequentially (app.py controls the loop)
+#
+# REQUIRES (already in earlier parts):
+# - get_media_duration_seconds()
+# - plan_scenes()
+# - generate_video_clip()
+# - concat_mp4s()
+# - mux_audio()
+# - read_script_file()
+# - safe_rmtree()
+# - _allocate_scene_seconds()   <-- must exist (add in Part 3 as discussed)
 
 def render_segment_mp4(
     *,
     pair: Dict,
-    extract_dir: str,
+    extract_dir: str,  # kept for compatibility (not used directly here)
     out_path: str,
     zoom_strength: float = 1.06,
     fps: int = 15,
     width: int = 1280,
     height: int = 720,
-    max_scenes: int = 8,
-    seconds_per_scene: int = 6,
+    max_scenes: int = 10,
+    min_scene_seconds: int = 4,
+    max_scene_seconds: int = 10,
     model: str = "gpt-5-mini",
     api_key: Optional[str] = None,
 ) -> str:
     """
     Orchestrates:
-      script → scene plan → image clips → concat → mux audio → final MP4
+      script → scene plan → auto-fit seconds → image clips → concat → mux audio → final MP4
+
+    Auto-fit logic:
+      - narration length (seconds) is measured from audio file
+      - scene count is estimated from narration / target_avg, capped by max_scenes
+      - per-scene seconds are allocated so total ~= narration length within min/max bounds
     """
 
     script_path = pair.get("script_path")
@@ -683,47 +790,92 @@ def render_segment_mp4(
     if not audio_path or not os.path.exists(audio_path):
         raise FileNotFoundError(f"Missing audio: {audio_path}")
 
+    # OpenAI client
     client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
+    # Read script
     chapter_text = read_script_file(script_path)
     chapter_title = pair.get("title_guess") or os.path.basename(script_path)
 
-    scenes = plan_scenes(
+    # ---- Auto-fit: measure narration duration ----
+    narration_sec = int(round(get_media_duration_seconds(audio_path)))
+    narration_sec = max(1, narration_sec)
+
+    # ---- Auto-fit: estimate number of scenes ----
+    min_scene_seconds = max(1, int(min_scene_seconds))
+    max_scene_seconds = max(min_scene_seconds, int(max_scene_seconds))
+    max_scenes = max(1, int(max_scenes))
+
+    target_avg = int((min_scene_seconds + max_scene_seconds) / 2)
+    est_scenes = int(round(narration_sec / max(1, target_avg)))
+    est_scenes = max(1, min(max_scenes, est_scenes))
+
+    # ---- Plan prompts (seconds here are only a hint; we override below) ----
+    planned = plan_scenes(
         client,
         chapter_title=chapter_title,
         chapter_text=chapter_text,
-        max_scenes=max_scenes,
-        seconds_per_scene=seconds_per_scene,
+        max_scenes=est_scenes,
+        seconds_per_scene=target_avg,
         model=model,
     )
+    planned = planned[:max_scenes]
+    if not planned:
+        raise RuntimeError("Scene planner returned no usable prompts.")
 
+    # ---- Allocate per-scene seconds to match narration ----
+    alloc = _allocate_scene_seconds(
+        narration_sec,
+        len(planned),
+        min_scene=min_scene_seconds,
+        max_scene=max_scene_seconds,
+    )
+
+    scenes: List[Dict] = []
+    for i, sc in enumerate(planned):
+        prompt = str(sc.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        scenes.append(
+            {"scene": i + 1, "seconds": int(alloc[i]), "prompt": prompt}
+        )
+
+    if not scenes:
+        raise RuntimeError("No usable scenes after allocation.")
+
+    # ---- Ken Burns zoom-only controls ----
     os.environ["UAPPRESS_ZOOM_START"] = "1.00"
-    os.environ["UAPPRESS_ZOOM_END"] = f"{max(1.01, min(1.20, zoom_strength)):.4f}"
-    os.environ["UAPPRESS_KB_FPS"] = str(int(fps))
+    os.environ["UAPPRESS_ZOOM_END"] = f"{max(1.01, min(1.20, float(zoom_strength))):.4f}"
+    os.environ["UAPPRESS_KB_FPS"] = str(int(max(10, min(30, fps))))
 
     size = f"{int(width)}x{int(height)}"
 
+    # Per-segment temp workdir (deleted afterwards to keep Streamlit stable)
     seg_work = tempfile.mkdtemp(prefix="uappress_seg_")
     clips: List[str] = []
 
     try:
+        # ---- Generate each scene clip ----
         for sc in scenes:
-            clip_path = os.path.join(
-                seg_work, f"scene_{int(sc['scene']):02d}.mp4"
-            )
+            clip_path = os.path.join(seg_work, f"scene_{int(sc['scene']):02d}.mp4")
             generate_video_clip(
                 client,
                 prompt=sc["prompt"],
-                seconds=sc["seconds"],
+                seconds=int(sc["seconds"]),
                 size=size,
                 model="ignored",
                 out_path=clip_path,
             )
             clips.append(clip_path)
 
+        if not clips:
+            raise RuntimeError("No scene clips were generated.")
+
+        # ---- Concat to silent video ----
         silent_mp4 = os.path.join(seg_work, "segment_silent.mp4")
         concat_mp4s(clips, silent_mp4)
 
+        # ---- Mux narration audio onto it ----
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         mux_audio(silent_mp4, audio_path, out_path)
 
