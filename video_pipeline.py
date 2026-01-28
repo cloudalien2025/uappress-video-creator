@@ -563,7 +563,7 @@ def reencode_mp4(in_path: str, out_path: str) -> str:
     return out_path
 
 # ============================
-# PART 4/5 — Image → Ken Burns MP4 (No Shake) + Tier-1 Caching + Disk Safety
+# PART 4/5 — Image → Ken Burns MP4 (ZOOM ONLY) + Tier-1 Caching + Disk Safety
 # ============================
 
 def _parse_size(size: str) -> Tuple[int, int]:
@@ -589,30 +589,24 @@ def _best_image_size_for_video(w: int, h: int) -> str:
 
 def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
     """
-    Continuous motion for full duration (fixes "stops early then static").
-
-    - NO ROTATION / SHAKE (hard disabled)
-    - Optional subtle grain (cheap, ffmpeg-only)
-
-    Env knobs:
-      UAPPRESS_ZOOM_START (default 1.00)
-      UAPPRESS_ZOOM_END   (default 1.08)
-      UAPPRESS_MOTION_GRAIN (0/1, default 1)
+    ZOOM ONLY (no shake, no drift, no grain).
+    Continuous zoom for full duration.
     """
     z0 = _safe_float_env("UAPPRESS_ZOOM_START", 1.00)
     z1 = _safe_float_env("UAPPRESS_ZOOM_END", 1.08)
     z0 = max(1.0, min(1.25, z0))
     z1 = max(z0, min(1.35, z1))
 
-    grain = _safe_int_env("UAPPRESS_MOTION_GRAIN", 1) == 1
-
-    # Smooth linear zoom over full frames using on (output frame index)
+    # Smooth linear zoom over full frames using 'on' (output frame index)
     zoom_expr = f"{z0}+({z1}-{z0})*on/max(1\\,{frames-1})"
 
-    # Center crop tracking (no drift, no shake)
+    # Dead-center crop tracking (no drift)
     x_expr = "iw/2-(iw/zoom/2)"
     y_expr = "ih/2-(ih/zoom/2)"
 
+    # IMPORTANT:
+    # - We keep scale+crop BEFORE zoompan for consistent frame geometry
+    # - No noise, no rotate, no extra filters
     vf = (
         f"scale={W}:{H}:force_original_aspect_ratio=increase,"
         f"crop={W}:{H},"
@@ -620,9 +614,6 @@ def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
         f"fps={fps},"
         f"format=yuv420p"
     )
-
-    if grain:
-        vf += ",noise=alls=10:allf=t+u"
 
     return vf
 
@@ -637,24 +628,17 @@ def generate_video_clip(
     out_path: str,
 ) -> str:
     """
-    Generates a scene clip WITHOUT OpenAI video endpoint.
-    Flow:
-      prompt -> OpenAI image -> ffmpeg motion -> mp4
-
-    Tier 1 optimizations:
-    - Continuous motion for full duration (no static tail)
-    - Hard-disable shake/rotation (zero drift)
-    - Lower default FPS (env configurable) for speed
-    - Faster x264 preset+crf+tune stillimage
-    - Cache eviction to avoid Streamlit disk crashes
+    prompt -> OpenAI image -> ffmpeg zoom-only -> mp4
+    - NO shake
+    - NO grain
+    - NO drift
     """
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     cache_dir = _get_cache_dir()
     _ensure_dir(cache_dir)
     _prune_cache(cache_dir)
 
-    # Stable prompt (cache key depends on it)
     img_prompt = (
         (prompt or "").strip()
         + "\n\nStyle notes: cinematic documentary b-roll, realistic lighting, photorealistic, "
@@ -665,14 +649,11 @@ def generate_video_clip(
     W, H = _parse_size(size)
     img_size = _best_image_size_for_video(W, H)
 
-    # FPS defaults lower for speed (override with env)
-    fps = _safe_int_env("UAPPRESS_KB_FPS", 15)  # default 15 (faster than 30)
+    # FPS: your pipeline default is 15 unless you override UAPPRESS_KB_FPS
+    fps = _safe_int_env("UAPPRESS_KB_FPS", 15)
     fps = max(10, min(30, fps))
     frames = max(1, int(seconds * fps))
 
-    # ----------------------------
-    # CACHE: reuse MP4 if already generated for same prompt/seconds/size/fps
-    # ----------------------------
     cache_id = _cache_key("gpt-image-1", img_prompt, str(seconds), str(size), f"fps={fps}")
     cached_png = os.path.join(cache_dir, f"{cache_id}.png")
     cached_mp4 = os.path.join(cache_dir, f"{cache_id}.mp4")
@@ -680,19 +661,16 @@ def generate_video_clip(
     if os.path.exists(cached_mp4):
         if not os.path.exists(out_path):
             _copy_file(cached_mp4, out_path)
-        # also copy png beside output for debugging, if present
         png_path = out_path.replace(".mp4", ".png")
         if os.path.exists(cached_png) and not os.path.exists(png_path):
             _copy_file(cached_png, png_path)
         return out_path
 
-    # If MP4 not cached but PNG is cached, reuse it and only run ffmpeg
     png_path = out_path.replace(".mp4", ".png")
     if os.path.exists(cached_png) and not os.path.exists(png_path):
         _copy_file(cached_png, png_path)
 
     if not os.path.exists(png_path):
-        # Retry image generation (handles intermittent 429/5xx)
         img = None
         last_err = None
         for attempt in range(1, 4):
@@ -708,7 +686,6 @@ def generate_video_clip(
                 last_err = e
                 time.sleep(2 * attempt)
 
-        # Fallback to size="auto"
         if img is None:
             try:
                 img = client.images.generate(
@@ -721,50 +698,42 @@ def generate_video_clip(
                     f"Image generation failed (gpt-image-1). {type(e).__name__}: {e}"
                 ) from e
 
-        # Decode base64 image payload
         try:
             b64 = img.data[0].b64_json
             img_bytes = base64.b64decode(b64)
         except Exception as e:
             raise RuntimeError(f"Could not decode image bytes. {type(e).__name__}: {e}") from e
 
-        # Save image next to clip + into cache
         with open(png_path, "wb") as f:
             f.write(img_bytes)
         with open(cached_png, "wb") as f:
             f.write(img_bytes)
 
-    # Animate image into video
     ff = ffmpeg_exe()
     vf = _build_motion_vf(W, H, fps=fps, frames=frames)
 
     preset = os.environ.get("UAPPRESS_X264_PRESET", "veryfast")
     crf = os.environ.get("UAPPRESS_X264_CRF", "23")
 
-    run_cmd(
-        [
-            ff, "-y",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-loop", "1",
-            "-i", png_path,
-            "-t", str(seconds),
-            "-vf", vf,
-            "-r", str(fps),
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-crf", crf,
-            "-tune", "stillimage",
-            "-profile:v", "high",
-            "-level", "4.1",
-            "-pix_fmt", "yuv420p",
-            "-g", str(max(30, fps * 2)),
-            "-movflags", "+faststart",
-            out_path,
-        ]
-    )
+    run_cmd([
+        ff, "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-loop", "1",
+        "-i", png_path,
+        "-t", str(seconds),
+        "-vf", vf,
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", crf,
+        "-tune", "stillimage",
+        "-pix_fmt", "yuv420p",
+        "-g", str(max(30, fps * 2)),
+        "-movflags", "+faststart",
+        out_path,
+    ])
 
-    # Save MP4 into cache + prune again
     _copy_file(out_path, cached_mp4)
     _prune_cache(cache_dir)
 
