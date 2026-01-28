@@ -361,19 +361,29 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict]:
     return pairs
 
 # ============================
-# PART 2/5 — Scene Planning (Text → JSON) + Transcription (Audio → SRT)
+# PART 2/5 — Scene Planning (Text → JSON)
+#   (NO Whisper / NO SRT — CapCut handles captions)
 # ============================
 
-# ----------------------------
-# Scene planning (text -> JSON scenes)
-# ----------------------------
 SCENE_PLANNER_SYSTEM = (
     "You convert a documentary narration segment into a list of short visual scenes for AI generation. "
-    "Return STRICT JSON only: a list of objects with keys: scene, seconds, prompt, on_screen_text(optional). "
-    "Style: cinematic documentary b-roll / reenactment vibes; realistic lighting; camera movement notes. "
+    "Return STRICT JSON only: a list of objects with keys: scene, seconds, prompt. "
+    "Style: cinematic documentary b-roll / reenactment vibes; realistic lighting; subtle motion notes only. "
     "Avoid brand names, copyrighted characters, celebrity likeness, and explicit violence/gore. "
     "Keep prompts concise (1–3 sentences)."
 )
+
+def _extract_json_list(text: str) -> str:
+    t = (text or "").strip()
+    # strip code fences if present
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
+    t = re.sub(r"\s*```$", "", t)
+
+    i = t.find("[")
+    j = t.rfind("]")
+    if i != -1 and j != -1 and j > i:
+        return t[i : j + 1]
+    return t
 
 def plan_scenes(
     client: OpenAI,
@@ -384,14 +394,11 @@ def plan_scenes(
     seconds_per_scene: int,
     model: str = "gpt-5-mini",
 ) -> List[Dict]:
-    """
-    Uses Responses API to return a STRICT JSON list of scene objects.
-    """
     payload = {
-        "chapter_title": chapter_title,
+        "chapter_title": str(chapter_title or "").strip(),
         "max_scenes": int(max_scenes),
         "seconds_per_scene": int(seconds_per_scene),
-        "chapter_text": chapter_text,
+        "chapter_text": str(chapter_text or "").strip(),
         "output": "STRICT_JSON_LIST_ONLY",
     }
 
@@ -403,17 +410,21 @@ def plan_scenes(
         ],
     )
 
-    text = (resp.output_text or "").strip()
+    text = ""
+    if hasattr(resp, "output_text") and isinstance(resp.output_text, str):
+        text = resp.output_text
+    else:
+        text = str(resp)
 
-    # Defensive extraction if the model wraps JSON in extra text
-    m = re.search(r"(\[\s*\{.*\}\s*\])", text, flags=re.S)
-    if m:
-        text = m.group(1)
+    raw = (text or "").strip()
+    json_str = _extract_json_list(raw)
 
     try:
-        scenes = json.loads(text)
+        scenes = json.loads(json_str)
     except Exception as e:
-        raise RuntimeError(f"Scene planner did not return valid JSON. {type(e).__name__}: {e}\n\nRAW:\n{text[:2000]}")
+        raise RuntimeError(
+            f"Scene planner did not return valid JSON. {type(e).__name__}: {e}\n\nRAW:\n{raw[:1200]}"
+        )
 
     if not isinstance(scenes, list):
         raise RuntimeError("Scene planner returned JSON but it is not a list.")
@@ -422,155 +433,72 @@ def plan_scenes(
     for i, sc in enumerate(scenes, start=1):
         if not isinstance(sc, dict):
             continue
-        out.append(
-            {
-                "scene": i,
-                "seconds": int(sc.get("seconds", seconds_per_scene)),
-                "prompt": str(sc.get("prompt", "")).strip(),
-                "on_screen_text": (
-                    str(sc.get("on_screen_text")).strip()
-                    if sc.get("on_screen_text") is not None
-                    else None
-                ),
-            }
-        )
 
-    # Sanity: remove empty prompts
-    out = [s for s in out if s.get("prompt")]
+        prompt = str(sc.get("prompt", "")).strip()
+        if not prompt:
+            continue
+
+        sec = sc.get("seconds", seconds_per_scene)
+        try:
+            sec_i = int(sec)
+        except Exception:
+            sec_i = int(seconds_per_scene)
+        sec_i = max(1, sec_i)
+
+        out.append({"scene": i, "seconds": sec_i, "prompt": prompt})
+
     if not out:
         raise RuntimeError("Scene planner returned no usable prompts.")
     return out
 
-
-# ----------------------------
-# Transcription -> SRT
-# ----------------------------
-def transcribe_audio_to_srt(
-    client: OpenAI,
-    audio_path: str,
-    *,
-    model: str = "whisper-1",
-    language: str = "en",
-) -> str:
-    """
-    Returns SRT string.
-    NOTE: For the new pipeline, you may not *use* SRTs (CapCut),
-    but we keep this function for optional workflows + compatibility.
-    """
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
-    with open(audio_path, "rb") as f:
-        tr = client.audio.transcriptions.create(
-            model=model,
-            file=f,
-            response_format="srt",
-            language=language,
-        )
-
-    # OpenAI SDK can return str or object depending on version
-    if isinstance(tr, str):
-        return tr
-    if hasattr(tr, "text") and isinstance(tr.text, str):
-        return tr.text
-    return str(tr)
-
-
 def write_text(path: str, text: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text or "")
 
 # ============================
-# PART 3/5 — SRT Utilities + ffmpeg Assembly (Concat / Mux / Subs / Re-encode)
+# PART 3/5 — ffmpeg Assembly (Concat + Mux) — NO SUBS
 # ============================
-# NOTE:
-# - Your new "Generate Videos" flow will NOT burn subtitles (CapCut).
-# - We keep subtitle helpers here for compatibility and optional use.
-# - In your new app/video_creator, you’ll simply avoid calling embed_srt_softsubs().
+# This is the only assembly you need for "segments only → CapCut does everything else".
+# - concat scene MP4s into one silent segment video
+# - mux narration audio onto that video
+# - output ONE clean MP4 per segment
 
-# ----------------------------
-# SRT shifting / merging
-# ----------------------------
-def srt_time_to_seconds(t: str) -> float:
-    hh, mm, rest = t.split(":")
-    ss, ms = rest.split(",")
-    return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
-
-
-def seconds_to_srt_time(x: float) -> str:
-    if x < 0:
-        x = 0.0
-    hh = int(x // 3600)
-    x -= hh * 3600
-    mm = int(x // 60)
-    x -= mm * 60
-    ss = int(x)
-    ms = int(round((x - ss) * 1000))
-    if ms >= 1000:
-        ss += 1
-        ms -= 1000
-    if ss >= 60:
-        mm += 1
-        ss -= 60
-    if mm >= 60:
-        hh += 1
-        mm -= 60
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-
-def shift_srt(srt_text: str, offset_seconds: float) -> str:
-    def repl(match: re.Match) -> str:
-        start = match.group(1)
-        end = match.group(2)
-        s = seconds_to_srt_time(srt_time_to_seconds(start) + offset_seconds)
-        e = seconds_to_srt_time(srt_time_to_seconds(end) + offset_seconds)
-        return f"{s} --> {e}"
-
-    pattern = re.compile(r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})")
-    return pattern.sub(repl, srt_text or "")
-
-
-def renumber_srt_blocks(srt_text: str) -> str:
-    blocks = re.split(r"\n\s*\n", (srt_text or "").strip(), flags=re.S)
-    out_blocks = []
-    n = 1
-    for b in blocks:
-        lines = b.strip().splitlines()
-        if not lines:
-            continue
-        # Drop existing index line if present
-        if re.fullmatch(r"\d+", (lines[0].strip() or "")):
-            lines = lines[1:]
-        out_blocks.append(str(n) + "\n" + "\n".join(lines))
-        n += 1
-    return "\n\n".join(out_blocks) + "\n"
-
-
-# ----------------------------
-# ffmpeg assembly: concat, mux, subtitles
-# ----------------------------
 def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
     """
-    Fast path: concat demuxer + stream copy.
-    If inputs differ in codecs/timebase, caller should re-encode first.
+    Concatenate MP4 clips using ffmpeg concat demuxer with stream copy.
+    Assumes all MP4 clips were generated with consistent codec/settings.
     """
     if not mp4_paths:
         raise ValueError("concat_mp4s: no input mp4_paths")
 
-    ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    for p in mp4_paths:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"concat_mp4s: missing input: {p}")
 
+    ff = ffmpeg_exe()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    # concat demuxer list file
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
         list_path = tf.name
         for p in mp4_paths:
-            if not os.path.exists(p):
-                raise FileNotFoundError(f"concat_mp4s: missing input: {p}")
-            # concat demuxer format
-            tf.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
+            # escape single quotes for concat file format
+            safe_p = p.replace("'", "'\\''")
+            tf.write(f"file '{safe_p}'\n")
 
     try:
-        run_cmd([ff, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path])
+        # -fflags +genpts helps when clips come from image loops
+        run_cmd([
+            ff, "-y",
+            "-hide_banner", "-loglevel", "error",
+            "-fflags", "+genpts",
+            "-f", "concat", "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            out_path,
+        ])
     finally:
         try:
             os.remove(list_path)
@@ -582,7 +510,8 @@ def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
 
 def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     """
-    Adds/overwrites audio onto the video.
+    Mux narration audio onto the concatenated video.
+    Video stream is copied; audio is encoded to AAC for broad compatibility.
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"mux_audio: missing video_path: {video_path}")
@@ -590,85 +519,48 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
         raise FileNotFoundError(f"mux_audio: missing audio_path: {audio_path}")
 
     ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    run_cmd(
-        [
-            ff, "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-shortest",
-            "-movflags", "+faststart",
-            out_path,
-        ]
-    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    # If your narration is longer than video (or vice versa), -shortest trims to the shorter.
+    run_cmd([
+        ff, "-y",
+        "-hide_banner", "-loglevel", "error",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
+        "-shortest",
+        "-movflags", "+faststart",
+        out_path,
+    ])
     return out_path
-
-
-def _escape_for_ffmpeg_filter(path: str) -> str:
-    # needed for subtitles filter on Windows-like paths + colons
-    return (path or "").replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-
-
-def burn_in_subtitles(video_path: str, srt_path: str, out_path: str) -> str:
-    """
-    Burns subtitles into video (always visible). Re-encodes.
-    (Legacy / optional — your new workflow will avoid this.)
-    """
-    ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    srt_escaped = _escape_for_ffmpeg_filter(srt_path)
-
-    run_cmd(
-        [
-            ff, "-y",
-            "-i", video_path,
-            "-vf", f"subtitles='{srt_escaped}'",
-            "-c:v", "libx264",
-            "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
-            "-crf", os.environ.get("UAPPRESS_X264_CRF", "23"),
-            "-tune", "stillimage",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            out_path,
-        ]
-    )
-    return out_path
-
-
-def embed_srt_softsubs(video_path: str, srt_path: str, out_path: str) -> str:
-    """
-    Kept for app compatibility: historically this burned subs in.
-    Your new video creator should NOT call this (CapCut subtitles).
-    """
-    return burn_in_subtitles(video_path, srt_path, out_path)
 
 
 def reencode_mp4(in_path: str, out_path: str) -> str:
     """
-    Safe re-encode for compatibility (use when concat-copy fails).
+    Fallback utility ONLY if you ever hit concat-copy incompatibility.
+    (Not normally used if your clips are produced consistently.)
     """
     if not os.path.exists(in_path):
         raise FileNotFoundError(f"reencode_mp4: missing input: {in_path}")
 
     ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    run_cmd(
-        [
-            ff, "-y",
-            "-i", in_path,
-            "-c:v", "libx264",
-            "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
-            "-crf", os.environ.get("UAPPRESS_X264_CRF", "23"),
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            out_path,
-        ]
-    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    run_cmd([
+        ff, "-y",
+        "-hide_banner", "-loglevel", "error",
+        "-i", in_path,
+        "-c:v", "libx264",
+        "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
+        "-crf", os.environ.get("UAPPRESS_X264_CRF", "23"),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
+        "-movflags", "+faststart",
+        out_path,
+    ])
     return out_path
 
 # ============================
