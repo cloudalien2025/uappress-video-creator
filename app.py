@@ -725,125 +725,101 @@ for idx, p in enumerate(pairs, start=1):
                 st.exception(e)
 
 # ----------------------------
-# 4) Build FINAL MP4 from URL (DigitalOcean) or ZIP upload
-#    + Upload FINAL MP4 to DigitalOcean Spaces (recommended for large files)
+# 4) Build FINAL MP4 (stitch + logo + safe delivery + upload to Spaces)
 # ----------------------------
 
 st.divider()
-st.subheader("4) Build FINAL MP4 (from URL or ZIP) — stitch + logo + safe delivery")
+st.subheader("4) Build FINAL MP4 (stitch + logo + safe delivery + upload to Spaces)")
 st.caption(
-    "Recommended: paste a public DigitalOcean Spaces URL to your ZIP of segment MP4s. "
-    "The app downloads to server disk, stitches, applies the logo once, and can upload the FINAL MP4 back to Spaces."
+    "Upload a ZIP containing your already-generated segment MP4s. "
+    "This step stitches them, applies the logo ONCE (optional), saves the final MP4 to the persistent cache, "
+    "and can upload the FINAL MP4 to DigitalOcean Spaces (public URL)."
 )
 
-source_mode = st.radio(
-    "Source",
-    ["DigitalOcean URL (recommended)", "Upload ZIP (fallback)"],
-    index=0,
-    horizontal=True,
-)
+final_zip = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="zip_segments")
 
-zip_url = ""
-zip_upload = None
-
-if source_mode == "DigitalOcean URL (recommended)":
-    zip_url = st.text_input(
-        "Public ZIP URL (DigitalOcean Spaces)",
-        placeholder="https://YOUR-BUCKET.nyc3.digitaloceanspaces.com/uappress/exports/segments.zip",
-    )
-else:
-    zip_upload = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="final_zip_upload")
-
-def _download_zip_stream(url: str, dest_path: str) -> None:
-    import requests
-    url = (url or "").strip()
-    if not url:
-        raise ValueError("Please paste a ZIP URL.")
-    prog = st.progress(0.0)
-    status = st.empty()
-
-    with requests.get(url, stream=True, timeout=(15, 900)) as r:
-        r.raise_for_status()
-        total = r.headers.get("Content-Length")
-        total_bytes = int(total) if total and total.isdigit() else None
-
-        downloaded = 0
-        status.write("Downloading ZIP to server disk…")
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total_bytes:
-                    prog.progress(min(1.0, downloaded / max(1, total_bytes)))
-
-    prog.empty()
-    status.empty()
-
-def _probe_streams(path: str) -> str:
-    r = subprocess.run(
-        [FFMPEG, "-hide_banner", "-i", path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return r.stderr or ""
-
-def _has_video(path: str) -> bool:
-    return "Video:" in _probe_streams(path)
-
-def _has_audio(path: str) -> bool:
-    return "Audio:" in _probe_streams(path)
-
-def _sort_mp4(path: str):
-    name = os.path.basename(path).lower()
-    if "intro" in name:
-        return (-1, name)
-    if "outro" in name:
-        return (999999, name)
-    m = re.search(r"(?:ch|chapter|seg)[\s_\-]*0*(\d+)", name)
+def _sort_key_mp4(name: str) -> Tuple[int, str]:
+    base = os.path.basename(name).lower()
+    m = re.search(r"seg[\s_\-]*0*(\d{1,4})", base)
     if m:
-        return (int(m.group(1)), name)
-    return (500000, name)
+        return (int(m.group(1)), base)
+    m2 = re.search(r"(?:chapter|ch)[\s_\-]*0*(\d{1,4})", base)
+    if m2:
+        return (1000 + int(m2.group(1)), base)
+    if "intro" in base:
+        return (-1, base)
+    if "outro" in base:
+        return (999999, base)
+    return (500000, base)
 
-def _concat_reencode(mp4s: List[str], out_path: str):
-    inputs, streams = [], []
-    for i, m in enumerate(mp4s):
-        inputs += ["-i", m]
-        streams.append(f"[{i}:v][{i}:a]")
-    flt = "".join(streams) + f"concat=n={len(mp4s)}:v=1:a=1[v][a]"
+def _probe_has_video(path: str) -> bool:
+    # Uses ffmpeg to inspect streams (no ffprobe dependency)
+    try:
+        p = subprocess.run(
+            [FFMPEG, "-hide_banner", "-i", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        txt = (p.stderr or "") + (p.stdout or "")
+        return "Video:" in txt
+    except Exception:
+        return False
 
-    subprocess.run(
-        [
-            FFMPEG, "-y",
-            *inputs,
-            "-filter_complex", flt,
-            "-map", "[v]",
-            "-map", "[a]",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            out_path,
-        ],
-        check=True,
+def overlay_logo_mp4_safe(
+    in_mp4: str,
+    logo_path: str,
+    out_mp4: str,
+    *,
+    size_pct: int = 10,
+    margin_px: int = 30,
+    opacity: float = 0.9,
+) -> None:
+    """
+    Safer logo overlay:
+    - Avoids scale2ref
+    - Explicitly maps video + optional audio
+    - Produces yuv420p + faststart
+    """
+    opacity = max(0.0, min(1.0, float(opacity)))
+    size_pct = max(3, min(30, int(size_pct)))
+    margin_px = max(0, int(margin_px))
+
+    # scale logo relative to input width using a simple expression
+    # iw here refers to logo width, so we use scale based on main input width via "main_w".
+    # Trick: use overlay's scale with "scale2ref" is what we are avoiding.
+    # Instead: scale logo to a fixed percentage of 1280/1920-ish by using input video width via eval in overlay chain:
+    # We'll do: [1:v]...scale=w=iw*X? doesn't know base width.
+    # So we do a two-pass filter: scale logo by percent of *input video width* using "scale=iw*..." is wrong.
+    # Better: use "scale=w=trunc(main_w*P/100):h=-1" via overlay's 'main_w' var is not available in scale.
+    # Practical workaround: scale logo to pct of 1280 when 720p or 1920 when 1080p based on current 'resolution' selection.
+    # We'll infer target width from `resolution` string.
+    try:
+        target_w = int(str(resolution).split("x")[0])
+    except Exception:
+        target_w = 1280
+
+    logo_w = max(80, int(target_w * (size_pct / 100.0)))
+
+    filter_complex = (
+        f"[1:v]format=rgba,colorchannelmixer=aa={opacity},scale={logo_w}:-1[lg];"
+        f"[0:v][lg]overlay=x=W-w-{margin_px}:y={margin_px}:format=auto[v]"
     )
 
-def _overlay_logo_png_safe(in_mp4, logo_png, out_mp4):
     subprocess.run(
         [
             FFMPEG, "-y",
+            "-hide_banner",
+            "-loglevel", "error",
             "-i", in_mp4,
-            "-i", logo_png,
-            "-filter_complex",
-            f"[1:v]format=rgba,scale=iw*{logo_size}/100:-1,"
-            f"colorchannelmixer=aa={logo_opacity}[lg];"
-            f"[0:v][lg]overlay=W-w-{logo_margin}:{logo_margin}[v]",
+            "-i", logo_path,
+            "-filter_complex", filter_complex,
             "-map", "[v]",
             "-map", "0:a?",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
+            "-preset", "veryfast",
+            "-crf", "20",
             "-c:a", "aac",
             "-movflags", "+faststart",
             out_mp4,
@@ -851,175 +827,217 @@ def _overlay_logo_png_safe(in_mp4, logo_png, out_mp4):
         check=True,
     )
 
-def _get_spaces_config():
-    # Prefer Streamlit secrets; fallback to env vars
-    def _sec(k, default=None):
-        try:
-            return st.secrets.get(k, default)
-        except Exception:
-            return default
+def _read_bytes(path: str, max_bytes: int = 1_500_000_000) -> bytes:
+    # Streamlit download_button is happiest with bytes.
+    # (We keep a sane cap to avoid accidental RAM blowups.)
+    sz = os.path.getsize(path)
+    if sz > max_bytes:
+        raise RuntimeError(f"File is too large to load into memory ({sz} bytes). Use Spaces upload instead.")
+    with open(path, "rb") as f:
+        return f.read()
 
-    do_key = _sec("DO_SPACES_KEY") or os.environ.get("DO_SPACES_KEY")
-    do_secret = _sec("DO_SPACES_SECRET") or os.environ.get("DO_SPACES_SECRET")
-    do_region = _sec("DO_SPACES_REGION", "nyc3") or os.environ.get("DO_SPACES_REGION", "nyc3")
-    do_bucket = _sec("DO_SPACES_BUCKET") or os.environ.get("DO_SPACES_BUCKET")
-    do_base = _sec("DO_SPACES_PUBLIC_BASE") or os.environ.get("DO_SPACES_PUBLIC_BASE")
-    return do_key, do_secret, do_region, do_bucket, do_base
+# --- DigitalOcean Spaces helpers (optional) ---
 
-def _upload_to_spaces(local_path: str, object_key: str) -> str:
-    # Import lazily so app doesn't crash if boto3 isn't installed
-    try:
-        import boto3
-        from botocore.client import Config
-    except ModuleNotFoundError:
-        raise RuntimeError("Missing boto3. Add boto3 + botocore to requirements.txt and redeploy.")
+def _spaces_enabled() -> bool:
+    return bool(os.environ.get("DO_SPACES_KEY") and os.environ.get("DO_SPACES_SECRET") and os.environ.get("DO_SPACES_BUCKET"))
 
-    do_key, do_secret, do_region, do_bucket, do_base = _get_spaces_config()
-    if not all([do_key, do_secret, do_region, do_bucket, do_base]):
-        raise RuntimeError("Missing Spaces config. Set DO_SPACES_KEY/SECRET/REGION/BUCKET/PUBLIC_BASE in Secrets.")
+def upload_to_spaces(file_path: str, object_key: str) -> str:
+    """
+    Uploads to DO Spaces using boto3 S3 client.
+    Requires env vars:
+      DO_SPACES_KEY
+      DO_SPACES_SECRET
+      DO_SPACES_REGION (default nyc3)
+      DO_SPACES_BUCKET
+    Optional:
+      DO_SPACES_PUBLIC_BASE  (e.g. https://uappress.nyc3.digitaloceanspaces.com)
+    """
+    import boto3  # keep import here to avoid app crash if boto3 isn't installed
 
-    endpoint = f"https://{do_region}.digitaloceanspaces.com"
+    do_key = os.environ.get("DO_SPACES_KEY")
+    do_secret = os.environ.get("DO_SPACES_SECRET")
+    do_region = os.environ.get("DO_SPACES_REGION", "nyc3")
+    do_bucket = os.environ.get("DO_SPACES_BUCKET")
+    do_base = os.environ.get("DO_SPACES_PUBLIC_BASE")  # optional
+
+    if not (do_key and do_secret and do_bucket):
+        raise RuntimeError("Missing DO Spaces env vars: DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_BUCKET")
+
+    endpoint_url = f"https://{do_region}.digitaloceanspaces.com"
+
     s3 = boto3.client(
         "s3",
         region_name=do_region,
-        endpoint_url=endpoint,
+        endpoint_url=endpoint_url,
         aws_access_key_id=do_key,
         aws_secret_access_key=do_secret,
-        config=Config(signature_version="s3v4"),
     )
 
-    object_key = (object_key or "").lstrip("/")
-    s3.upload_file(
-        local_path,
-        do_bucket,
-        object_key,
-        ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
-    )
-
-    return f"{do_base.rstrip('/')}/{object_key}"
-
-disabled = True
-if source_mode == "DigitalOcean URL (recommended)":
-    disabled = not bool((zip_url or "").strip())
-else:
-    disabled = zip_upload is None
-
-build_final = st.button("🎬 Build FINAL MP4", type="primary", disabled=disabled)
-
-if build_final:
+    # Upload public-read (works if ACLs are allowed; otherwise rely on bucket policy)
+    extra = {"ContentType": "video/mp4"}
     try:
-        with tempfile.TemporaryDirectory() as td:
-            zip_path = os.path.join(td, "segments.zip")
+        extra["ACL"] = "public-read"
+    except Exception:
+        pass
 
-            # 1) Acquire ZIP onto disk
-            if source_mode == "DigitalOcean URL (recommended)":
-                _download_zip_stream(zip_url, zip_path)
-            else:
-                with open(zip_path, "wb") as f:
-                    f.write(zip_upload.getvalue())
+    s3.upload_file(file_path, do_bucket, object_key, ExtraArgs=extra)
 
-            # 2) Extract ZIP
-            extract_dir = os.path.join(td, "unzipped")
-            os.makedirs(extract_dir, exist_ok=True)
-            with zipfile.ZipFile(zip_path, "r") as z:
-                z.extractall(extract_dir)
+    if do_base:
+        return do_base.rstrip("/") + "/" + object_key.lstrip("/")
+    return f"{endpoint_url}/{do_bucket}/{object_key.lstrip('/')}"
 
-            # 3) Collect MP4s
-            mp4s = []
-            for root, _, files in os.walk(extract_dir):
-                for fn in files:
-                    if fn.lower().endswith(".mp4"):
-                        mp4s.append(os.path.join(root, fn))
+# Persistent output location (IMPORTANT: not temp)
+final_out_dir = os.path.join(cache_dir, "uappress_final_outputs")
+_ensure_dir(final_out_dir)
 
-            if not mp4s:
-                st.error("No MP4 files found in the ZIP.")
-                st.stop()
+st.session_state.setdefault("final_mp4_path", None)
+st.session_state.setdefault("final_mp4_name", None)
+st.session_state.setdefault("final_spaces_url", None)
 
-            # 4) Validate video+audio
-            valid = [m for m in mp4s if _has_video(m) and _has_audio(m)]
-            if not valid:
-                st.error("No valid MP4s with BOTH video+audio found in the ZIP.")
-                st.stop()
+build_final = st.button("🎞 Build FINAL MP4", type="primary", disabled=(final_zip is None))
 
-            mp4s = sorted(valid, key=_sort_mp4)
+if build_final and final_zip is not None:
+    try:
+        with st.spinner("Unzipping segment MP4s…"):
+            with tempfile.TemporaryDirectory() as td:
+                with zipfile.ZipFile(final_zip, "r") as z:
+                    z.extractall(td)
 
-            st.write("Stitch order:")
-            for m in mp4s:
-                st.write(f"- {os.path.basename(m)}")
+                mp4s = []
+                for root, _, files in os.walk(td):
+                    for f in files:
+                        if f.lower().endswith(".mp4"):
+                            mp4s.append(os.path.join(root, f))
 
-            # 5) Stitch
-            out_dir = os.path.join(td, "out")
-            os.makedirs(out_dir, exist_ok=True)
-            full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
+                if not mp4s:
+                    st.error("No MP4 files found in the ZIP.")
+                    st.stop()
 
-            st.info("Stitching segments (re-encode)…")
-            _concat_reencode(mp4s, full_mp4)
+                mp4s.sort(key=_sort_key_mp4)
 
-            if not _has_video(full_mp4):
-                st.error("Stitched output has NO video stream.")
-                st.stop()
+                st.write("MP4 order:")
+                for m in mp4s:
+                    st.write(f"- {os.path.basename(m)}")
 
-            final_out = full_mp4
+                # 1) Stitch into a temp file
+                tmp_full = os.path.join(td, "uappress_full_documentary.mp4")
 
-            # 6) Apply logo once (optional)
-            if apply_logo_on_final and logo_file is not None:
-                logo_path = os.path.join(out_dir, "logo.png")
-                with open(logo_path, "wb") as f:
-                    f.write(logo_file.getvalue())
+                st.info("Concatenating (re-encode concat)…")
+                # Use concat filter + re-encode (more compatible than concat demuxer copy)
+                # Build filter inputs: -i a -i b ... -filter_complex concat=n=...:v=1:a=1
+                cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
+                for pth in mp4s:
+                    cmd += ["-i", pth]
 
-                branded = os.path.join(out_dir, "uappress_full_documentary_logo.mp4")
-                st.info("Applying logo…")
-                _overlay_logo_png_safe(full_mp4, logo_path, branded)
+                n = len(mp4s)
+                filter_complex = f"concat=n={n}:v=1:a=1[v][a]"
+                cmd += [
+                    "-filter_complex", filter_complex,
+                    "-map", "[v]",
+                    "-map", "[a]",
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-preset", "veryfast",
+                    "-crf", "20",
+                    "-c:a", "aac",
+                    "-movflags", "+faststart",
+                    tmp_full,
+                ]
+                subprocess.run(cmd, check=True)
 
-                if _has_video(branded):
-                    final_out = branded
-                else:
-                    st.warning("Logo output invalid — using unbranded video.")
+                if not _probe_has_video(tmp_full):
+                    raise RuntimeError("Stitched output has no video stream. Check segment MP4s for video streams.")
 
-            st.success("✅ Final movie ready")
-            st.video(final_out)
+                # 2) Optional logo (temp)
+                tmp_final = tmp_full
+                if apply_logo_on_final and logo_file is not None:
+                    st.info("Applying logo watermark to FINAL movie (once)…")
+                    logo_path = os.path.join(td, "logo_upload.png")
+                    with open(logo_path, "wb") as f:
+                        f.write(logo_file.getvalue())
 
-            # 7) Safe delivery
-            size_mb = os.path.getsize(final_out) / (1024 * 1024)
-            st.caption(f"Final size: {size_mb:.1f} MB")
-
-            st.subheader("Deliver FINAL MP4")
-
-            # Direct download only for smaller files
-            BIG_MB = 200
-            if size_mb < BIG_MB:
-                with open(final_out, "rb") as f:
-                    st.download_button(
-                        "⬇️ Download FINAL MP4 (direct)",
-                        data=f.read(),
-                        file_name=os.path.basename(final_out),
-                        mime="video/mp4",
+                    branded = os.path.join(td, "uappress_full_documentary_logo.mp4")
+                    overlay_logo_mp4_safe(
+                        tmp_full,
+                        logo_path,
+                        branded,
+                        size_pct=logo_size,
+                        margin_px=logo_margin,
+                        opacity=logo_opacity,
                     )
-            else:
-                st.warning("Large file: direct download may crash Streamlit. Upload to Spaces instead.")
 
-            # Upload to Spaces (recommended)
-            do_key, do_secret, do_region, do_bucket, do_base = _get_spaces_config()
-            spaces_ready = all([do_key, do_secret, do_bucket, do_base, do_region])
+                    # Sanity check: if logo overlay somehow results in audio-only, auto-fallback.
+                    if not _probe_has_video(branded):
+                        st.error("⚠️ Logo output became audio-only. Falling back to unbranded FULL MP4.")
+                        tmp_final = tmp_full
+                    else:
+                        tmp_final = branded
 
-            if not spaces_ready:
-                st.info(
-                    "To enable 1-click Spaces upload, set Streamlit Secrets (or env vars):\n"
-                    "DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_REGION, DO_SPACES_BUCKET, DO_SPACES_PUBLIC_BASE"
-                )
-            else:
-                default_prefix = "uappress/final"
-                prefix = st.text_input("Spaces folder (prefix)", value=default_prefix).strip().strip("/")
-                filename = os.path.basename(final_out)
-                object_key = f"{prefix}/{filename}" if prefix else filename
+                # 3) Optional force re-encode using your helper
+                if force_reencode:
+                    st.info("Force re-encoding FINAL movie…")
+                    tmp_re = tmp_final.replace(".mp4", "_reencoded.mp4")
+                    tmp_final = reencode_mp4(tmp_final, tmp_re)
 
-                if st.button("☁️ Upload FINAL MP4 to DigitalOcean Spaces", type="primary"):
-                    st.info("Uploading to Spaces…")
-                    url = _upload_to_spaces(final_out, object_key)
-                    st.success("✅ Uploaded!")
-                    st.write("Public URL:")
-                    st.code(url)
+                # 4) Persist output to cache (so it survives Streamlit reruns & downloads)
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                base_name = f"uappress_full_documentary_{stamp}.mp4"
+                final_path = os.path.join(final_out_dir, base_name)
+                shutil.copy2(tmp_final, final_path)
+
+        st.session_state.final_mp4_path = final_path
+        st.session_state.final_mp4_name = os.path.basename(final_path)
+        st.session_state.final_spaces_url = None
+
+        st.success("✅ Final movie saved to persistent cache (safe for download & upload).")
 
     except Exception as e:
         st.error(f"Final build failed: {e}")
         st.exception(e)
+
+# --- Display + Download + Upload (safe across reruns) ---
+
+final_path = st.session_state.get("final_mp4_path")
+if final_path and os.path.exists(final_path):
+    st.video(final_path)
+
+    c1, c2 = st.columns([1, 1])
+
+    with c1:
+        # Download via bytes so it doesn't depend on temp paths during reruns
+        try:
+            data = _read_bytes(final_path)
+            st.download_button(
+                "⬇️ Download FINAL MP4 (YouTube Ready)",
+                data=data,
+                file_name=st.session_state.get("final_mp4_name") or os.path.basename(final_path),
+                mime="video/mp4",
+            )
+        except Exception as e:
+            st.warning(
+                f"Download disabled (likely too large to load into RAM): {e}\n\n"
+                "Use the Spaces upload button instead."
+            )
+
+    with c2:
+        st.markdown("**DigitalOcean Spaces (optional)**")
+        if not _spaces_enabled():
+            st.info("Set DO_SPACES_KEY / DO_SPACES_SECRET / DO_SPACES_BUCKET in Streamlit Secrets or env vars.")
+        else:
+            prefix = st.text_input("Spaces folder prefix (optional)", value="uappress/final")
+            upload_btn = st.button("☁️ Upload FINAL MP4 to Spaces")
+
+            if upload_btn:
+                try:
+                    with st.spinner("Uploading to Spaces…"):
+                        obj_key = f"{prefix.strip().strip('/')}/{os.path.basename(final_path)}"
+                        url = upload_to_spaces(final_path, obj_key)
+                        st.session_state.final_spaces_url = url
+                    st.success("✅ Uploaded to Spaces.")
+                except Exception as e:
+                    st.error(f"Spaces upload failed: {e}")
+                    st.exception(e)
+
+    if st.session_state.get("final_spaces_url"):
+        st.text_input("Public URL (copy/paste)", value=st.session_state["final_spaces_url"])
+        st.caption("If this URL 403s, your bucket needs public-read via bucket policy or object ACLs enabled.")
