@@ -613,11 +613,15 @@ def _allocate_scene_seconds(total_seconds: int, n_scenes: int, *, min_scene: int
 # ============================
 # PART 4/5 — Image → Ken Burns MP4 (ZOOM ONLY)
 # ============================
+# ✅ NO Streamlit UI here (NO st.columns / sliders / buttons)
+# ✅ Zoom-only Ken Burns (no shake, no drift, no noise)
+# ✅ Tier-1 caching (png + mp4) + cache pruning
+# ✅ Robust image generation retries
 
 def _parse_size(size: str) -> Tuple[int, int]:
     if "x" not in (size or ""):
         return 1280, 720
-    w, h = size.lower().split("x", 1)
+    w, h = str(size).lower().split("x", 1)
     try:
         return int(w), int(h)
     except Exception:
@@ -625,7 +629,8 @@ def _parse_size(size: str) -> Tuple[int, int]:
 
 
 def _best_image_size_for_video(w: int, h: int) -> str:
-    return "1536x1024" if w >= h else "1024x1536"
+    # gpt-image-1 supported sizes: 1024x1024, 1536x1024, 1024x1536, auto
+    return "1536x1024" if int(w) >= int(h) else "1024x1536"
 
 
 def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
@@ -636,10 +641,12 @@ def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
     z0 = _safe_float_env("UAPPRESS_ZOOM_START", 1.00)
     z1 = _safe_float_env("UAPPRESS_ZOOM_END", 1.08)
 
-    z0 = max(1.0, min(1.25, z0))
-    z1 = max(z0, min(1.35, z1))
+    z0 = max(1.0, min(1.25, float(z0)))
+    z1 = max(z0, min(1.35, float(z1)))
 
-    zoom_expr = f"{z0}+({z1}-{z0})*on/max(1\\,{frames-1})"
+    # smooth linear zoom over all frames using output frame index 'on'
+    zoom_expr = f"{z0}+({z1}-{z0})*on/max(1\\,{max(1, frames-1)})"
+    # dead-center crop tracking (no drift)
     x_expr = "iw/2-(iw/zoom/2)"
     y_expr = "ih/2-(ih/zoom/2)"
 
@@ -650,25 +657,7 @@ def _build_motion_vf(W: int, H: int, fps: int, frames: int) -> str:
         f"fps={fps},"
         f"format=yuv420p"
     )
-colD, colE = st.columns([1, 1])
-with colD:
-    max_scenes = st.number_input(
-        "Max scenes per segment",
-        min_value=3,
-        max_value=20,
-        value=8,
-        step=1,
-        disabled=st.session_state["is_generating"],
-    )
-with colE:
-    seconds_per_scene = st.number_input(
-        "Seconds per scene",
-        min_value=2,
-        max_value=20,
-        value=6,
-        step=1,
-        disabled=st.session_state["is_generating"],
-    )
+
 
 def generate_video_clip(
     client: OpenAI,
@@ -676,11 +665,15 @@ def generate_video_clip(
     prompt: str,
     seconds: int,
     size: str,
-    model: str,
+    model: str,   # kept for compatibility (ignored; we use gpt-image-1)
     out_path: str,
 ) -> str:
     """
     OpenAI image → zoom-only Ken Burns → MP4
+
+    Caching:
+      - stores {cache_id}.png and {cache_id}.mp4 inside UAPPRESS_CACHE_DIR
+      - if cached mp4 exists, copies it to out_path (fast)
     """
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
@@ -690,36 +683,76 @@ def generate_video_clip(
 
     seconds = max(1, int(seconds))
     W, H = _parse_size(size)
+
     fps = _safe_int_env("UAPPRESS_KB_FPS", 15)
-    fps = max(10, min(30, fps))
-    frames = seconds * fps
+    fps = max(10, min(30, int(fps)))
+    frames = max(1, int(seconds * fps))
 
     img_prompt = (
-        prompt.strip()
-        + "\n\nCinematic documentary b-roll, realistic lighting, "
+        (prompt or "").strip()
+        + "\n\nCinematic documentary b-roll, realistic lighting, photorealistic, "
           "no text, no logos, no watermarks."
     )
 
-    cache_id = _cache_key(img_prompt, str(seconds), size, str(fps))
+    cache_id = _cache_key("gpt-image-1", img_prompt, str(seconds), str(size), f"fps={fps}")
     png_path = out_path.replace(".mp4", ".png")
+    cached_png = os.path.join(cache_dir, f"{cache_id}.png")
     cached_mp4 = os.path.join(cache_dir, f"{cache_id}.mp4")
 
+    # Fast path: cached mp4
     if os.path.exists(cached_mp4):
-        _copy_file(cached_mp4, out_path)
+        if not os.path.exists(out_path):
+            _copy_file(cached_mp4, out_path)
+        if os.path.exists(cached_png) and not os.path.exists(png_path):
+            _copy_file(cached_png, png_path)
         return out_path
 
-    img = client.images.generate(
-        model="gpt-image-1",
-        prompt=img_prompt,
-        size=_best_image_size_for_video(W, H),
-    )
+    # If png cached, reuse it
+    if os.path.exists(cached_png) and not os.path.exists(png_path):
+        _copy_file(cached_png, png_path)
 
-    img_bytes = base64.b64decode(img.data[0].b64_json)
-    with open(png_path, "wb") as f:
-        f.write(img_bytes)
+    # Generate png if needed
+    if not os.path.exists(png_path):
+        img = None
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                img = client.images.generate(
+                    model="gpt-image-1",
+                    prompt=img_prompt,
+                    size=_best_image_size_for_video(W, H),
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(2 * attempt)
+
+        if img is None:
+            # final fallback: auto size
+            try:
+                img = client.images.generate(
+                    model="gpt-image-1",
+                    prompt=img_prompt,
+                    size="auto",
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Image generation failed (gpt-image-1). {type(e).__name__}: {e}"
+                ) from e
+
+        try:
+            img_bytes = base64.b64decode(img.data[0].b64_json)
+        except Exception as e:
+            raise RuntimeError(f"Could not decode image bytes. {type(e).__name__}: {e}") from e
+
+        with open(png_path, "wb") as f:
+            f.write(img_bytes)
+        with open(cached_png, "wb") as f:
+            f.write(img_bytes)
 
     ff = ffmpeg_exe()
-    vf = _build_motion_vf(W, H, fps, frames)
+    vf = _build_motion_vf(W, H, fps=fps, frames=frames)
 
     run_cmd([
         ff, "-y",
@@ -732,12 +765,16 @@ def generate_video_clip(
         "-c:v", "libx264",
         "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
         "-crf", os.environ.get("UAPPRESS_X264_CRF", "23"),
+        "-tune", "stillimage",
         "-pix_fmt", "yuv420p",
+        "-g", str(max(30, fps * 2)),
         "-movflags", "+faststart",
         out_path,
     ])
 
     _copy_file(out_path, cached_mp4)
+    _prune_cache(cache_dir)
+
     return out_path
 
 # ============================
