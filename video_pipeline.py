@@ -778,28 +778,31 @@ def generate_video_clip(
     return out_path
 
 # ============================
-# PART 5/5 — Segment Orchestrator (ONE SEGMENT → ONE MP4) + Auto-fit to narration duration
+# PART 5/5 — Segment Orchestrator (ONE SEGMENT → ONE MP4)
+# Auto-fit to narration duration
 # ============================
-# ✅ Auto-fit: scene count + per-scene seconds are derived from narration length
-# ✅ Enforces min/max seconds per scene
-# ✅ Still generates sequentially (app.py controls the loop)
-# ✅ FIX: removes NameError by using shutil.rmtree directly (no safe_rmtree dependency)
-#
-# REQUIRES (already in earlier parts):
+
+from typing import Dict, List, Optional
+import os
+import tempfile
+import shutil
+
+from openai import OpenAI
+
+# REQUIRES (already defined earlier in video_pipeline.py):
 # - get_media_duration_seconds()
 # - plan_scenes()
 # - generate_video_clip()
 # - concat_mp4s()
 # - mux_audio()
 # - read_script_file()
-# - _allocate_scene_seconds()   <-- must exist (add in Part 3 as discussed)
+# - _allocate_scene_seconds()
 
-import shutil  # ✅ PATCH: for cleanup
 
 def render_segment_mp4(
     *,
     pair: Dict,
-    extract_dir: str,  # kept for compatibility (not used directly here)
+    extract_dir: str,   # kept for compatibility
     out_path: str,
     zoom_strength: float = 1.06,
     fps: int = 15,
@@ -813,12 +816,12 @@ def render_segment_mp4(
 ) -> str:
     """
     Orchestrates:
-      script → scene plan → auto-fit seconds → image clips → concat → mux audio → final MP4
+      script → scene planning → auto-fit timing → image clips → concat → mux audio
 
     Auto-fit logic:
-      - narration length (seconds) is measured from audio file
-      - scene count is estimated from narration / target_avg, capped by max_scenes
-      - per-scene seconds are allocated so total ~= narration length within min/max bounds
+      - Measure narration duration from audio
+      - Estimate scene count (capped)
+      - Allocate per-scene seconds within min/max bounds
     """
 
     script_path = pair.get("script_path")
@@ -836,11 +839,12 @@ def render_segment_mp4(
     chapter_text = read_script_file(script_path)
     chapter_title = pair.get("title_guess") or os.path.basename(script_path)
 
-    # ---- Auto-fit: measure narration duration ----
+    # -------------------------------------------------
+    # Auto-fit: narration duration
+    # -------------------------------------------------
     narration_sec = int(round(get_media_duration_seconds(audio_path)))
     narration_sec = max(1, narration_sec)
 
-    # ---- Auto-fit: estimate number of scenes ----
     min_scene_seconds = max(1, int(min_scene_seconds))
     max_scene_seconds = max(min_scene_seconds, int(max_scene_seconds))
     max_scenes = max(1, int(max_scenes))
@@ -849,7 +853,9 @@ def render_segment_mp4(
     est_scenes = int(round(narration_sec / max(1, target_avg)))
     est_scenes = max(1, min(max_scenes, est_scenes))
 
-    # ---- Plan prompts (seconds here are only a hint; we override below) ----
+    # -------------------------------------------------
+    # Scene planning (LLM)
+    # -------------------------------------------------
     planned = plan_scenes(
         client,
         chapter_title=chapter_title,
@@ -858,11 +864,14 @@ def render_segment_mp4(
         seconds_per_scene=target_avg,
         model=model,
     )
+
     planned = planned[:max_scenes]
     if not planned:
         raise RuntimeError("Scene planner returned no usable prompts.")
 
-    # ---- Allocate per-scene seconds to match narration ----
+    # -------------------------------------------------
+    # Allocate seconds per scene to match narration
+    # -------------------------------------------------
     alloc = _allocate_scene_seconds(
         narration_sec,
         len(planned),
@@ -875,26 +884,38 @@ def render_segment_mp4(
         prompt = str(sc.get("prompt") or "").strip()
         if not prompt:
             continue
-        scenes.append({"scene": i + 1, "seconds": int(alloc[i]), "prompt": prompt})
+        scenes.append(
+            {
+                "scene": i + 1,
+                "seconds": int(alloc[i]),
+                "prompt": prompt,
+            }
+        )
 
     if not scenes:
         raise RuntimeError("No usable scenes after allocation.")
 
-    # ---- Ken Burns zoom-only controls ----
+    # -------------------------------------------------
+    # Ken Burns (zoom-only)
+    # -------------------------------------------------
     os.environ["UAPPRESS_ZOOM_START"] = "1.00"
     os.environ["UAPPRESS_ZOOM_END"] = f"{max(1.01, min(1.20, float(zoom_strength))):.4f}"
     os.environ["UAPPRESS_KB_FPS"] = str(int(max(10, min(30, fps))))
 
     size = f"{int(width)}x{int(height)}"
 
-    # Per-segment temp workdir (deleted afterwards to keep Streamlit stable)
+    # Per-segment temp directory
     seg_work = tempfile.mkdtemp(prefix="uappress_seg_")
     clips: List[str] = []
 
     try:
-        # ---- Generate each scene clip ----
+        # -------------------------------------------------
+        # Generate scene clips
+        # -------------------------------------------------
         for sc in scenes:
-            clip_path = os.path.join(seg_work, f"scene_{int(sc['scene']):02d}.mp4")
+            clip_path = os.path.join(
+                seg_work, f"scene_{int(sc['scene']):02d}.mp4"
+            )
             generate_video_clip(
                 client,
                 prompt=sc["prompt"],
@@ -908,16 +929,20 @@ def render_segment_mp4(
         if not clips:
             raise RuntimeError("No scene clips were generated.")
 
-        # ---- Concat to silent video ----
+        # -------------------------------------------------
+        # Concat → silent MP4
+        # -------------------------------------------------
         silent_mp4 = os.path.join(seg_work, "segment_silent.mp4")
         concat_mp4s(clips, silent_mp4)
 
-        # ---- Mux narration audio onto it ----
+        # -------------------------------------------------
+        # Mux narration audio
+        # -------------------------------------------------
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         mux_audio(silent_mp4, audio_path, out_path)
 
         return out_path
 
     finally:
-        # ✅ PATCH: no safe_rmtree() dependency, prevents NameError
+        # ✅ SAFE CLEANUP — no custom helper, no NameError
         shutil.rmtree(seg_work, ignore_errors=True)
