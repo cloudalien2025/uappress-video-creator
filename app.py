@@ -184,7 +184,7 @@ if zip_file:
     st.session_state.job_manifest = {}
 
 # If no ZIP, stop early
-if not st.session_state.tts_zip_bytes:
+if not st.session_state.get("tts_zip_bytes"):
     st.info("Upload the TTS Studio ZIP to detect segments.")
     st.stop()
 
