@@ -725,179 +725,90 @@ for idx, p in enumerate(pairs, start=1):
                 st.exception(e)
 
 # ----------------------------
-# 4) Build final MP4 from ZIP of segment MP4s (logo applied once)
-#    ✅ PATCHES INCLUDED:
-#       - URL (DigitalOcean) streaming download to disk (avoids Streamlit RAM crashes)
-#       - Scan/probe extracted MP4s and ONLY stitch ones that have REAL VIDEO
-#       - Reliable concat using concat filter + re-encode (not concat-copy)
-#       - Safer PNG logo overlay (no scale2ref) + sanity checks before/after logo
-#       - If logo output is audio-only, auto-fallback to unbranded video
-#
-#    NOTE: Ensure you have `import requests` ONCE near the top of your file.
+# 4) Build FINAL MP4 from ZIP of segment MP4s
+#    - Reliable concat (re-encode)
+#    - Safe PNG logo overlay (ONCE)
+#    - DigitalOcean Spaces upload (no Streamlit crash)
 # ----------------------------
 
-import requests  # REMOVE this line if requests is already imported elsewhere in your file.
+import requests
+import boto3
+from botocore.client import Config
 
 st.divider()
-st.subheader("4) Build FINAL MP4 from ZIP (stitching + optional logo ONCE)")
+st.subheader("4) Build FINAL MP4 (stitch + logo + safe delivery)")
 st.caption(
-    "Recommended: paste a public DigitalOcean Spaces ZIP URL so the app streams to disk. "
-    "This step validates MP4 streams and prevents audio-only finals."
+    "This step stitches your segment MP4s into a single movie, applies the logo ONCE, "
+    "and delivers the final file safely (no Streamlit crashes)."
 )
 
-mode = st.radio(
-    "ZIP source",
-    ["URL (recommended)", "Upload (small test ZIP only)"],
-    index=0,
+# ----------------------------
+# ZIP SOURCE
+# ----------------------------
+source_mode = st.radio(
+    "Segment ZIP source",
+    ["Public URL (recommended)", "Upload ZIP (small test only)"],
     horizontal=True,
 )
 
 zip_url = ""
-uploaded_zip = None
+zip_upload = None
 
-if mode == "URL (recommended)":
+if source_mode == "Public URL (recommended)":
     zip_url = st.text_input(
-        "ZIP URL (DigitalOcean Spaces public link)",
-        value="",
-        placeholder="https://cloud-alien.nyc3.digitaloceanspaces.com/episodes/roswell/segments.zip",
+        "ZIP URL (DigitalOcean Spaces or other public link)",
+        placeholder="https://cloud-alien.nyc3.digitaloceanspaces.com/uappress/segments.zip",
     )
 else:
-    uploaded_zip = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"], key="zip_segments_small")
+    zip_upload = st.file_uploader("Upload ZIP of segment MP4s", type=["zip"])
 
-def _sort_key_mp4(name: str) -> Tuple[int, str]:
-    base = os.path.basename(name).lower()
-    m = re.search(r"seg[\s_\-]*0*(\d{1,4})", base)
-    if m:
-        return (int(m.group(1)), base)
-    m2 = re.search(r"(?:chapter|ch)[\s_\-]*0*(\d{1,4})", base)
-    if m2:
-        return (1000 + int(m2.group(1)), base)
-    if "intro" in base:
-        return (-1, base)
-    if "outro" in base:
-        return (999999, base)
-    return (500000, base)
-
-def _download_zip_streaming(url: str, dest_path: str) -> None:
-    url = (url or "").strip()
-    if not url:
-        raise ValueError("Please paste a ZIP URL.")
-    headers = {"User-Agent": "uappress-streamlit/1.0"}
-    prog = st.progress(0.0)
-    status = st.empty()
-
-    with requests.get(url, stream=True, timeout=(15, 600), headers=headers) as r:
-        r.raise_for_status()
-        total = r.headers.get("Content-Length")
-        total_bytes = int(total) if total and total.isdigit() else None
-
-        downloaded = 0
-        chunk_size = 1024 * 1024  # 1MB
-
-        status.write("Downloading ZIP to server disk…")
-        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total_bytes:
-                    prog.progress(min(1.0, downloaded / max(1, total_bytes)))
-
-    prog.empty()
-    status.empty()
-
-def _ffmpeg_probe_stderr(path: str) -> str:
-    p = subprocess.run(
+# ----------------------------
+# HELPERS
+# ----------------------------
+def _probe(path: str) -> str:
+    r = subprocess.run(
         [FFMPEG, "-hide_banner", "-i", path],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    return p.stderr or ""
+    return r.stderr or ""
 
-def _has_video_stream(path: str) -> bool:
-    return "Video:" in _ffmpeg_probe_stderr(path)
+def _has_video(path: str) -> bool:
+    return "Video:" in _probe(path)
 
-def _has_audio_stream(path: str) -> bool:
-    return "Audio:" in _ffmpeg_probe_stderr(path)
+def _has_audio(path: str) -> bool:
+    return "Audio:" in _probe(path)
 
-def _overlay_logo_png_safe(
-    in_mp4: str,
-    logo_png: str,
-    out_mp4: str,
-    *,
-    size_pct: int = 10,
-    margin_px: int = 30,
-    opacity: float = 0.9,
-) -> None:
-    """
-    Safer PNG overlay: avoids scale2ref and explicitly maps video+audio.
-    """
-    opacity = max(0.0, min(1.0, float(opacity)))
-    size_pct = max(3, min(30, int(size_pct)))
-    margin_px = max(0, int(margin_px))
+def _download_zip(url: str, dest: str):
+    with requests.get(url, stream=True, timeout=(15, 600)) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
-    # Scale logo relative to its own dimensions, then overlay on base video.
-    filter_complex = (
-        f"[1:v]format=rgba,"
-        f"scale=iw*{size_pct}/100:-1,"
-        f"colorchannelmixer=aa={opacity}[lg];"
-        f"[0:v][lg]overlay=x=W-w-{margin_px}:y={margin_px}:format=auto[v]"
-    )
+def _sort_mp4(p: str):
+    name = os.path.basename(p).lower()
+    if "intro" in name:
+        return (-1, name)
+    if "outro" in name:
+        return (999999, name)
+    m = re.search(r"(?:ch|chapter|seg)[\s_\-]*0*(\d+)", name)
+    if m:
+        return (int(m.group(1)), name)
+    return (500000, name)
 
-    subprocess.run(
-        [
-            FFMPEG, "-y",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-i", in_mp4,
-            "-i", logo_png,
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-map", "0:a?",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            "-shortest",
-            out_mp4,
-        ],
-        check=True,
-    )
-
-def _concat_mp4s_filter_reencode(mp4s: List[str], out_path: str) -> None:
-    """
-    Most reliable stitch: concat filter + re-encode.
-    Requires every input to have both video+audio streams.
-    """
-    if not mp4s:
-        raise ValueError("No MP4s to stitch.")
-
-    missing_video = [m for m in mp4s if not _has_video_stream(m)]
-    if missing_video:
-        raise RuntimeError("Some inputs have NO video stream:\n" + "\n".join(os.path.basename(x) for x in missing_video[:25]))
-
-    missing_audio = [m for m in mp4s if not _has_audio_stream(m)]
-    if missing_audio:
-        raise RuntimeError("Some inputs have NO audio stream:\n" + "\n".join(os.path.basename(x) for x in missing_audio[:25]))
-
-    inputs: List[str] = []
-    for m in mp4s:
-        inputs += ["-i", m]
-
-    # [0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[v][a]
+def _concat_reencode(mp4s: List[str], out_path: str):
+    inputs = []
     parts = []
-    for i in range(len(mp4s)):
-        parts.append(f"[{i}:v:0][{i}:a:0]")
+    for i, m in enumerate(mp4s):
+        inputs += ["-i", m]
+        parts.append(f"[{i}:v][{i}:a]")
     flt = "".join(parts) + f"concat=n={len(mp4s)}:v=1:a=1[v][a]"
-
     subprocess.run(
         [
             FFMPEG, "-y",
-            "-hide_banner",
-            "-loglevel", "error",
             *inputs,
             "-filter_complex", flt,
             "-map", "[v]",
@@ -911,146 +822,151 @@ def _concat_mp4s_filter_reencode(mp4s: List[str], out_path: str) -> None:
         check=True,
     )
 
-build_final_disabled = True
-if mode == "URL (recommended)":
-    build_final_disabled = not bool((zip_url or "").strip())
-else:
-    build_final_disabled = uploaded_zip is None
+def _overlay_logo_png(in_mp4, logo_png, out_mp4):
+    subprocess.run(
+        [
+            FFMPEG, "-y",
+            "-i", in_mp4,
+            "-i", logo_png,
+            "-filter_complex",
+            f"[1:v]format=rgba,scale=iw*{logo_size}/100:-1,"
+            f"colorchannelmixer=aa={logo_opacity}[lg];"
+            f"[0:v][lg]overlay=W-w-{logo_margin}:{logo_margin}[v]",
+            "-map", "[v]",
+            "-map", "0:a?",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            out_mp4,
+        ],
+        check=True,
+    )
 
-build_final = st.button("🎞 Build FINAL MP4", type="primary", disabled=build_final_disabled)
+# ----------------------------
+# BUILD FINAL
+# ----------------------------
+can_build = (zip_url.strip() if source_mode == "Public URL (recommended)" else zip_upload) is not None
+build = st.button("🎬 Build FINAL MP4", type="primary", disabled=not can_build)
 
-if build_final:
+if build:
     try:
         with tempfile.TemporaryDirectory() as td:
             zip_path = os.path.join(td, "segments.zip")
 
-            # 1) Get ZIP onto disk
-            if mode == "URL (recommended)":
-                _download_zip_streaming(zip_url, zip_path)
+            # Get ZIP
+            if source_mode == "Public URL (recommended)":
+                _download_zip(zip_url.strip(), zip_path)
             else:
                 with open(zip_path, "wb") as f:
-                    f.write(uploaded_zip.getvalue())
+                    f.write(zip_upload.getvalue())
 
-            # 2) Extract
+            # Extract
             extract_dir = os.path.join(td, "unzipped")
             os.makedirs(extract_dir, exist_ok=True)
-
-            st.info("Extracting ZIP…")
             with zipfile.ZipFile(zip_path, "r") as z:
                 z.extractall(extract_dir)
 
-            # 3) Collect MP4s and probe streams
-            st.info("Scanning MP4s and validating streams…")
-
-            all_mp4s: List[str] = []
+            # Collect MP4s
+            mp4s = []
             for root, _, files in os.walk(extract_dir):
                 for fn in files:
                     if fn.lower().endswith(".mp4"):
-                        all_mp4s.append(os.path.join(root, fn))
-
-            if not all_mp4s:
-                st.error("No .mp4 files found in the ZIP.")
-                st.stop()
-
-            report_rows = []
-            video_mp4s: List[str] = []
-            audio_only_mp4s: List[str] = []
-            no_stream_mp4s: List[str] = []
-
-            for p in sorted(all_mp4s, key=lambda x: os.path.basename(x).lower()):
-                hv = _has_video_stream(p)
-                ha = _has_audio_stream(p)
-                report_rows.append(
-                    {"file": os.path.basename(p), "video": "YES" if hv else "NO", "audio": "YES" if ha else "NO"}
-                )
-                if hv:
-                    video_mp4s.append(p)
-                elif ha:
-                    audio_only_mp4s.append(p)
-                else:
-                    no_stream_mp4s.append(p)
-
-            st.write(f"Found {len(all_mp4s)} total .mp4 files")
-            st.write(f"✅ Video MP4s: {len(video_mp4s)}")
-            st.write(f"⚠️ Audio-only MP4s: {len(audio_only_mp4s)}")
-            if no_stream_mp4s:
-                st.write(f"⚠️ Empty/unknown MP4s: {len(no_stream_mp4s)}")
-
-            st.dataframe(report_rows, use_container_width=True, height=320)
-
-            if audio_only_mp4s:
-                st.warning("Ignoring audio-only MP4s (these would produce an audio-only final). Examples:")
-                for p in audio_only_mp4s[:25]:
-                    st.write(f"- {os.path.basename(p)}")
-
-            mp4s = sorted(video_mp4s, key=lambda p: _sort_key_mp4(os.path.basename(p)))
+                        mp4s.append(os.path.join(root, fn))
 
             if not mp4s:
-                st.error(
-                    "ZERO usable video MP4s were found in this ZIP. "
-                    "Your ZIP does not contain real video segments."
-                )
+                st.error("No MP4 files found in ZIP.")
                 st.stop()
 
-            st.write("✅ Stitch order (VIDEO MP4s only):")
-            for m in mp4s:
-                st.write(f"- {os.path.basename(m)}")
+            # Validate streams
+            valid = [m for m in mp4s if _has_video(m) and _has_audio(m)]
+            if not valid:
+                st.error("No valid video MP4s found (video+audio required).")
+                st.stop()
 
+            mp4s = sorted(valid, key=_sort_mp4)
+
+            # Stitch
             out_dir = os.path.join(td, "out")
             os.makedirs(out_dir, exist_ok=True)
             full_mp4 = os.path.join(out_dir, "uappress_full_documentary.mp4")
 
-            # 4) Stitch (re-encode concat)
-            st.info("Stitching segments (concat filter + re-encode)…")
-            _concat_mp4s_filter_reencode(mp4s, full_mp4)
+            st.info("Stitching segments…")
+            _concat_reencode(mp4s, full_mp4)
 
-            # Sanity check: stitched file MUST have video
-            if not _has_video_stream(full_mp4):
-                st.error("🚨 Stitched FULL MP4 is missing video. Something is wrong with input segments.")
+            if not _has_video(full_mp4):
+                st.error("Final stitched file has NO video stream.")
                 st.stop()
 
             final_out = full_mp4
 
-            # 5) Apply logo ONCE (PNG overlay) with sanity checks + fallback
+            # Apply logo ONCE
             if apply_logo_on_final and logo_file is not None:
-                st.info("Applying logo watermark to FINAL movie…")
-                logo_path = os.path.join(out_dir, "logo_upload.png")
+                logo_path = os.path.join(out_dir, "logo.png")
                 with open(logo_path, "wb") as f:
                     f.write(logo_file.getvalue())
 
                 branded = os.path.join(out_dir, "uappress_full_documentary_logo.mp4")
-                _overlay_logo_png_safe(
-                    full_mp4,
-                    logo_path,
-                    branded,
-                    size_pct=logo_size,
-                    margin_px=logo_margin,
-                    opacity=logo_opacity,
-                )
+                st.info("Applying logo…")
+                _overlay_logo_png(full_mp4, logo_path, branded)
 
-                # If branding breaks video, fallback
-                if not _has_video_stream(branded):
-                    st.error("🚨 Logo output became audio-only. Falling back to unbranded FULL MP4.")
-                    final_out = full_mp4
-                else:
+                if _has_video(branded):
                     final_out = branded
+                else:
+                    st.warning("Logo output was invalid. Using unbranded video.")
 
-            # 6) Optional force re-encode (your existing helper)
-            if force_reencode:
-                st.info("Force re-encoding FINAL movie…")
-                final_re = final_out.replace(".mp4", "_reencoded.mp4")
-                final_out = reencode_mp4(final_out, final_re)
-
-            st.success("✅ Final movie ready!")
+            st.success("✅ Final movie ready")
             st.video(final_out)
 
-            with open(final_out, "rb") as f:
-                st.download_button(
-                    "⬇️ Download FINAL MP4 (YouTube Ready)",
-                    data=f,
-                    file_name=os.path.basename(final_out),
-                    mime="video/mp4",
+            # ----------------------------
+            # SAFE DELIVERY (NO CRASH)
+            # ----------------------------
+            size_mb = os.path.getsize(final_out) / (1024 * 1024)
+            st.caption(f"Final size: {size_mb:.1f} MB")
+
+            BIG_MB = 200
+            use_url = size_mb >= BIG_MB
+
+            st.subheader("Download")
+
+            if use_url:
+                st.write("Large file detected — uploading to DigitalOcean Spaces (recommended).")
+
+            do_key = os.environ.get("DO_SPACES_KEY")
+            do_secret = os.environ.get("DO_SPACES_SECRET")
+            do_region = os.environ.get("DO_SPACES_REGION", "nyc3")
+            do_bucket = os.environ.get("DO_SPACES_BUCKET")
+            do_base = os.environ.get("DO_SPACES_PUBLIC_BASE")
+
+            if use_url and all([do_key, do_secret, do_bucket, do_base]):
+                s3 = boto3.client(
+                    "s3",
+                    region_name=do_region,
+                    endpoint_url=f"https://{do_region}.digitaloceanspaces.com",
+                    aws_access_key_id=do_key,
+                    aws_secret_access_key=do_secret,
+                    config=Config(signature_version="s3v4"),
                 )
+
+                obj_key = f"uappress/exports/{os.path.basename(final_out)}"
+                s3.upload_file(
+                    final_out,
+                    do_bucket,
+                    obj_key,
+                    ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
+                )
+
+                url = f"{do_base.rstrip('/')}/{obj_key}"
+                st.code(url)
+
+            if not use_url:
+                with open(final_out, "rb") as f:
+                    st.download_button(
+                        "⬇️ Download FINAL MP4",
+                        data=f.read(),
+                        file_name=os.path.basename(final_out),
+                        mime="video/mp4",
+                    )
 
     except Exception as e:
         st.error(f"Final build failed: {e}")
