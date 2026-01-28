@@ -211,7 +211,6 @@ def _safe_mkdir(p: str) -> str:
     return p
 
 def _default_out_dir(extract_dir: str) -> str:
-    # Save outputs inside extracted workspace
     return _safe_mkdir(str(Path(extract_dir) / "_mp4_segments"))
 
 def _segment_out_path(out_dir: str, segment_key: str) -> str:
@@ -235,6 +234,10 @@ def generate_all_segments_sequential(
     fps: int,
     width: int,
     height: int,
+    max_scenes: int,
+    min_scene_seconds: int,
+    max_scene_seconds: int,
+    api_key: str,
 ) -> None:
     st.session_state["is_generating"] = True
     st.session_state["stop_requested"] = False
@@ -258,7 +261,7 @@ def generate_all_segments_sequential(
         seg_label = seg.get("label", seg_key)
         out_path = _segment_out_path(out_dir, seg_key)
 
-        # Skip if already exists (resume-safe) unless overwrite
+        # Skip if already exists unless overwrite
         if (not overwrite) and Path(out_path).exists():
             st.session_state["generated"][seg_key] = out_path
             status.info(f"Skipping (already exists): {seg_label}")
@@ -270,28 +273,22 @@ def generate_all_segments_sequential(
 
         t0 = time.time()
         try:
-            # ------------------------------------------------------------
-            # ✅ Pipeline call — ONE SEGMENT at a time
-            #
-            # We pass seg["pair"] (the raw pair from vp.pair_segments),
-            # because Part 1 stored it inside the normalized segment dict.
-            #
-            # If your function is named differently, change only this call.
-            # ------------------------------------------------------------
+            # ✅ Correct pipeline call (matches video_pipeline.py Part 5)
             vp.render_segment_mp4(
-                pair=seg["pair"],          # <-- raw pair from video_pipeline pairing
+                pair=seg["pair"],
                 extract_dir=extract_dir,
                 out_path=out_path,
-                ken_burns=True,
-                zoom_only=True,
-                zoom_strength=zoom_strength,
-                fps=fps,
-                width=width,
-                height=height,
+                zoom_strength=float(zoom_strength),
+                fps=int(fps),
+                width=int(width),
+                height=int(height),
+                api_key=str(api_key),
+                max_scenes=int(max_scenes),
+                min_scene_seconds=int(min_scene_seconds),
+                max_scene_seconds=int(max_scene_seconds),
             )
 
             st.session_state["generated"][seg_key] = out_path
-
             dt = time.time() - t0
             _log(f"✅ Generated {seg_label} in {dt:.1f}s")
 
@@ -300,7 +297,6 @@ def generate_all_segments_sequential(
             status.error(f"Failed generating {seg_label}. See log below.")
             break
         finally:
-            # free memory between segments
             gc.collect()
             time.sleep(0.05)
 
@@ -320,11 +316,16 @@ if not extract_dir or not Path(extract_dir).exists():
     st.warning("Upload/extract a ZIP first.")
     st.stop()
 
+# ✅ Require API key (sidebar Part 1 already stores it here)
+api_key = st.session_state.get("api_key", "").strip()
+if not api_key:
+    st.warning("Enter your OpenAI API key in the sidebar to generate videos.")
+    st.stop()
+
 out_dir = _default_out_dir(extract_dir)
 st.caption(f"Segments will be saved to: {out_dir}")
 
-# Resolution control matches Part 1 sidebar values if you kept them;
-# otherwise default to 1280x720
+# Resolution from sidebar (Part 1)
 res = st.session_state.get("ui_resolution", "1280x720")
 w, h = (1280, 720) if res == "1280x720" else (1920, 1080)
 
@@ -340,6 +341,36 @@ with colC:
         max_value=1.20,
         value=1.06,
         step=0.01,
+        disabled=st.session_state["is_generating"],
+    )
+
+# ✅ Scene pacing controls (APP UI ONLY)
+colD, colE, colF = st.columns([1, 1, 1])
+with colD:
+    max_scenes = st.number_input(
+        "Max scenes per segment",
+        min_value=3,
+        max_value=20,
+        value=8,
+        step=1,
+        disabled=st.session_state["is_generating"],
+    )
+with colE:
+    min_scene_seconds = st.number_input(
+        "Min seconds per scene",
+        min_value=2,
+        max_value=20,
+        value=4,
+        step=1,
+        disabled=st.session_state["is_generating"],
+    )
+with colF:
+    max_scene_seconds = st.number_input(
+        "Max seconds per scene",
+        min_value=int(min_scene_seconds),
+        max_value=30,
+        value=10,
+        step=1,
         disabled=st.session_state["is_generating"],
     )
 
@@ -370,6 +401,10 @@ if generate_clicked:
         fps=int(fps),
         width=int(w),
         height=int(h),
+        max_scenes=int(max_scenes),
+        min_scene_seconds=int(min_scene_seconds),
+        max_scene_seconds=int(max_scene_seconds),
+        api_key=api_key,
     )
 
 # ----------------------------
@@ -395,4 +430,3 @@ if st.session_state.get("gen_log"):
     st.code("\n".join(st.session_state["gen_log"][-200:]))
 else:
     st.caption("Log will appear here.")
-
