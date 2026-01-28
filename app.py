@@ -1,5 +1,5 @@
 # ============================
-# PART 1/5 — Sidebar + ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
+# PART 1/2 — Sidebar + ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
 # ============================
 # app.py — UAPpress Video Creator
 #
@@ -209,14 +209,16 @@ if st.session_state.zip_path:
 st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, crash-safe).")
 
 # ============================
-# PART 3/5 — Generate Segment MP4s (Sequential, Crash-Safe)
+# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe)
 # ============================
 
 import gc
 import time
 from pathlib import Path
+
 import streamlit as st
 import video_pipeline as vp
+
 
 # ----------------------------
 # Session state init (small only)
@@ -230,26 +232,39 @@ if "generated" not in st.session_state:
 if "gen_log" not in st.session_state:
     st.session_state["gen_log"] = []    # list[str]
 
+
 def _log(msg: str) -> None:
     st.session_state["gen_log"].append(msg)
+
 
 def _safe_mkdir(p: str) -> str:
     Path(p).mkdir(parents=True, exist_ok=True)
     return p
 
+
 def _default_out_dir(extract_dir: str) -> str:
     return _safe_mkdir(str(Path(extract_dir) / "_mp4_segments"))
 
+
 def _segment_out_path(out_dir: str, segment_key: str) -> str:
     return str(Path(out_dir) / f"{segment_key}.mp4")
+
 
 def _request_stop() -> None:
     st.session_state["stop_requested"] = True
     _log("🛑 Stop requested — will stop after current segment finishes.")
 
+
 def _reset_gen_flags() -> None:
     st.session_state["is_generating"] = False
     st.session_state["stop_requested"] = False
+
+
+def _get_resolution_wh() -> tuple[int, int]:
+    # Uses the sidebar selectbox from Part 1/2 if present; fallback to 1280x720.
+    res = st.session_state.get("ui_resolution", "1280x720")
+    return (1280, 720) if res == "1280x720" else (1920, 1080)
+
 
 def generate_all_segments_sequential(
     *,
@@ -300,16 +315,16 @@ def generate_all_segments_sequential(
 
         t0 = time.time()
         try:
-            # ✅ Correct pipeline call (matches video_pipeline.py Part 5)
+            # ✅ ONE SEGMENT at a time (sequential, crash-safe)
             vp.render_segment_mp4(
                 pair=seg["pair"],
                 extract_dir=extract_dir,
                 out_path=out_path,
-                zoom_strength=float(zoom_strength),
+                api_key=str(api_key),
                 fps=int(fps),
                 width=int(width),
                 height=int(height),
-                api_key=str(api_key),
+                zoom_strength=float(zoom_strength),
                 max_scenes=int(max_scenes),
                 min_scene_seconds=int(min_scene_seconds),
                 max_scene_seconds=int(max_scene_seconds),
@@ -331,6 +346,7 @@ def generate_all_segments_sequential(
 
     _reset_gen_flags()
 
+
 # ----------------------------
 # UI
 # ----------------------------
@@ -343,7 +359,7 @@ if not extract_dir or not Path(extract_dir).exists():
     st.warning("Upload/extract a ZIP first.")
     st.stop()
 
-# ✅ Require API key (sidebar Part 1 already stores it here)
+# ✅ Require API key from Part 1/2 sidebar ("api_key")
 api_key = st.session_state.get("api_key", "").strip()
 if not api_key:
     st.warning("Enter your OpenAI API key in the sidebar to generate videos.")
@@ -352,15 +368,24 @@ if not api_key:
 out_dir = _default_out_dir(extract_dir)
 st.caption(f"Segments will be saved to: {out_dir}")
 
-# Resolution from sidebar (Part 1)
-res = st.session_state.get("ui_resolution", "1280x720")
-w, h = (1280, 720) if res == "1280x720" else (1920, 1080)
+w, h = _get_resolution_wh()
 
 colA, colB, colC = st.columns([1, 1, 1])
 with colA:
-    overwrite = st.checkbox("Overwrite existing MP4s", value=False, disabled=st.session_state["is_generating"])
+    overwrite = st.checkbox(
+        "Overwrite existing MP4s",
+        value=False,
+        disabled=st.session_state["is_generating"],
+    )
 with colB:
-    fps = st.number_input("FPS", min_value=12, max_value=60, value=30, step=1, disabled=st.session_state["is_generating"])
+    fps = st.number_input(
+        "FPS",
+        min_value=12,
+        max_value=60,
+        value=30,
+        step=1,
+        disabled=st.session_state["is_generating"],
+    )
 with colC:
     zoom_strength = st.slider(
         "Ken Burns zoom strength (zoom-only)",
@@ -371,14 +396,14 @@ with colC:
         disabled=st.session_state["is_generating"],
     )
 
-# ✅ Scene pacing controls (APP UI ONLY)
+# ✅ Low-cost defaults (edit here if desired)
 colD, colE, colF = st.columns([1, 1, 1])
 with colD:
     max_scenes = st.number_input(
         "Max scenes per segment",
         min_value=3,
         max_value=20,
-        value=8,
+        value=6,  # 👈 default (lower cost)
         step=1,
         disabled=st.session_state["is_generating"],
     )
@@ -387,7 +412,7 @@ with colE:
         "Min seconds per scene",
         min_value=2,
         max_value=20,
-        value=4,
+        value=5,  # 👈 default
         step=1,
         disabled=st.session_state["is_generating"],
     )
@@ -396,7 +421,7 @@ with colF:
         "Max seconds per scene",
         min_value=int(min_scene_seconds),
         max_value=30,
-        value=10,
+        value=9,  # 👈 default
         step=1,
         disabled=st.session_state["is_generating"],
     )
@@ -434,6 +459,7 @@ if generate_clicked:
         api_key=api_key,
     )
 
+
 # ----------------------------
 # Output previews
 # ----------------------------
@@ -444,12 +470,14 @@ generated = st.session_state.get("generated", {})
 if not generated:
     st.info("No MP4s generated yet.")
 else:
+    # display in the same order as detected segments
     for seg in segments:
-        seg_key = seg["key"]
+        seg_key = seg.get("key")
         mp4_path = generated.get(seg_key)
         if mp4_path and Path(mp4_path).exists():
-            st.write(f"**{seg['label']}**")
+            st.write(f"**{seg.get('label', seg_key)}**")
             st.video(mp4_path)
+
 
 st.markdown("---")
 st.subheader("🧾 Log")
