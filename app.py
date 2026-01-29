@@ -209,11 +209,13 @@ if st.session_state.zip_path:
 st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, crash-safe).")
 
 # ============================
-# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe)
+# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe) + ZIP Export
 # ============================
 
 import gc
 import time
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -228,9 +230,11 @@ if "is_generating" not in st.session_state:
 if "stop_requested" not in st.session_state:
     st.session_state["stop_requested"] = False
 if "generated" not in st.session_state:
-    st.session_state["generated"] = {}  # key -> mp4_path (strings only)
+    st.session_state["generated"] = {}  # seg_key -> mp4_path (strings only)
 if "gen_log" not in st.session_state:
     st.session_state["gen_log"] = []    # list[str]
+if "zip_export_path" not in st.session_state:
+    st.session_state["zip_export_path"] = ""  # path to export zip (strings only)
 
 
 def _log(msg: str) -> None:
@@ -284,6 +288,69 @@ def _get_resolution_wh() -> tuple[int, int]:
     return (1280, 720) if res == "1280x720" else (1920, 1080)
 
 
+def _build_zip_export(*, out_dir: str, segments: list, generated: dict) -> str:
+    """
+    Create a ZIP containing all generated segment MP4s in the detected order.
+    Returns zip file path.
+    """
+    out_dir_p = Path(out_dir)
+    out_dir_p.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_path = str(out_dir_p / f"uappress_segments_{ts}.zip")
+
+    files_added = 0
+    missing = []
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for seg in segments:
+            seg_key = seg.get("key")
+            mp4_path = generated.get(seg_key)
+
+            if not mp4_path:
+                missing.append(f"{seg.get('label', seg_key)} (not generated)")
+                continue
+
+            p = Path(mp4_path)
+            if not p.exists():
+                missing.append(f"{seg.get('label', seg_key)} (missing file)")
+                continue
+
+            # Store in ZIP with the clean filename only
+            z.write(str(p), arcname=p.name)
+            files_added += 1
+
+        # Optional: add a simple manifest
+        manifest_lines = []
+        manifest_lines.append("UAPpress Video Creator — Segment Export")
+        manifest_lines.append(f"Created: {datetime.now().isoformat(timespec='seconds')}")
+        manifest_lines.append("")
+        manifest_lines.append("Segments (in order):")
+        for seg in segments:
+            seg_key = seg.get("key")
+            mp4_path = generated.get(seg_key)
+            name = Path(mp4_path).name if mp4_path else "(not generated)"
+            manifest_lines.append(f"- {seg.get('index', ''):>2}  {seg.get('label', seg_key)}  ->  {name}")
+
+        if missing:
+            manifest_lines.append("")
+            manifest_lines.append("Missing / Not Included:")
+            for m in missing:
+                manifest_lines.append(f"- {m}")
+
+        z.writestr("manifest.txt", "\n".join(manifest_lines))
+
+    if files_added == 0:
+        # Clean up empty zip
+        try:
+            Path(zip_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError("No MP4 files were available to add to the ZIP.")
+
+    return zip_path
+
+
 def generate_all_segments_sequential(
     *,
     segments: list,
@@ -301,6 +368,9 @@ def generate_all_segments_sequential(
 ) -> None:
     st.session_state["is_generating"] = True
     st.session_state["stop_requested"] = False
+
+    # Clear any previous ZIP export because outputs may change
+    st.session_state["zip_export_path"] = ""
 
     progress = st.progress(0.0)
     status = st.empty()
@@ -333,7 +403,6 @@ def generate_all_segments_sequential(
 
         t0 = time.time()
         try:
-            # ✅ ONE SEGMENT at a time (sequential, crash-safe)
             vp.render_segment_mp4(
                 pair=seg["pair"],
                 extract_dir=extract_dir,
@@ -377,7 +446,6 @@ if not extract_dir or not Path(extract_dir).exists():
     st.warning("Upload/extract a ZIP first.")
     st.stop()
 
-# ✅ Require API key from Part 1/2 sidebar ("api_key")
 api_key = st.session_state.get("api_key", "").strip()
 if not api_key:
     st.warning("Enter your OpenAI API key in the sidebar to generate videos.")
@@ -416,7 +484,6 @@ with colC:
 
 # ✅ Scene timing controls (20s min / 40s max requested)
 colD, colE, colF = st.columns([1, 1, 1])
-
 with colD:
     max_scenes = st.number_input(
         "Max scenes per segment",
@@ -426,7 +493,6 @@ with colD:
         step=1,
         disabled=st.session_state["is_generating"],
     )
-
 with colE:
     min_scene_seconds = st.slider(
         "Min seconds per scene",
@@ -436,7 +502,6 @@ with colE:
         step=1,
         disabled=st.session_state["is_generating"],
     )
-
 with colF:
     max_scene_seconds = st.slider(
         "Max seconds per scene",
@@ -482,16 +547,61 @@ if generate_clicked:
 
 
 # ----------------------------
-# Output previews + Downloads (named files)
+# Phase 3 — Export (Downloads + ZIP)
+# ----------------------------
+st.markdown("---")
+st.subheader("📦 Export")
+
+generated = st.session_state.get("generated", {})
+
+if not generated:
+    st.info("Generate at least one MP4 to enable export.")
+else:
+    left, right = st.columns([1, 1])
+
+    with left:
+        build_zip_clicked = st.button(
+            "📦 Build ZIP of all generated MP4s",
+            disabled=st.session_state["is_generating"],
+            use_container_width=True,
+        )
+
+    with right:
+        zip_path = st.session_state.get("zip_export_path", "")
+        zip_ready = bool(zip_path) and Path(zip_path).exists()
+        st.caption("After building, a ZIP download button will appear here.")
+        if zip_ready:
+            with open(zip_path, "rb") as f:
+                st.download_button(
+                    label=f"⬇️ Download ZIP ({Path(zip_path).name})",
+                    data=f,
+                    file_name=Path(zip_path).name,
+                    mime="application/zip",
+                    key="dl_zip_all",
+                    use_container_width=True,
+                )
+
+    if build_zip_clicked:
+        try:
+            zip_path = _build_zip_export(out_dir=out_dir, segments=segments, generated=generated)
+            st.session_state["zip_export_path"] = zip_path
+            _log(f"📦 ZIP created: {zip_path}")
+            st.success(f"ZIP created: {Path(zip_path).name}")
+            st.rerun()
+        except Exception as e:
+            _log(f"❌ ZIP build failed: {type(e).__name__}: {e}")
+            st.error(f"ZIP build failed: {type(e).__name__}: {e}")
+
+
+# ----------------------------
+# Output previews + per-file downloads (named files)
 # ----------------------------
 st.markdown("---")
 st.subheader("✅ Generated MP4s")
 
-generated = st.session_state.get("generated", {})
 if not generated:
     st.info("No MP4s generated yet.")
 else:
-    # display in the same order as detected segments
     for seg in segments:
         seg_key = seg.get("key")
         mp4_path = generated.get(seg_key)
@@ -499,7 +609,6 @@ else:
             st.write(f"**{seg.get('label', seg_key)}** — `{Path(mp4_path).name}`")
             st.video(mp4_path)
 
-            # ✅ Real download button with correct filename
             with open(mp4_path, "rb") as f:
                 st.download_button(
                     label="⬇️ Download MP4",
