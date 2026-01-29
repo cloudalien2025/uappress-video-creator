@@ -524,7 +524,7 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     Behavior:
       - Copies video stream (no re-encode)
       - Encodes audio to AAC for broad compatibility
-      - Adds a tiny audio pad to absorb timestamp/edge cases (harmless if not needed)
+      - Adds a tiny audio pad to absorb timestamp edge cases (harmless if not needed)
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(video_path)
@@ -542,11 +542,92 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
+        # Small pad to guard against timestamp rounding; does NOT chop audio.
         "-af", "apad=pad_dur=2",
         "-movflags", "+faststart",
         out_path,
     ])
     return out_path
+
+
+def _allocate_scene_seconds(
+    total_seconds: int,
+    n_scenes: int,
+    *,
+    min_scene: int,
+    max_scene: int,
+) -> List[int]:
+    """
+    Distribute total_seconds across n_scenes with per-scene bounds.
+    Returns a list (length n_scenes) that sums to total_seconds (best effort).
+
+    This exists to prevent narration cutoffs by ensuring the SUM(scene_seconds)
+    matches the target duration (narration duration, or padded narration duration).
+    """
+    total_seconds = max(1, int(total_seconds))
+    n_scenes = max(1, int(n_scenes))
+    min_scene = max(1, int(min_scene))
+    max_scene = max(min_scene, int(max_scene))
+
+    # Start equal split
+    base = total_seconds // n_scenes
+    secs = [base] * n_scenes
+
+    # Remainder distribution
+    rem = total_seconds - sum(secs)
+    i = 0
+    while rem > 0:
+        secs[i % n_scenes] += 1
+        rem -= 1
+        i += 1
+
+    # Cap at max_scene by redistributing overflow
+    for i in range(n_scenes):
+        if secs[i] > max_scene:
+            overflow = secs[i] - max_scene
+            secs[i] = max_scene
+            j = 1
+            while overflow > 0 and j <= n_scenes:
+                k = (i + j) % n_scenes
+                room = max_scene - secs[k]
+                if room > 0:
+                    add = min(room, overflow)
+                    secs[k] += add
+                    overflow -= add
+                j += 1
+
+    # Raise to min_scene by borrowing from largest
+    for i in range(n_scenes):
+        if secs[i] < min_scene:
+            need = min_scene - secs[i]
+            secs[i] = min_scene
+            while need > 0:
+                donor = max(range(n_scenes), key=lambda d: secs[d])
+                if secs[donor] <= min_scene:
+                    break
+                take = min(need, secs[donor] - min_scene)
+                secs[donor] -= take
+                need -= take
+
+    # Final nudge to match total_seconds if possible within bounds
+    diff = total_seconds - sum(secs)
+    if diff > 0:
+        for i in range(n_scenes):
+            if diff == 0:
+                break
+            if secs[i] < max_scene:
+                secs[i] += 1
+                diff -= 1
+    elif diff < 0:
+        diff = -diff
+        for i in range(n_scenes):
+            if diff == 0:
+                break
+            if secs[i] > min_scene:
+                secs[i] -= 1
+                diff -= 1
+
+    return secs
 
 # ============================
 # PART 4/5 — Image → Ken Burns MP4 (ZOOM ONLY)
