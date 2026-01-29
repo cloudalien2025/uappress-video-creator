@@ -213,6 +213,10 @@ st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, cras
 # + AUTO Upload Each MP4 to DigitalOcean Spaces (no export button needed)
 # File: app.py
 # Section: PART 2/2 (replace this whole block top-to-bottom)
+#
+# FIX INCLUDED:
+# - Removed ".mp4.part" temp output (ffmpeg can't infer format from ".part")
+# - Render directly to ".mp4" then auto-upload AFTER render completes
 # ============================
 
 import gc
@@ -221,7 +225,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import streamlit as st
 import video_pipeline as vp
@@ -360,7 +364,7 @@ def _read_spaces_secret(key: str, default: str = "") -> str:
     return default
 
 
-def _spaces_client_and_context() -> Tuple[object, str, str, str]:
+def _spaces_client_and_context():
     """
     Returns: (s3_client, bucket, region, public_base)
     """
@@ -420,7 +424,6 @@ def _object_exists(*, s3, bucket: str, object_key: str) -> bool:
         code = str(e.response.get("Error", {}).get("Code", ""))
         if code in ("404", "NoSuchKey", "NotFound"):
             return False
-        # Any other error: re-raise
         raise
 
 
@@ -504,7 +507,7 @@ def _write_and_upload_manifest(
         s3=s3,
         bucket=bucket,
         region=region,
-        public_base=public_base,
+        public_base=public_base or "",
         data=json.dumps(manifest, indent=2).encode("utf-8"),
         object_key=key,
         content_type="application/json",
@@ -528,7 +531,7 @@ def generate_all_segments_sequential(
     min_scene_seconds: int,
     max_scene_seconds: int,
     api_key: str,
-    # NEW: auto-upload knobs
+    # Auto-upload knobs
     auto_upload: bool,
     make_public: bool,
     prefix_override: str,
@@ -546,7 +549,7 @@ def generate_all_segments_sequential(
         _reset_gen_flags()
         return
 
-    # If auto-upload enabled, init Spaces once (fast + reliable)
+    # Init Spaces once (if auto-upload enabled)
     s3 = bucket = region = public_base = None
     job_prefix = ""
 
@@ -573,7 +576,7 @@ def generate_all_segments_sequential(
         seg_label = seg.get("label", seg_key)
         out_path = _segment_out_path(out_dir, seg)
 
-        # If file already exists and overwrite is off, we can still auto-upload it (idempotent)
+        # If already exists, skip render; optionally still auto-upload (idempotent)
         if (not overwrite) and Path(out_path).exists():
             st.session_state["generated"][seg_key] = out_path
             status.info(f"Skipping generate (already exists): {seg_label}")
@@ -593,7 +596,6 @@ def generate_all_segments_sequential(
                         make_public=bool(make_public),
                         skip_if_exists=True,
                     )
-                    # Avoid duplicate URLs in the UI list
                     if url not in st.session_state["spaces_public_urls"]:
                         st.session_state["spaces_public_urls"].append(url)
                     _ulog(f"✅ (existing) {name} -> {url}")
@@ -615,22 +617,13 @@ def generate_all_segments_sequential(
         status.info(f"Generating {seg_label} ({i}/{n})…")
         detail.caption(f"Output: {out_path}")
 
-        # CRASH-SAFE: render to a temp file, then atomic rename
-        tmp_path = str(Path(out_path).with_suffix(".mp4.part"))
-
         t0 = time.time()
         try:
-            # Clean old temp file if present
-            try:
-                if Path(tmp_path).exists():
-                    Path(tmp_path).unlink()
-            except Exception:
-                pass
-
+            # FIX: render directly to .mp4 (ffmpeg needs mp4 extension to infer container)
             vp.render_segment_mp4(
                 pair=seg["pair"],
                 extract_dir=extract_dir,
-                out_path=tmp_path,  # render to .part
+                out_path=out_path,
                 api_key=str(api_key),
                 fps=int(fps),
                 width=int(width),
@@ -641,14 +634,11 @@ def generate_all_segments_sequential(
                 max_scene_seconds=int(max_scene_seconds),
             )
 
-            # Rename only after success (prevents uploading partial files)
-            Path(tmp_path).replace(out_path)
-
             st.session_state["generated"][seg_key] = out_path
             dt = time.time() - t0
             _log(f"✅ Generated {seg_label} in {dt:.1f}s")
 
-            # AUTO UPLOAD RIGHT HERE (no button required)
+            # AUTO UPLOAD RIGHT HERE (no export button)
             if auto_upload and s3 and bucket and region is not None:
                 name = Path(out_path).name
                 object_key = f"{job_prefix}{name}"
@@ -662,13 +652,12 @@ def generate_all_segments_sequential(
                         local_path=out_path,
                         object_key=object_key,
                         make_public=bool(make_public),
-                        skip_if_exists=True,  # idempotent (no double uploads on reruns)
+                        skip_if_exists=True,
                     )
                     if url not in st.session_state["spaces_public_urls"]:
                         st.session_state["spaces_public_urls"].append(url)
                     _ulog(f"✅ {name} -> {url}")
 
-                    # Upload/update manifest after each successful segment upload
                     murl = _write_and_upload_manifest(
                         s3=s3,
                         bucket=bucket,
@@ -688,12 +677,6 @@ def generate_all_segments_sequential(
             status.error(f"Failed generating {seg_label}. See log below.")
             break
         finally:
-            # Cleanup temp if still there
-            try:
-                if Path(tmp_path).exists():
-                    Path(tmp_path).unlink()
-            except Exception:
-                pass
             gc.collect()
             time.sleep(0.05)
 
@@ -780,7 +763,7 @@ with colF:
         disabled=st.session_state["is_generating"],
     )
 
-# NEW: Auto-upload settings
+# Auto-upload controls
 st.markdown("---")
 st.subheader("☁️ DigitalOcean Spaces (Auto-upload)")
 
