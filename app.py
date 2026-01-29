@@ -209,17 +209,19 @@ if st.session_state.zip_path:
 st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, crash-safe).")
 
 # ============================
-# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe) + DigitalOcean Spaces Export
+# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe)
+# + AUTO Upload Each MP4 to DigitalOcean Spaces (no export button needed)
 # File: app.py
 # Section: PART 2/2 (replace this whole block top-to-bottom)
 # ============================
 
 import gc
 import os
+import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 import video_pipeline as vp
@@ -227,6 +229,7 @@ import video_pipeline as vp
 # boto3 (classic S3 API) — add to requirements.txt: boto3>=1.34.0
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
 
 
 # ----------------------------
@@ -240,12 +243,18 @@ if "generated" not in st.session_state:
     st.session_state["generated"] = {}  # seg_key -> mp4_path (strings only)
 if "gen_log" not in st.session_state:
     st.session_state["gen_log"] = []    # list[str]
+
+# Spaces-related
 if "spaces_upload_log" not in st.session_state:
     st.session_state["spaces_upload_log"] = []  # list[str]
 if "spaces_public_urls" not in st.session_state:
     st.session_state["spaces_public_urls"] = []  # list[str]
 if "spaces_last_prefix" not in st.session_state:
     st.session_state["spaces_last_prefix"] = ""  # str
+if "spaces_uploaded_keys" not in st.session_state:
+    st.session_state["spaces_uploaded_keys"] = set()  # set[str] (in-memory for this session)
+if "spaces_manifest_url" not in st.session_state:
+    st.session_state["spaces_manifest_url"] = ""  # str
 
 
 def _log(msg: str) -> None:
@@ -304,7 +313,7 @@ def _get_resolution_wh() -> Tuple[int, int]:
 
 def _scan_mp4s(out_dir: str) -> List[str]:
     """
-    Robust export: scan output directory for MP4s (works even after session_state resets).
+    Robust scan: find MP4s in output directory (works even after session_state resets).
     """
     p = Path(out_dir)
     if not p.exists():
@@ -383,14 +392,9 @@ def _spaces_client_and_context() -> Tuple[object, str, str, str]:
 
 
 def _build_public_url(*, bucket: str, region: str, public_base: str, object_key: str) -> str:
-    """
-    If you provide DO_SPACES_PUBLIC_BASE, we use it.
-    Otherwise we use the standard public URL form.
-    """
     object_key = object_key.lstrip("/")
     if public_base:
         return f"{public_base.rstrip('/')}/{object_key}"
-    # Standard DO Spaces public URL
     return f"https://{bucket}.{region}.digitaloceanspaces.com/{object_key}"
 
 
@@ -408,6 +412,18 @@ def _job_prefix() -> str:
     return f"uappress/{slug}/{ts}/"
 
 
+def _object_exists(*, s3, bucket: str, object_key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=object_key)
+        return True
+    except ClientError as e:
+        code = str(e.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        # Any other error: re-raise
+        raise
+
+
 def _upload_file_to_spaces(
     *,
     s3,
@@ -417,18 +433,85 @@ def _upload_file_to_spaces(
     local_path: str,
     object_key: str,
     make_public: bool = True,
+    skip_if_exists: bool = True,
 ) -> str:
     """
     Upload local file to Spaces and return public URL.
+    Idempotent: optionally skip if object already exists.
     """
+    object_key = object_key.lstrip("/")
+
+    if skip_if_exists:
+        if object_key in st.session_state.get("spaces_uploaded_keys", set()):
+            return _build_public_url(bucket=bucket, region=region, public_base=public_base, object_key=object_key)
+        if _object_exists(s3=s3, bucket=bucket, object_key=object_key):
+            st.session_state["spaces_uploaded_keys"].add(object_key)
+            return _build_public_url(bucket=bucket, region=region, public_base=public_base, object_key=object_key)
+
     extra = {"ContentType": "video/mp4"}
-    # If your bucket is private-by-default, this can make objects public.
-    # If your bucket policy already makes objects public, you can leave it on or off.
     if make_public:
         extra["ACL"] = "public-read"
 
     s3.upload_file(local_path, bucket, object_key, ExtraArgs=extra)
+    st.session_state["spaces_uploaded_keys"].add(object_key)
     return _build_public_url(bucket=bucket, region=region, public_base=public_base, object_key=object_key)
+
+
+def _upload_bytes_to_spaces(
+    *,
+    s3,
+    bucket: str,
+    region: str,
+    public_base: str,
+    data: bytes,
+    object_key: str,
+    content_type: str,
+    make_public: bool = True,
+) -> str:
+    object_key = object_key.lstrip("/")
+    extra = {"ContentType": content_type}
+    if make_public:
+        extra["ACL"] = "public-read"
+    s3.put_object(Bucket=bucket, Key=object_key, Body=data, **extra)
+    return _build_public_url(bucket=bucket, region=region, public_base=public_base, object_key=object_key)
+
+
+def _write_and_upload_manifest(
+    *,
+    s3,
+    bucket: str,
+    region: str,
+    public_base: str,
+    job_prefix: str,
+    make_public: bool,
+    out_dir: str,
+) -> str:
+    """
+    Upload a manifest after each segment so you can resume/recover if Streamlit crashes.
+    Includes local filenames and any known public URLs.
+    """
+    mp4_paths = _scan_mp4s(out_dir)
+    urls = st.session_state.get("spaces_public_urls", [])
+    manifest: Dict[str, object] = {
+        "job_prefix": job_prefix,
+        "generated_count": len(mp4_paths),
+        "generated_files": [Path(p).name for p in mp4_paths],
+        "public_urls": urls,
+        "updated_at": datetime.now().isoformat(),
+    }
+    key = f"{job_prefix}manifest.json"
+    url = _upload_bytes_to_spaces(
+        s3=s3,
+        bucket=bucket,
+        region=region,
+        public_base=public_base,
+        data=json.dumps(manifest, indent=2).encode("utf-8"),
+        object_key=key,
+        content_type="application/json",
+        make_public=bool(make_public),
+    )
+    st.session_state["spaces_manifest_url"] = url
+    return url
 
 
 def generate_all_segments_sequential(
@@ -445,6 +528,10 @@ def generate_all_segments_sequential(
     min_scene_seconds: int,
     max_scene_seconds: int,
     api_key: str,
+    # NEW: auto-upload knobs
+    auto_upload: bool,
+    make_public: bool,
+    prefix_override: str,
 ) -> None:
     st.session_state["is_generating"] = True
     st.session_state["stop_requested"] = False
@@ -459,6 +546,24 @@ def generate_all_segments_sequential(
         _reset_gen_flags()
         return
 
+    # If auto-upload enabled, init Spaces once (fast + reliable)
+    s3 = bucket = region = public_base = None
+    job_prefix = ""
+
+    if auto_upload:
+        try:
+            s3, bucket, region, public_base = _spaces_client_and_context()
+            job_prefix = (prefix_override or "").strip() or _job_prefix()
+            if not job_prefix.endswith("/"):
+                job_prefix += "/"
+            st.session_state["spaces_last_prefix"] = job_prefix
+            _ulog(f"Auto-upload enabled → Bucket: {bucket} | Region: {region}")
+            _ulog(f"Prefix: {job_prefix}")
+        except Exception as e:
+            auto_upload = False
+            _ulog(f"❌ Auto-upload disabled (failed to init Spaces): {type(e).__name__}: {e}")
+            status.warning("Auto-upload disabled: could not initialize DigitalOcean Spaces. See upload log below.")
+
     for i, seg in enumerate(segments, start=1):
         if st.session_state.get("stop_requested"):
             _log("Stopped before starting next segment.")
@@ -468,21 +573,64 @@ def generate_all_segments_sequential(
         seg_label = seg.get("label", seg_key)
         out_path = _segment_out_path(out_dir, seg)
 
+        # If file already exists and overwrite is off, we can still auto-upload it (idempotent)
         if (not overwrite) and Path(out_path).exists():
             st.session_state["generated"][seg_key] = out_path
-            status.info(f"Skipping (already exists): {seg_label}")
+            status.info(f"Skipping generate (already exists): {seg_label}")
+            detail.caption(f"Output: {out_path}")
+
+            if auto_upload and s3 and bucket and region is not None:
+                name = Path(out_path).name
+                object_key = f"{job_prefix}{name}"
+                try:
+                    url = _upload_file_to_spaces(
+                        s3=s3,
+                        bucket=bucket,
+                        region=region,
+                        public_base=public_base or "",
+                        local_path=out_path,
+                        object_key=object_key,
+                        make_public=bool(make_public),
+                        skip_if_exists=True,
+                    )
+                    # Avoid duplicate URLs in the UI list
+                    if url not in st.session_state["spaces_public_urls"]:
+                        st.session_state["spaces_public_urls"].append(url)
+                    _ulog(f"✅ (existing) {name} -> {url}")
+                    _write_and_upload_manifest(
+                        s3=s3,
+                        bucket=bucket,
+                        region=region,
+                        public_base=public_base or "",
+                        job_prefix=job_prefix,
+                        make_public=bool(make_public),
+                        out_dir=out_dir,
+                    )
+                except Exception as e:
+                    _ulog(f"❌ Upload failed for existing {name}: {type(e).__name__}: {e}")
+
             progress.progress(min(1.0, i / n))
             continue
 
         status.info(f"Generating {seg_label} ({i}/{n})…")
         detail.caption(f"Output: {out_path}")
 
+        # CRASH-SAFE: render to a temp file, then atomic rename
+        tmp_path = str(Path(out_path).with_suffix(".mp4.part"))
+
         t0 = time.time()
         try:
+            # Clean old temp file if present
+            try:
+                if Path(tmp_path).exists():
+                    Path(tmp_path).unlink()
+            except Exception:
+                pass
+
             vp.render_segment_mp4(
                 pair=seg["pair"],
                 extract_dir=extract_dir,
-                out_path=out_path,
+                out_path=tmp_path,  # render to .part
                 api_key=str(api_key),
                 fps=int(fps),
                 width=int(width),
@@ -493,15 +641,59 @@ def generate_all_segments_sequential(
                 max_scene_seconds=int(max_scene_seconds),
             )
 
+            # Rename only after success (prevents uploading partial files)
+            Path(tmp_path).replace(out_path)
+
             st.session_state["generated"][seg_key] = out_path
             dt = time.time() - t0
             _log(f"✅ Generated {seg_label} in {dt:.1f}s")
+
+            # AUTO UPLOAD RIGHT HERE (no button required)
+            if auto_upload and s3 and bucket and region is not None:
+                name = Path(out_path).name
+                object_key = f"{job_prefix}{name}"
+                status.info(f"Uploading to Spaces: {name}")
+                try:
+                    url = _upload_file_to_spaces(
+                        s3=s3,
+                        bucket=bucket,
+                        region=region,
+                        public_base=public_base or "",
+                        local_path=out_path,
+                        object_key=object_key,
+                        make_public=bool(make_public),
+                        skip_if_exists=True,  # idempotent (no double uploads on reruns)
+                    )
+                    if url not in st.session_state["spaces_public_urls"]:
+                        st.session_state["spaces_public_urls"].append(url)
+                    _ulog(f"✅ {name} -> {url}")
+
+                    # Upload/update manifest after each successful segment upload
+                    murl = _write_and_upload_manifest(
+                        s3=s3,
+                        bucket=bucket,
+                        region=region,
+                        public_base=public_base or "",
+                        job_prefix=job_prefix,
+                        make_public=bool(make_public),
+                        out_dir=out_dir,
+                    )
+                    _ulog(f"📄 manifest.json -> {murl}")
+
+                except Exception as e:
+                    _ulog(f"❌ {name} upload failed: {type(e).__name__}: {e}")
 
         except Exception as e:
             _log(f"❌ Failed {seg_label}: {type(e).__name__}: {e}")
             status.error(f"Failed generating {seg_label}. See log below.")
             break
         finally:
+            # Cleanup temp if still there
+            try:
+                if Path(tmp_path).exists():
+                    Path(tmp_path).unlink()
+            except Exception:
+                pass
             gc.collect()
             time.sleep(0.05)
 
@@ -558,7 +750,7 @@ with colC:
         disabled=st.session_state["is_generating"],
     )
 
-# Scene timing controls (requested)
+# Scene timing controls
 colD, colE, colF = st.columns([1, 1, 1])
 with colD:
     max_scenes = st.number_input(
@@ -586,6 +778,32 @@ with colF:
         value=40,
         step=1,
         disabled=st.session_state["is_generating"],
+    )
+
+# NEW: Auto-upload settings
+st.markdown("---")
+st.subheader("☁️ DigitalOcean Spaces (Auto-upload)")
+
+colU1, colU2, colU3 = st.columns([1, 1, 1])
+with colU1:
+    auto_upload = st.checkbox(
+        "Auto-upload each MP4 as soon as it’s created",
+        value=True,
+        disabled=st.session_state["is_generating"],
+        help="Uploads immediately after each segment finishes. No export button required.",
+    )
+with colU2:
+    make_public = st.checkbox(
+        "Make uploaded files public (ACL: public-read)",
+        value=True,
+        disabled=st.session_state["is_generating"],
+    )
+with colU3:
+    prefix_override = st.text_input(
+        "Spaces prefix (folder) — optional",
+        value=st.session_state.get("spaces_last_prefix", ""),
+        disabled=st.session_state["is_generating"],
+        help="Leave blank to auto-generate: uappress/<job>/<timestamp>/",
     )
 
 col1, col2 = st.columns([1, 1])
@@ -619,112 +837,53 @@ if generate_clicked:
         min_scene_seconds=int(min_scene_seconds),
         max_scene_seconds=int(max_scene_seconds),
         api_key=api_key,
+        auto_upload=bool(auto_upload),
+        make_public=bool(make_public),
+        prefix_override=str(prefix_override or ""),
     )
 
 
 # ----------------------------
-# Phase 3 — Export (DigitalOcean Spaces)
+# Live outputs (URLs + Manifest)
 # ----------------------------
 st.markdown("---")
-st.subheader("☁️ Export to DigitalOcean Spaces")
+st.subheader("✅ Upload Results")
 
-mp4_paths = _scan_mp4s(out_dir)
+urls = st.session_state.get("spaces_public_urls", [])
+manifest_url = st.session_state.get("spaces_manifest_url", "")
 
-if not mp4_paths:
-    st.info("No MP4s found in the output folder yet. Generate at least one segment first.")
+if urls:
+    st.success(f"Uploaded **{len(urls)}** file(s) to Spaces:")
+    st.text_area("Public URLs (copy/paste)", value="\n".join(urls), height=180)
 else:
-    st.caption(f"Found **{len(mp4_paths)}** MP4(s) in `{out_dir}` (scan-based; survives reruns).")
+    st.caption("No uploaded URLs yet (generate a segment with auto-upload enabled).")
 
-    colL, colR = st.columns([1, 1])
-    with colL:
-        make_public = st.checkbox("Make uploaded files public (ACL: public-read)", value=True)
-    with colR:
-        prefix_override = st.text_input(
-            "Spaces prefix (folder) — optional",
-            value=st.session_state.get("spaces_last_prefix", ""),
-            help="Leave blank to auto-generate: uappress/<job>/<timestamp>/",
-        )
+if manifest_url:
+    st.info(f"Manifest URL: {manifest_url}")
 
-    upload_clicked = st.button(
-        "☁️ Upload ALL MP4s to DigitalOcean Spaces",
-        disabled=st.session_state["is_generating"],
-        use_container_width=True,
-    )
-
-    if upload_clicked:
-        st.session_state["spaces_upload_log"] = []
-        st.session_state["spaces_public_urls"] = []
-
-        try:
-            s3, bucket, region, public_base = _spaces_client_and_context()
-
-            job_prefix = (prefix_override or "").strip()
-            if not job_prefix:
-                job_prefix = _job_prefix()
-            if not job_prefix.endswith("/"):
-                job_prefix += "/"
-
-            st.session_state["spaces_last_prefix"] = job_prefix
-            _ulog(f"Bucket: {bucket} | Region: {region}")
-            _ulog(f"Prefix: {job_prefix}")
-
-            progress = st.progress(0.0)
-            status = st.empty()
-
-            for i, local_path in enumerate(mp4_paths, start=1):
-                name = Path(local_path).name
-                object_key = f"{job_prefix}{name}"
-
-                status.info(f"Uploading {i}/{len(mp4_paths)} — {name}")
-                try:
-                    url = _upload_file_to_spaces(
-                        s3=s3,
-                        bucket=bucket,
-                        region=region,
-                        public_base=public_base,
-                        local_path=local_path,
-                        object_key=object_key,
-                        make_public=bool(make_public),
-                    )
-                    st.session_state["spaces_public_urls"].append(url)
-                    _ulog(f"✅ {name} -> {url}")
-                except Exception as e:
-                    _ulog(f"❌ {name} failed: {type(e).__name__}: {e}")
-
-                progress.progress(min(1.0, i / max(1, len(mp4_paths))))
-
-            status.success("Upload complete.")
-        except Exception as e:
-            st.error(f"Upload failed: {type(e).__name__}: {e}")
-            _ulog(f"❌ Upload failed: {type(e).__name__}: {e}")
-
-    urls = st.session_state.get("spaces_public_urls", [])
-    if urls:
-        st.success(f"Uploaded **{len(urls)}** file(s). Public URLs:")
-        st.text_area("Public URLs (copy/paste)", value="\n".join(urls), height=180)
-
-    if st.session_state.get("spaces_upload_log"):
-        with st.expander("Upload log"):
-            st.code("\n".join(st.session_state["spaces_upload_log"][-300:]))
+if st.session_state.get("spaces_upload_log"):
+    with st.expander("Upload log"):
+        st.code("\n".join(st.session_state["spaces_upload_log"][-300:]))
 
 
 # ----------------------------
 # Output previews + per-file downloads (named files)
 # ----------------------------
 st.markdown("---")
-st.subheader("✅ Generated MP4s")
+st.subheader("🎞️ Generated MP4s (Local Preview)")
 
-generated = st.session_state.get("generated", {})
+mp4_paths = _scan_mp4s(out_dir)
 
 if not mp4_paths:
     st.info("No MP4s generated yet.")
 else:
+    st.caption(f"Found **{len(mp4_paths)}** MP4(s) in `{out_dir}` (scan-based; survives reruns).")
     for p in mp4_paths:
         name = Path(p).name
         st.write(f"`{name}`")
         st.video(p)
 
-        # Optional per-file download from Streamlit (still useful even with Spaces export)
+        # Optional per-file download from Streamlit
         with open(p, "rb") as f:
             st.download_button(
                 label="⬇️ Download MP4",
