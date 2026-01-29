@@ -209,17 +209,24 @@ if st.session_state.zip_path:
 st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, crash-safe).")
 
 # ============================
-# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe) + ZIP Export
+# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe) + DigitalOcean Spaces Export
+# File: app.py
+# Section: PART 2/2 (replace this whole block top-to-bottom)
 # ============================
 
 import gc
+import os
 import time
-import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import List, Tuple
 
 import streamlit as st
 import video_pipeline as vp
+
+# boto3 (classic S3 API) — add to requirements.txt: boto3>=1.34.0
+import boto3
+from botocore.client import Config
 
 
 # ----------------------------
@@ -233,12 +240,20 @@ if "generated" not in st.session_state:
     st.session_state["generated"] = {}  # seg_key -> mp4_path (strings only)
 if "gen_log" not in st.session_state:
     st.session_state["gen_log"] = []    # list[str]
-if "zip_export_path" not in st.session_state:
-    st.session_state["zip_export_path"] = ""  # path to export zip (strings only)
+if "spaces_upload_log" not in st.session_state:
+    st.session_state["spaces_upload_log"] = []  # list[str]
+if "spaces_public_urls" not in st.session_state:
+    st.session_state["spaces_public_urls"] = []  # list[str]
+if "spaces_last_prefix" not in st.session_state:
+    st.session_state["spaces_last_prefix"] = ""  # str
 
 
 def _log(msg: str) -> None:
     st.session_state["gen_log"].append(msg)
+
+
+def _ulog(msg: str) -> None:
+    st.session_state["spaces_upload_log"].append(msg)
 
 
 def _safe_mkdir(p: str) -> str:
@@ -282,73 +297,138 @@ def _reset_gen_flags() -> None:
     st.session_state["stop_requested"] = False
 
 
-def _get_resolution_wh() -> tuple[int, int]:
-    # Uses the sidebar selectbox from Part 1/2 if present; fallback to 1280x720.
+def _get_resolution_wh() -> Tuple[int, int]:
     res = st.session_state.get("ui_resolution", "1280x720")
     return (1280, 720) if res == "1280x720" else (1920, 1080)
 
 
-def _build_zip_export(*, out_dir: str, segments: list, generated: dict) -> str:
+def _scan_mp4s(out_dir: str) -> List[str]:
     """
-    Create a ZIP containing all generated segment MP4s in the detected order.
-    Returns zip file path.
+    Robust export: scan output directory for MP4s (works even after session_state resets).
     """
-    out_dir_p = Path(out_dir)
-    out_dir_p.mkdir(parents=True, exist_ok=True)
+    p = Path(out_dir)
+    if not p.exists():
+        return []
+    files = sorted([str(x) for x in p.glob("*.mp4") if x.is_file()])
+    return files
 
+
+def _read_spaces_secret(key: str, default: str = "") -> str:
+    """
+    Read from st.secrets, with env var fallback.
+    Supports either:
+      st.secrets["do_spaces"][...]
+    or flat:
+      st.secrets["DO_SPACES_KEY"], etc.
+    """
+    # nested
+    try:
+        if "do_spaces" in st.secrets and key in st.secrets["do_spaces"]:
+            return str(st.secrets["do_spaces"][key]).strip()
+    except Exception:
+        pass
+
+    # flat
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+
+    # env fallback (optional)
+    env_map = {
+        "key": "DO_SPACES_KEY",
+        "secret": "DO_SPACES_SECRET",
+        "region": "DO_SPACES_REGION",
+        "bucket": "DO_SPACES_BUCKET",
+        "public_base": "DO_SPACES_PUBLIC_BASE",
+        "endpoint": "DO_SPACES_ENDPOINT",  # optional override
+    }
+    env_name = env_map.get(key, "")
+    if env_name:
+        return str(os.environ.get(env_name, default)).strip()
+
+    return default
+
+
+def _spaces_client_and_context() -> Tuple[object, str, str, str]:
+    """
+    Returns: (s3_client, bucket, region, public_base)
+    """
+    key = _read_spaces_secret("key")
+    secret = _read_spaces_secret("secret")
+    region = _read_spaces_secret("region", "nyc3")
+    bucket = _read_spaces_secret("bucket")
+    public_base = _read_spaces_secret("public_base", "")
+
+    if not key or not secret or not bucket:
+        raise RuntimeError(
+            "Missing DigitalOcean Spaces secrets. "
+            "Set st.secrets['do_spaces']['key'/'secret'/'bucket'/'region'] "
+            "and optionally 'public_base'."
+        )
+
+    endpoint_override = _read_spaces_secret("endpoint", "")
+    endpoint_url = endpoint_override or f"https://{region}.digitaloceanspaces.com"
+
+    s3 = boto3.client(
+        "s3",
+        region_name=region,
+        endpoint_url=endpoint_url,
+        aws_access_key_id=key,
+        aws_secret_access_key=secret,
+        config=Config(signature_version="s3v4"),
+    )
+    return s3, bucket, region, public_base
+
+
+def _build_public_url(*, bucket: str, region: str, public_base: str, object_key: str) -> str:
+    """
+    If you provide DO_SPACES_PUBLIC_BASE, we use it.
+    Otherwise we use the standard public URL form.
+    """
+    object_key = object_key.lstrip("/")
+    if public_base:
+        return f"{public_base.rstrip('/')}/{object_key}"
+    # Standard DO Spaces public URL
+    return f"https://{bucket}.{region}.digitaloceanspaces.com/{object_key}"
+
+
+def _job_prefix() -> str:
+    """
+    Example prefix per job:
+      uappress/<job_slug>/<timestamp>/
+    job_slug derived from uploaded ZIP name when available; fallback "job".
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_path = str(out_dir_p / f"uappress_segments_{ts}.zip")
+    zip_path = st.session_state.get("zip_path", "") or ""
+    zip_name = Path(zip_path).name if zip_path else ""
+    base = zip_name.replace(".zip", "").strip() if zip_name else "job"
+    slug = vp.safe_slug(base, max_len=50)
+    return f"uappress/{slug}/{ts}/"
 
-    files_added = 0
-    missing = []
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for seg in segments:
-            seg_key = seg.get("key")
-            mp4_path = generated.get(seg_key)
+def _upload_file_to_spaces(
+    *,
+    s3,
+    bucket: str,
+    region: str,
+    public_base: str,
+    local_path: str,
+    object_key: str,
+    make_public: bool = True,
+) -> str:
+    """
+    Upload local file to Spaces and return public URL.
+    """
+    extra = {"ContentType": "video/mp4"}
+    # If your bucket is private-by-default, this can make objects public.
+    # If your bucket policy already makes objects public, you can leave it on or off.
+    if make_public:
+        extra["ACL"] = "public-read"
 
-            if not mp4_path:
-                missing.append(f"{seg.get('label', seg_key)} (not generated)")
-                continue
-
-            p = Path(mp4_path)
-            if not p.exists():
-                missing.append(f"{seg.get('label', seg_key)} (missing file)")
-                continue
-
-            # Store in ZIP with the clean filename only
-            z.write(str(p), arcname=p.name)
-            files_added += 1
-
-        # Optional: add a simple manifest
-        manifest_lines = []
-        manifest_lines.append("UAPpress Video Creator — Segment Export")
-        manifest_lines.append(f"Created: {datetime.now().isoformat(timespec='seconds')}")
-        manifest_lines.append("")
-        manifest_lines.append("Segments (in order):")
-        for seg in segments:
-            seg_key = seg.get("key")
-            mp4_path = generated.get(seg_key)
-            name = Path(mp4_path).name if mp4_path else "(not generated)"
-            manifest_lines.append(f"- {seg.get('index', ''):>2}  {seg.get('label', seg_key)}  ->  {name}")
-
-        if missing:
-            manifest_lines.append("")
-            manifest_lines.append("Missing / Not Included:")
-            for m in missing:
-                manifest_lines.append(f"- {m}")
-
-        z.writestr("manifest.txt", "\n".join(manifest_lines))
-
-    if files_added == 0:
-        # Clean up empty zip
-        try:
-            Path(zip_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise RuntimeError("No MP4 files were available to add to the ZIP.")
-
-    return zip_path
+    s3.upload_file(local_path, bucket, object_key, ExtraArgs=extra)
+    return _build_public_url(bucket=bucket, region=region, public_base=public_base, object_key=object_key)
 
 
 def generate_all_segments_sequential(
@@ -369,9 +449,6 @@ def generate_all_segments_sequential(
     st.session_state["is_generating"] = True
     st.session_state["stop_requested"] = False
 
-    # Clear any previous ZIP export because outputs may change
-    st.session_state["zip_export_path"] = ""
-
     progress = st.progress(0.0)
     status = st.empty()
     detail = st.empty()
@@ -391,7 +468,6 @@ def generate_all_segments_sequential(
         seg_label = seg.get("label", seg_key)
         out_path = _segment_out_path(out_dir, seg)
 
-        # Skip if already exists unless overwrite
         if (not overwrite) and Path(out_path).exists():
             st.session_state["generated"][seg_key] = out_path
             status.info(f"Skipping (already exists): {seg_label}")
@@ -482,7 +558,7 @@ with colC:
         disabled=st.session_state["is_generating"],
     )
 
-# ✅ Scene timing controls (20s min / 40s max requested)
+# Scene timing controls (requested)
 colD, colE, colF = st.columns([1, 1, 1])
 with colD:
     max_scenes = st.number_input(
@@ -497,7 +573,7 @@ with colE:
     min_scene_seconds = st.slider(
         "Min seconds per scene",
         min_value=5,
-        max_value=40,
+        max_value=60,
         value=20,
         step=1,
         disabled=st.session_state["is_generating"],
@@ -506,7 +582,7 @@ with colF:
     max_scene_seconds = st.slider(
         "Max seconds per scene",
         min_value=int(min_scene_seconds),
-        max_value=90,
+        max_value=120,
         value=40,
         step=1,
         disabled=st.session_state["is_generating"],
@@ -547,50 +623,89 @@ if generate_clicked:
 
 
 # ----------------------------
-# Phase 3 — Export (Downloads + ZIP)
+# Phase 3 — Export (DigitalOcean Spaces)
 # ----------------------------
 st.markdown("---")
-st.subheader("📦 Export")
+st.subheader("☁️ Export to DigitalOcean Spaces")
 
-generated = st.session_state.get("generated", {})
+mp4_paths = _scan_mp4s(out_dir)
 
-if not generated:
-    st.info("Generate at least one MP4 to enable export.")
+if not mp4_paths:
+    st.info("No MP4s found in the output folder yet. Generate at least one segment first.")
 else:
-    left, right = st.columns([1, 1])
+    st.caption(f"Found **{len(mp4_paths)}** MP4(s) in `{out_dir}` (scan-based; survives reruns).")
 
-    with left:
-        build_zip_clicked = st.button(
-            "📦 Build ZIP of all generated MP4s",
-            disabled=st.session_state["is_generating"],
-            use_container_width=True,
+    colL, colR = st.columns([1, 1])
+    with colL:
+        make_public = st.checkbox("Make uploaded files public (ACL: public-read)", value=True)
+    with colR:
+        prefix_override = st.text_input(
+            "Spaces prefix (folder) — optional",
+            value=st.session_state.get("spaces_last_prefix", ""),
+            help="Leave blank to auto-generate: uappress/<job>/<timestamp>/",
         )
 
-    with right:
-        zip_path = st.session_state.get("zip_export_path", "")
-        zip_ready = bool(zip_path) and Path(zip_path).exists()
-        st.caption("After building, a ZIP download button will appear here.")
-        if zip_ready:
-            with open(zip_path, "rb") as f:
-                st.download_button(
-                    label=f"⬇️ Download ZIP ({Path(zip_path).name})",
-                    data=f,
-                    file_name=Path(zip_path).name,
-                    mime="application/zip",
-                    key="dl_zip_all",
-                    use_container_width=True,
-                )
+    upload_clicked = st.button(
+        "☁️ Upload ALL MP4s to DigitalOcean Spaces",
+        disabled=st.session_state["is_generating"],
+        use_container_width=True,
+    )
 
-    if build_zip_clicked:
+    if upload_clicked:
+        st.session_state["spaces_upload_log"] = []
+        st.session_state["spaces_public_urls"] = []
+
         try:
-            zip_path = _build_zip_export(out_dir=out_dir, segments=segments, generated=generated)
-            st.session_state["zip_export_path"] = zip_path
-            _log(f"📦 ZIP created: {zip_path}")
-            st.success(f"ZIP created: {Path(zip_path).name}")
-            st.rerun()
+            s3, bucket, region, public_base = _spaces_client_and_context()
+
+            job_prefix = (prefix_override or "").strip()
+            if not job_prefix:
+                job_prefix = _job_prefix()
+            if not job_prefix.endswith("/"):
+                job_prefix += "/"
+
+            st.session_state["spaces_last_prefix"] = job_prefix
+            _ulog(f"Bucket: {bucket} | Region: {region}")
+            _ulog(f"Prefix: {job_prefix}")
+
+            progress = st.progress(0.0)
+            status = st.empty()
+
+            for i, local_path in enumerate(mp4_paths, start=1):
+                name = Path(local_path).name
+                object_key = f"{job_prefix}{name}"
+
+                status.info(f"Uploading {i}/{len(mp4_paths)} — {name}")
+                try:
+                    url = _upload_file_to_spaces(
+                        s3=s3,
+                        bucket=bucket,
+                        region=region,
+                        public_base=public_base,
+                        local_path=local_path,
+                        object_key=object_key,
+                        make_public=bool(make_public),
+                    )
+                    st.session_state["spaces_public_urls"].append(url)
+                    _ulog(f"✅ {name} -> {url}")
+                except Exception as e:
+                    _ulog(f"❌ {name} failed: {type(e).__name__}: {e}")
+
+                progress.progress(min(1.0, i / max(1, len(mp4_paths))))
+
+            status.success("Upload complete.")
         except Exception as e:
-            _log(f"❌ ZIP build failed: {type(e).__name__}: {e}")
-            st.error(f"ZIP build failed: {type(e).__name__}: {e}")
+            st.error(f"Upload failed: {type(e).__name__}: {e}")
+            _ulog(f"❌ Upload failed: {type(e).__name__}: {e}")
+
+    urls = st.session_state.get("spaces_public_urls", [])
+    if urls:
+        st.success(f"Uploaded **{len(urls)}** file(s). Public URLs:")
+        st.text_area("Public URLs (copy/paste)", value="\n".join(urls), height=180)
+
+    if st.session_state.get("spaces_upload_log"):
+        with st.expander("Upload log"):
+            st.code("\n".join(st.session_state["spaces_upload_log"][-300:]))
 
 
 # ----------------------------
@@ -599,28 +714,32 @@ else:
 st.markdown("---")
 st.subheader("✅ Generated MP4s")
 
-if not generated:
+generated = st.session_state.get("generated", {})
+
+if not mp4_paths:
     st.info("No MP4s generated yet.")
 else:
-    for seg in segments:
-        seg_key = seg.get("key")
-        mp4_path = generated.get(seg_key)
-        if mp4_path and Path(mp4_path).exists():
-            st.write(f"**{seg.get('label', seg_key)}** — `{Path(mp4_path).name}`")
-            st.video(mp4_path)
+    for p in mp4_paths:
+        name = Path(p).name
+        st.write(f"`{name}`")
+        st.video(p)
 
-            with open(mp4_path, "rb") as f:
-                st.download_button(
-                    label="⬇️ Download MP4",
-                    data=f,
-                    file_name=Path(mp4_path).name,
-                    mime="video/mp4",
-                    key=f"dl_{seg_key}",
-                )
+        # Optional per-file download from Streamlit (still useful even with Spaces export)
+        with open(p, "rb") as f:
+            st.download_button(
+                label="⬇️ Download MP4",
+                data=f,
+                file_name=name,
+                mime="video/mp4",
+                key=f"dl_{name}",
+            )
 
 
+# ----------------------------
+# Log
+# ----------------------------
 st.markdown("---")
-st.subheader("🧾 Log")
+st.subheader("🧾 Generation Log")
 if st.session_state.get("gen_log"):
     st.code("\n".join(st.session_state["gen_log"][-200:]))
 else:
