@@ -974,41 +974,27 @@ def generate_sora_brand_intro_outro(
 # File: video_pipeline.py
 # ============================
 # Purpose:
-# - Keeps the existing “build final MP4” behavior unchanged by default.
-# - Adds an OPTIONAL step to prepend/append Sora-generated *GLOBAL* brand intro/outro clips.
-#
-# Key behavior:
-# - GLOBAL brand clips are reused across episodes (Joe Rogan-style).
-# - We cache/reuse brand clips if they already exist locally (unless force_regen=True).
-# - We concatenate: [intro] + [main_video] + [outro] using ffmpeg concat demuxer.
+# - Adds OPTIONAL step to prepend/append Sora-generated *GLOBAL* brand intro/outro clips.
+# - GLOBAL brand clips are reused across episodes (JRE-style consistency).
+# - Caches/reuses brand clips if already exist locally unless force_regen_brand=True.
 #
 # IMPORTANT:
-# - This code is intentionally isolated. Do NOT change your other pipeline behavior.
-# - Only call finalize_video_output() at the very end if/when you want bumpers.
-#
-# Assumptions:
-# - ffmpeg is available in PATH.
-# - Inputs should be compatible for stream copy; otherwise ffmpeg will fail.
-#   (If it fails, this function raises, so you can decide to fallback to re-encode.)
-
-from __future__ import annotations
+# - Does NOT change other pipeline behavior unless you call finalize_video_output().
+# - Concat uses ffmpeg concat demuxer (fast, no re-encode when compatible).
 
 import os
+import re
 import shlex
 import subprocess
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-# Reuse the BrandIntroOutroSpec + generate_sora_brand_intro_outro from Part 4/5
-# (No changes needed here if Part 4 is in the same module.)
 
 # ----------------------------
 # Settings / toggles
 # ----------------------------
 ENABLE_SORA_BRAND_CLIPS = os.getenv("ENABLE_SORA_BRAND_CLIPS", "0").strip() == "1"
-SORA_BRAND_OUTPUT_SUBDIR = os.getenv("SORA_BRAND_OUTPUT_SUBDIR", "_brand_clips")
 SORA_BRAND_ASSETS_SUBDIR = os.getenv("SORA_BRAND_ASSETS_SUBDIR", "brand_assets")  # stable folder inside output_dir
 
 
@@ -1016,11 +1002,6 @@ SORA_BRAND_ASSETS_SUBDIR = os.getenv("SORA_BRAND_ASSETS_SUBDIR", "brand_assets")
 # Small utility: run ffmpeg
 # ----------------------------
 def _run_cmd(cmd: Union[str, list]) -> None:
-    """
-    Thin wrapper so we don't depend on any other helpers.
-    If you already have a run_ffmpeg() helper earlier, feel free to replace calls
-    to _run_cmd with it—keeping behavior identical.
-    """
     p = subprocess.run(
         cmd if isinstance(cmd, list) else shlex.split(cmd),
         stdout=subprocess.PIPE,
@@ -1037,16 +1018,13 @@ def _ffmpeg_concat_videos_demuxer(
 ) -> Path:
     """
     Concatenate MP4 files using concat demuxer (stream copy).
-    This is fast and avoids re-encoding when inputs are compatible.
+    Fast and avoids re-encoding when inputs are compatible.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as td:
         list_file = Path(td) / "concat_list.txt"
-        lines = []
-        for p in video_paths:
-            # concat demuxer requires: file 'path'
-            lines.append(f"file '{p.resolve().as_posix()}'")
+        lines = [f"file '{p.resolve().as_posix()}'" for p in video_paths]
         list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         cmd = (
@@ -1059,26 +1037,26 @@ def _ffmpeg_concat_videos_demuxer(
     return out_path
 
 
+def _sanitize_filename_local(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s or "brand"
+
+
 def _global_brand_filenames(brand_name: str) -> Tuple[str, str]:
     """
     Stable filenames for GLOBAL bumpers.
     """
-    # Use the Part 4 helper if present; otherwise keep it simple.
-    try:
-        from .video_pipeline import _sanitize_filename  # type: ignore
-        slug = _sanitize_filename(brand_name)
-    except Exception:
-        slug = (brand_name or "brand").strip().lower().replace(" ", "-") or "brand"
-
+    slug = _sanitize_filename_local(brand_name)
     return (f"{slug}_GLOBAL_INTRO.mp4", f"{slug}_GLOBAL_OUTRO.mp4")
 
 
 def _get_brand_assets_dir(output_dir: Union[str, Path]) -> Path:
     """
-    Stable local directory for brand assets (NOT per-episode).
+    Stable local directory for brand assets (NOT tied to per-ZIP extract_dir).
     """
-    output_dir = Path(output_dir)
-    return output_dir / SORA_BRAND_ASSETS_SUBDIR
+    return Path(output_dir) / SORA_BRAND_ASSETS_SUBDIR
 
 
 def _maybe_generate_or_reuse_global_brand_clips(
@@ -1110,8 +1088,8 @@ def _maybe_generate_or_reuse_global_brand_clips(
     if (not force_regen) and intro_path.exists() and outro_path.exists():
         return intro_path, outro_path
 
-    # Generate using Part 4 API (supports separate intro/outro seconds now)
-    intro_tmp, outro_tmp = generate_sora_brand_intro_outro(  # noqa: F821 (defined in Part 4)
+    # Uses Part 4/5 API (already in this file)
+    intro_tmp, outro_tmp = generate_sora_brand_intro_outro(  # noqa: F821
         client,
         brand_spec,
         brand_dir,
@@ -1147,7 +1125,6 @@ def _maybe_add_sora_brand_intro_outro(
     final_basename: str,
     brand_spec,  # BrandIntroOutroSpec
     enable: bool,
-    # Brand generation controls
     model: Optional[str] = None,
     intro_seconds: Optional[Union[str, int]] = None,
     outro_seconds: Optional[Union[str, int]] = None,
@@ -1158,10 +1135,6 @@ def _maybe_add_sora_brand_intro_outro(
     outro_reference_image: Optional[str] = None,
     force_regen_brand: bool = False,
 ) -> Path:
-    """
-    Returns the path to the final video (either unchanged main_video_path
-    or a new concatenated output).
-    """
     main_video_path = Path(main_video_path)
     output_dir = Path(output_dir)
 
@@ -1185,9 +1158,8 @@ def _maybe_add_sora_brand_intro_outro(
 
     out_path = output_dir / f"{final_basename}.mp4"
 
-    # Concatenate intro + main + outro
     _ffmpeg_concat_videos_demuxer(
-        (Path(intro_path), main_video_path, Path(outro_path)),
+        (intro_path, main_video_path, outro_path),
         out_path,
     )
     return out_path
@@ -1204,7 +1176,6 @@ def finalize_video_output(
     final_name: str,
     brand_spec=None,  # BrandIntroOutroSpec | None
     enable_brand_clips: Optional[bool] = None,
-    # Forwardable controls (optional)
     model: Optional[str] = None,
     intro_seconds: Optional[Union[str, int]] = None,
     outro_seconds: Optional[Union[str, int]] = None,
@@ -1216,22 +1187,35 @@ def finalize_video_output(
     force_regen_brand: bool = False,
 ) -> Path:
     """
-    Drop-in finalizer you can call right after your existing pipeline produces
-    the main MP4.
+    Drop-in finalizer you can call after your pipeline produces the main MP4.
 
-    Behavior:
-      - If brand clips are disabled (default), returns main_video_path unchanged.
-      - If enabled and brand_spec is provided, returns a new MP4 with GLOBAL intro/outro.
-
-    GLOBAL caching:
-      - Uses output_dir/<SORA_BRAND_ASSETS_SUBDIR>/..._GLOBAL_INTRO/OUTRO.mp4
-      - Reuses if present unless force_regen_brand=True
+    - Disabled by default: returns main_video_path unchanged.
+    - If enabled and brand_spec provided: returns new MP4 with GLOBAL intro/outro.
+    - GLOBAL assets cached in: output_dir/brand_assets/*_GLOBAL_INTRO/OUTRO.mp4
     """
     enable = ENABLE_SORA_BRAND_CLIPS if enable_brand_clips is None else bool(enable_brand_clips)
 
-    # If enabled but no spec, do nothing (safe no-op)
     if (not enable) or (brand_spec is None):
         return Path(main_video_path)
+
+    return _maybe_add_sora_brand_intro_outro(
+        client,
+        main_video_path=main_video_path,
+        output_dir=output_dir,
+        final_basename=final_name,
+        brand_spec=brand_spec,
+        enable=True,
+        model=model,
+        intro_seconds=intro_seconds,
+        outro_seconds=outro_seconds,
+        size=size,
+        intro_size=intro_size,
+        outro_size=outro_size,
+        intro_reference_image=intro_reference_image,
+        outro_reference_image=outro_reference_image,
+        force_regen_brand=force_regen_brand,
+    )
+
 
     return _maybe_add_sora_brand_intro_outro(
         client,
