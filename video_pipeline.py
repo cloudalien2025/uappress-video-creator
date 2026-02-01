@@ -647,8 +647,6 @@ def _allocate_scene_seconds(
 # - seconds: "4", "8", or "12"
 # - size: "720x1280", "1280x720", "1024x1792", "1792x1024"
 
-from __future__ import annotations
-
 import os
 import re
 import time
