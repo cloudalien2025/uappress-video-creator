@@ -654,7 +654,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Union
 
 # ----------------------------
 # Config (safe defaults)
@@ -673,76 +673,117 @@ SORA_POLL_TIMEOUT_S = float(os.getenv("SORA_POLL_TIMEOUT_S", "900"))  # 15 min
 class BrandIntroOutroSpec:
     brand_name: str                       # e.g., "UAPpress"
     channel_or_series: str                # e.g., "UAPpress Investigations"
-    tagline: str                          # e.g., "Credibility-first UAP documentary"
-    episode_title: str                    # e.g., "The Rendlesham Forest Incident"
+    tagline: str                          # optional; not required for global bumpers
+    episode_title: str                    # kept for backward compatibility; ignored when global=True
     visual_style: str = (
-        "cinematic documentary, restrained, moody, high-contrast, subtle film grain, "
-        "slow camera motion, tasteful typography, premium broadcast look"
+        # Default tuned for UAPpress Radar/FLIR HUD vibe (serious, repeatable, not cheesy)
+        "Radar/FLIR surveillance aesthetic, serious investigative tone. "
+        "Monochrome/low-saturation, subtle scanlines, HUD overlays, gridlines, "
+        "bearing ticks, altitude/velocity readouts, minimal telemetry numbers, "
+        "soft glow, restrained film grain. Slow camera drift. "
+        "No aliens, no monsters, no bright neon sci-fi, no cheesy explosions. "
+        "Clean premium typography, stable and readable."
     )
     palette: str = "deep charcoal, soft white, muted amber accents"
     logo_text: Optional[str] = None       # if you don't have a logo asset, use text
-    intro_music_cue: str = (
-        "subtle, tense, minimal, low synth pad, distant rumble, understated"
-    )
-    outro_music_cue: str = (
-        "calm resolve, minimal, quiet synth pad, gentle rise, understated"
-    )
+    intro_music_cue: str = "subtle systems hum, low synth bed, minimal, tense but restrained"
+    outro_music_cue: str = "subtle systems hum, low synth bed, minimal, calm resolve"
     cta_line: str = "Subscribe for more investigations."
-    sponsor_line: Optional[str] = None    # if you want a sponsor line in the OUTRO
+    sponsor_line: Optional[str] = None    # sponsor line in the OUTRO
     aspect: str = "landscape"             # "landscape" or "portrait"
+
+    # NEW: global brand assets (reused every episode)
+    global_mode: bool = True              # if True, DO NOT include episode title in intro
 
 
 # ----------------------------
 # Prompt builders (brand-safe, consistent)
 # ----------------------------
 def _sanitize_filename(s: str) -> str:
-    s = s.strip().lower()
+    s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-{2,}", "-", s).strip("-")
     return s or "clip"
 
 
-def _resolve_size(spec: BrandIntroOutroSpec) -> str:
+def _normalize_seconds(v: Optional[Union[str, int]]) -> str:
+    if v is None:
+        return str(SORA_DEFAULT_SECONDS)
+    s = str(v).strip()
+    if s not in ("4", "8", "12"):
+        # fail safe → default
+        return str(SORA_DEFAULT_SECONDS)
+    return s
+
+
+def _resolve_size(spec: BrandIntroOutroSpec, explicit_size: Optional[str] = None) -> str:
     # Keep it simple: landscape default 1280x720; portrait default 720x1280
+    if explicit_size:
+        return explicit_size
     if spec.aspect.lower().startswith("p"):
         return "720x1280"
     return "1280x720"
 
 
-def build_sora_brand_intro_prompt(spec: BrandIntroOutroSpec) -> str:
-    logo_text = spec.logo_text or spec.brand_name
-
-    return (
-        f"Create a short branded INTRO for a serious documentary YouTube channel.\n"
-        f"Length: {SORA_DEFAULT_SECONDS} seconds.\n"
-        f"Style: {spec.visual_style}.\n"
-        f"Color palette: {spec.palette}.\n\n"
-        f"On-screen text (clean, modern, readable):\n"
-        f"1) '{logo_text}' (primary)\n"
-        f"2) '{spec.channel_or_series}' (secondary)\n"
-        f"3) Episode title: '{spec.episode_title}' (briefly)\n\n"
-        f"Motion + composition rules:\n"
-        f"- Slow, deliberate camera movement.\n"
-        f"- No chaotic cuts, no flashy meme styles.\n"
-        f"- Minimal, premium typography.\n"
-        f"- Avoid misspelled text; keep text large and stable.\n\n"
-        f"Audio:\n"
-        f"- Add synced audio that matches: {spec.intro_music_cue}.\n"
-        f"- No voiceover.\n\n"
-        f"Deliver a polished broadcast-ready intro."
-    )
-
-
-def build_sora_brand_outro_prompt(spec: BrandIntroOutroSpec) -> str:
+def build_sora_brand_intro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) -> str:
+    """
+    GLOBAL INTRO (default): no episode title (podcast/JRE-style consistency).
+    If spec.global_mode is False, will include episode title briefly.
+    """
     logo_text = spec.logo_text or spec.brand_name
 
     lines = [
-        "Create a short branded OUTRO for a serious documentary YouTube channel.",
-        f"Length: {SORA_DEFAULT_SECONDS} seconds.",
-        f"Style: {spec.visual_style}.",
-        f"Color palette: {spec.palette}.",
+        "Create a short branded INTRO bumper for a serious investigative documentary YouTube channel.",
+        f"Length: {seconds} seconds.",
+        f"Style: {spec.visual_style}",
+        f"Color palette: {spec.palette}",
         "",
-        "On-screen text (clean, modern, readable):",
+        "Visual language requirements (Radar/FLIR HUD):",
+        "- FLIR / radar scope UI feeling, telemetry overlays, HUD ticks, gridlines, bearing marks, minimal numbers.",
+        "- Subtle scanlines, restrained grain, soft glow; slow drift (no fast cuts).",
+        "- Serious tone: declassified / surveillance vibe. Avoid neon sci-fi and cheesy effects.",
+        "",
+        "On-screen text (clean, modern, readable, stable):",
+        f"1) '{logo_text}' (primary)",
+        f"2) '{spec.channel_or_series}' (secondary)",
+    ]
+
+    if not spec.global_mode:
+        # backward-compatible: episode-specific intros
+        ep = (spec.episode_title or "").strip()
+        if ep:
+            lines.append(f"3) Episode title (briefly): '{ep}'")
+
+    lines += [
+        "",
+        "Typography rules:",
+        "- Keep text large, stable, and spelled correctly.",
+        "- Minimal, premium broadcast typography; no gimmicky fonts.",
+        "",
+        "Audio:",
+        f"- Add synced audio that matches: {spec.intro_music_cue}.",
+        "- No voiceover.",
+        "",
+        "Deliver a polished broadcast-ready intro bumper."
+    ]
+    return "\n".join(lines)
+
+
+def build_sora_brand_outro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) -> str:
+    logo_text = spec.logo_text or spec.brand_name
+
+    lines = [
+        "Create a short branded OUTRO bumper for a serious investigative documentary YouTube channel.",
+        f"Length: {seconds} seconds.",
+        f"Style: {spec.visual_style}",
+        f"Color palette: {spec.palette}",
+        "",
+        "Visual language requirements (Radar/FLIR HUD):",
+        "- FLIR / radar scope UI feeling, telemetry overlays, HUD ticks, gridlines, bearing marks, minimal numbers.",
+        "- Subtle scanlines, restrained grain, soft glow; slow drift; gentle fade to black at end.",
+        "- Serious tone: avoid neon sci-fi, avoid cheesy effects.",
+        "",
+        "On-screen text (clean, modern, readable, stable):",
         f"1) '{logo_text}' (primary)",
         f"2) '{spec.cta_line}' (secondary)",
     ]
@@ -751,18 +792,16 @@ def build_sora_brand_outro_prompt(spec: BrandIntroOutroSpec) -> str:
 
     lines += [
         "",
-        "Motion + composition rules:",
-        "- Slow, calm movement; gentle fade to black at end.",
-        "- Minimal, premium typography.",
-        "- Avoid misspelled text; keep text large and stable.",
+        "Typography rules:",
+        "- Keep text large, stable, and spelled correctly.",
+        "- Minimal, premium broadcast typography.",
         "",
         "Audio:",
         f"- Add synced audio that matches: {spec.outro_music_cue}.",
         "- No voiceover.",
         "",
-        "Deliver a polished broadcast-ready outro."
+        "Deliver a polished broadcast-ready outro bumper."
     ]
-
     return "\n".join(lines)
 
 
@@ -774,15 +813,15 @@ def _sora_create_video_job(
     prompt: str,
     *,
     model: Optional[str] = None,
-    seconds: Optional[str] = None,
+    seconds: Optional[Union[str, int]] = None,
     size: Optional[str] = None,
     input_reference_path: Optional[str] = None,
 ) -> Any:
     kwargs: Dict[str, Any] = {
         "prompt": prompt,
-        "model": model or SORA_DEFAULT_MODEL,
-        "seconds": seconds or SORA_DEFAULT_SECONDS,
-        "size": size or SORA_DEFAULT_SIZE,
+        "model": (model or SORA_DEFAULT_MODEL),
+        "seconds": _normalize_seconds(seconds),
+        "size": (size or SORA_DEFAULT_SIZE),
     }
 
     # Optional image reference guide (if your pipeline already has a brand frame / logo image)
@@ -801,7 +840,7 @@ def _sora_poll_until_done(client, video_id: str) -> Any:
 
     while time.time() < deadline:
         job = client.videos.retrieve(video_id)
-        status = getattr(job, "status", None) or job.get("status")  # tolerate dict-like
+        status = getattr(job, "status", None) or (job.get("status") if isinstance(job, dict) else None)
 
         if status != last_status:
             last_status = status
@@ -823,18 +862,15 @@ def _sora_download_mp4(client, video_id: str, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # SDK may return bytes, a stream, or a response-like object depending on version.
-    # Handle the common cases safely:
     if isinstance(content, (bytes, bytearray)):
         out_path.write_bytes(content)
         return out_path
 
-    # If it's file-like:
     read = getattr(content, "read", None)
     if callable(read):
         out_path.write_bytes(content.read())
         return out_path
 
-    # If it's response-like with .content:
     raw = getattr(content, "content", None)
     if isinstance(raw, (bytes, bytearray)):
         out_path.write_bytes(raw)
@@ -852,34 +888,60 @@ def generate_sora_brand_intro_outro(
     output_dir: str | Path,
     *,
     model: Optional[str] = None,
-    seconds: Optional[str] = None,
+    # Backward-compatible single seconds/size:
+    seconds: Optional[Union[str, int]] = None,
     size: Optional[str] = None,
+    # NEW: separate controls
+    intro_seconds: Optional[Union[str, int]] = None,
+    outro_seconds: Optional[Union[str, int]] = None,
+    intro_size: Optional[str] = None,
+    outro_size: Optional[str] = None,
     intro_reference_image: Optional[str] = None,
     outro_reference_image: Optional[str] = None,
 ) -> Tuple[Path, Path]:
     """
     Generates:
-      - brand_intro.mp4
-      - brand_outro.mp4
+      - <brand>-intro.mp4
+      - <brand>-outro.mp4
 
     Returns (intro_path, outro_path)
+
+    Controls:
+      - If intro_seconds/outro_seconds are provided, they take precedence.
+      - Else falls back to `seconds`, else env default.
+      - If intro_size/outro_size are provided, they take precedence.
+      - Else falls back to `size`, else aspect-based default.
     """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    resolved_size = size or _resolve_size(spec)
+    # Resolve seconds
+    if intro_seconds is None:
+        intro_seconds = seconds
+    if outro_seconds is None:
+        outro_seconds = seconds
+
+    intro_s = _normalize_seconds(intro_seconds)
+    outro_s = _normalize_seconds(outro_seconds)
+
+    # Resolve sizes
+    base_size = size  # may be None
+    intro_sz = _resolve_size(spec, explicit_size=(intro_size or base_size))
+    outro_sz = _resolve_size(spec, explicit_size=(outro_size or base_size))
 
     # --- Intro ---
-    intro_prompt = build_sora_brand_intro_prompt(spec)
+    intro_prompt = build_sora_brand_intro_prompt(spec, seconds=intro_s)
     intro_job = _sora_create_video_job(
         client,
         intro_prompt,
         model=model,
-        seconds=seconds,
-        size=resolved_size,
+        seconds=intro_s,
+        size=intro_sz,
         input_reference_path=intro_reference_image,
     )
-    intro_id = getattr(intro_job, "id", None) or intro_job.get("id")
+    intro_id = getattr(intro_job, "id", None) or (intro_job.get("id") if isinstance(intro_job, dict) else None)
+    if not intro_id:
+        raise RuntimeError("Sora intro job did not return an id")
     _sora_poll_until_done(client, intro_id)
 
     intro_name = f"{_sanitize_filename(spec.brand_name)}-intro.mp4"
@@ -887,16 +949,18 @@ def generate_sora_brand_intro_outro(
     _sora_download_mp4(client, intro_id, intro_path)
 
     # --- Outro ---
-    outro_prompt = build_sora_brand_outro_prompt(spec)
+    outro_prompt = build_sora_brand_outro_prompt(spec, seconds=outro_s)
     outro_job = _sora_create_video_job(
         client,
         outro_prompt,
         model=model,
-        seconds=seconds,
-        size=resolved_size,
+        seconds=outro_s,
+        size=outro_sz,
         input_reference_path=outro_reference_image,
     )
-    outro_id = getattr(outro_job, "id", None) or outro_job.get("id")
+    outro_id = getattr(outro_job, "id", None) or (outro_job.get("id") if isinstance(outro_job, dict) else None)
+    if not outro_id:
+        raise RuntimeError("Sora outro job did not return an id")
     _sora_poll_until_done(client, outro_id)
 
     outro_name = f"{_sanitize_filename(spec.brand_name)}-outro.mp4"
@@ -911,17 +975,21 @@ def generate_sora_brand_intro_outro(
 # ============================
 # Purpose:
 # - Keeps the existing “build final MP4” behavior unchanged by default.
-# - Adds an OPTIONAL step to prepend/append Sora-generated brand intro/outro clips.
+# - Adds an OPTIONAL step to prepend/append Sora-generated *GLOBAL* brand intro/outro clips.
 #
-# How it works:
-# - If enabled, we:
-#   1) generate (or reuse) intro/outro MP4 clips via Sora
-#   2) concatenate: [intro] + [main_video] + [outro] using ffmpeg concat demuxer
+# Key behavior:
+# - GLOBAL brand clips are reused across episodes (Joe Rogan-style).
+# - We cache/reuse brand clips if they already exist locally (unless force_regen=True).
+# - We concatenate: [intro] + [main_video] + [outro] using ffmpeg concat demuxer.
 #
 # IMPORTANT:
-# - This code assumes you already have an ffmpeg helper in earlier parts.
-# - If you already have a “final render” function, keep calling it as-is.
-# - Only wrap the final output if brand clips are enabled.
+# - This code is intentionally isolated. Do NOT change your other pipeline behavior.
+# - Only call finalize_video_output() at the very end if/when you want bumpers.
+#
+# Assumptions:
+# - ffmpeg is available in PATH.
+# - Inputs should be compatible for stream copy; otherwise ffmpeg will fail.
+#   (If it fails, this function raises, so you can decide to fallback to re-encode.)
 
 from __future__ import annotations
 
@@ -929,29 +997,29 @@ import os
 import shlex
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 # Reuse the BrandIntroOutroSpec + generate_sora_brand_intro_outro from Part 4/5
 # (No changes needed here if Part 4 is in the same module.)
-# from .video_pipeline import BrandIntroOutroSpec, generate_sora_brand_intro_outro
-
 
 # ----------------------------
 # Settings / toggles
 # ----------------------------
 ENABLE_SORA_BRAND_CLIPS = os.getenv("ENABLE_SORA_BRAND_CLIPS", "0").strip() == "1"
 SORA_BRAND_OUTPUT_SUBDIR = os.getenv("SORA_BRAND_OUTPUT_SUBDIR", "_brand_clips")
+SORA_BRAND_ASSETS_SUBDIR = os.getenv("SORA_BRAND_ASSETS_SUBDIR", "brand_assets")  # stable folder inside output_dir
 
 
 # ----------------------------
 # Small utility: run ffmpeg
 # ----------------------------
-def _run_cmd(cmd: str) -> None:
+def _run_cmd(cmd: Union[str, list]) -> None:
     """
     Thin wrapper so we don't depend on any other helpers.
-    If you already have a run_ffmpeg() helper earlier, feel free to replace
-    calls to _run_cmd with it—keeping behavior identical.
+    If you already have a run_ffmpeg() helper earlier, feel free to replace calls
+    to _run_cmd with it—keeping behavior identical.
     """
     p = subprocess.run(
         cmd if isinstance(cmd, list) else shlex.split(cmd),
@@ -968,7 +1036,7 @@ def _ffmpeg_concat_videos_demuxer(
     out_path: Path,
 ) -> Path:
     """
-    Concatenate MP4 files (same codec/params expected) using concat demuxer.
+    Concatenate MP4 files using concat demuxer (stream copy).
     This is fast and avoids re-encoding when inputs are compatible.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -978,7 +1046,6 @@ def _ffmpeg_concat_videos_demuxer(
         lines = []
         for p in video_paths:
             # concat demuxer requires: file 'path'
-            # Use absolute paths to avoid cwd issues.
             lines.append(f"file '{p.resolve().as_posix()}'")
         list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -992,16 +1059,104 @@ def _ffmpeg_concat_videos_demuxer(
     return out_path
 
 
+def _global_brand_filenames(brand_name: str) -> Tuple[str, str]:
+    """
+    Stable filenames for GLOBAL bumpers.
+    """
+    # Use the Part 4 helper if present; otherwise keep it simple.
+    try:
+        from .video_pipeline import _sanitize_filename  # type: ignore
+        slug = _sanitize_filename(brand_name)
+    except Exception:
+        slug = (brand_name or "brand").strip().lower().replace(" ", "-") or "brand"
+
+    return (f"{slug}_GLOBAL_INTRO.mp4", f"{slug}_GLOBAL_OUTRO.mp4")
+
+
+def _get_brand_assets_dir(output_dir: Union[str, Path]) -> Path:
+    """
+    Stable local directory for brand assets (NOT per-episode).
+    """
+    output_dir = Path(output_dir)
+    return output_dir / SORA_BRAND_ASSETS_SUBDIR
+
+
+def _maybe_generate_or_reuse_global_brand_clips(
+    client,
+    *,
+    output_dir: Union[str, Path],
+    brand_spec,  # BrandIntroOutroSpec
+    model: Optional[str] = None,
+    intro_seconds: Optional[Union[str, int]] = None,
+    outro_seconds: Optional[Union[str, int]] = None,
+    size: Optional[str] = None,
+    intro_size: Optional[str] = None,
+    outro_size: Optional[str] = None,
+    intro_reference_image: Optional[str] = None,
+    outro_reference_image: Optional[str] = None,
+    force_regen: bool = False,
+) -> Tuple[Path, Path]:
+    """
+    Returns (intro_path, outro_path) for GLOBAL bumpers.
+    Generates them only if missing or force_regen=True.
+    """
+    brand_dir = _get_brand_assets_dir(output_dir)
+    brand_dir.mkdir(parents=True, exist_ok=True)
+
+    intro_name, outro_name = _global_brand_filenames(getattr(brand_spec, "brand_name", "brand"))
+    intro_path = brand_dir / intro_name
+    outro_path = brand_dir / outro_name
+
+    if (not force_regen) and intro_path.exists() and outro_path.exists():
+        return intro_path, outro_path
+
+    # Generate using Part 4 API (supports separate intro/outro seconds now)
+    intro_tmp, outro_tmp = generate_sora_brand_intro_outro(  # noqa: F821 (defined in Part 4)
+        client,
+        brand_spec,
+        brand_dir,
+        model=model,
+        size=size,
+        intro_seconds=intro_seconds,
+        outro_seconds=outro_seconds,
+        intro_size=intro_size,
+        outro_size=outro_size,
+        intro_reference_image=intro_reference_image,
+        outro_reference_image=outro_reference_image,
+    )
+
+    # Rename to GLOBAL stable filenames
+    try:
+        Path(intro_tmp).replace(intro_path)
+    except Exception:
+        intro_path.write_bytes(Path(intro_tmp).read_bytes())
+
+    try:
+        Path(outro_tmp).replace(outro_path)
+    except Exception:
+        outro_path.write_bytes(Path(outro_tmp).read_bytes())
+
+    return intro_path, outro_path
+
+
 def _maybe_add_sora_brand_intro_outro(
     client,
     *,
-    main_video_path: str | Path,
-    output_dir: str | Path,
+    main_video_path: Union[str, Path],
+    output_dir: Union[str, Path],
     final_basename: str,
     brand_spec,  # BrandIntroOutroSpec
     enable: bool,
+    # Brand generation controls
+    model: Optional[str] = None,
+    intro_seconds: Optional[Union[str, int]] = None,
+    outro_seconds: Optional[Union[str, int]] = None,
+    size: Optional[str] = None,
+    intro_size: Optional[str] = None,
+    outro_size: Optional[str] = None,
     intro_reference_image: Optional[str] = None,
     outro_reference_image: Optional[str] = None,
+    force_regen_brand: bool = False,
 ) -> Path:
     """
     Returns the path to the final video (either unchanged main_video_path
@@ -1013,14 +1168,19 @@ def _maybe_add_sora_brand_intro_outro(
     if not enable:
         return main_video_path
 
-    # Generate brand clips into a predictable folder
-    brand_dir = output_dir / SORA_BRAND_OUTPUT_SUBDIR
-    intro_path, outro_path = generate_sora_brand_intro_outro(
+    intro_path, outro_path = _maybe_generate_or_reuse_global_brand_clips(
         client,
-        brand_spec,
-        brand_dir,
+        output_dir=output_dir,
+        brand_spec=brand_spec,
+        model=model,
+        intro_seconds=intro_seconds,
+        outro_seconds=outro_seconds,
+        size=size,
+        intro_size=intro_size,
+        outro_size=outro_size,
         intro_reference_image=intro_reference_image,
         outro_reference_image=outro_reference_image,
+        force_regen=force_regen_brand,
     )
 
     out_path = output_dir / f"{final_basename}.mp4"
@@ -1039,13 +1199,21 @@ def _maybe_add_sora_brand_intro_outro(
 def finalize_video_output(
     client,
     *,
-    main_video_path: str | Path,
-    output_dir: str | Path,
+    main_video_path: Union[str, Path],
+    output_dir: Union[str, Path],
     final_name: str,
     brand_spec=None,  # BrandIntroOutroSpec | None
     enable_brand_clips: Optional[bool] = None,
+    # Forwardable controls (optional)
+    model: Optional[str] = None,
+    intro_seconds: Optional[Union[str, int]] = None,
+    outro_seconds: Optional[Union[str, int]] = None,
+    size: Optional[str] = None,
+    intro_size: Optional[str] = None,
+    outro_size: Optional[str] = None,
     intro_reference_image: Optional[str] = None,
     outro_reference_image: Optional[str] = None,
+    force_regen_brand: bool = False,
 ) -> Path:
     """
     Drop-in finalizer you can call right after your existing pipeline produces
@@ -1053,12 +1221,16 @@ def finalize_video_output(
 
     Behavior:
       - If brand clips are disabled (default), returns main_video_path unchanged.
-      - If enabled and brand_spec is provided, returns a new MP4 with intro/outro.
+      - If enabled and brand_spec is provided, returns a new MP4 with GLOBAL intro/outro.
+
+    GLOBAL caching:
+      - Uses output_dir/<SORA_BRAND_ASSETS_SUBDIR>/..._GLOBAL_INTRO/OUTRO.mp4
+      - Reuses if present unless force_regen_brand=True
     """
     enable = ENABLE_SORA_BRAND_CLIPS if enable_brand_clips is None else bool(enable_brand_clips)
 
     # If enabled but no spec, do nothing (safe no-op)
-    if not enable or brand_spec is None:
+    if (not enable) or (brand_spec is None):
         return Path(main_video_path)
 
     return _maybe_add_sora_brand_intro_outro(
@@ -1068,35 +1240,13 @@ def finalize_video_output(
         final_basename=final_name,
         brand_spec=brand_spec,
         enable=True,
+        model=model,
+        intro_seconds=intro_seconds,
+        outro_seconds=outro_seconds,
+        size=size,
+        intro_size=intro_size,
+        outro_size=outro_size,
         intro_reference_image=intro_reference_image,
         outro_reference_image=outro_reference_image,
+        force_regen_brand=force_regen_brand,
     )
-
-
-# ----------------------------
-# Example integration point (minimal / optional)
-# ----------------------------
-# If Part 3/5 or earlier has a function that builds the main video like:
-#   main_mp4 = build_main_video(...)
-# then, at the very end (ONLY), wrap it like this:
-#
-#   final_mp4 = finalize_video_output(
-#       client,
-#       main_video_path=main_mp4,
-#       output_dir=out_dir,
-#       final_name=episode_slug,
-#       brand_spec=BrandIntroOutroSpec(
-#           brand_name="UAPpress",
-#           channel_or_series="UAPpress Investigations",
-#           tagline="Credibility-first UAP documentary",
-#           episode_title=episode_title,
-#           sponsor_line="Sponsored by OPA Nutrition",
-#           aspect="landscape",
-#       ),
-#   )
-#
-# And keep returning/using final_mp4 from there.
-#
-# IMPORTANT:
-# - This does NOT touch your chapter stitching, Ken Burns, TTS, or timeline logic.
-# - It only changes the final file when ENABLE_SORA_BRAND_CLIPS=1.
