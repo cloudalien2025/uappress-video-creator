@@ -211,12 +211,18 @@ st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, cras
 # ============================
 # PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe)
 # + AUTO Upload Each MP4 to DigitalOcean Spaces (no export button needed)
+# + (NEW) OPTIONAL: Generate Sora Brand Intro/Outro MP4s + Auto-upload
 # File: app.py
 # Section: PART 2/2 (replace this whole block top-to-bottom)
 #
 # FIX INCLUDED:
 # - Removed ".mp4.part" temp output (ffmpeg can't infer format from ".part")
 # - Render directly to ".mp4" then auto-upload AFTER render completes
+#
+# NEW (Sora Branding):
+# - Optional UI to generate branded intro/outro clips via Sora (using video_pipeline.py helpers)
+# - Optional “Generate brand clips after segments” checkbox
+# - Optional auto-upload of brand clips to Spaces using the SAME settings/prefix
 # ============================
 
 import gc
@@ -225,10 +231,13 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 import video_pipeline as vp
+
+# NEW: OpenAI client for Sora brand clips
+from openai import OpenAI
 
 # boto3 (classic S3 API) — add to requirements.txt: boto3>=1.34.0
 import boto3
@@ -260,6 +269,12 @@ if "spaces_uploaded_keys" not in st.session_state:
 if "spaces_manifest_url" not in st.session_state:
     st.session_state["spaces_manifest_url"] = ""  # str
 
+# NEW: Branding-related
+if "brand_intro_outro_paths" not in st.session_state:
+    st.session_state["brand_intro_outro_paths"] = {"intro": "", "outro": ""}  # local paths
+if "brand_public_urls" not in st.session_state:
+    st.session_state["brand_public_urls"] = []  # list[str]
+
 
 def _log(msg: str) -> None:
     st.session_state["gen_log"].append(msg)
@@ -276,6 +291,10 @@ def _safe_mkdir(p: str) -> str:
 
 def _default_out_dir(extract_dir: str) -> str:
     return _safe_mkdir(str(Path(extract_dir) / "_mp4_segments"))
+
+
+def _brand_out_dir(extract_dir: str) -> str:
+    return _safe_mkdir(str(Path(extract_dir) / "_brand_clips"))
 
 
 def _segment_out_path(out_dir: str, seg: dict) -> str:
@@ -515,6 +534,127 @@ def _write_and_upload_manifest(
     )
     st.session_state["spaces_manifest_url"] = url
     return url
+
+
+# ----------------------------
+# NEW: Sora Brand Intro/Outro generator (optional)
+# ----------------------------
+def _can_do_branding() -> bool:
+    return bool(getattr(vp, "BrandIntroOutroSpec", None)) and bool(getattr(vp, "generate_sora_brand_intro_outro", None))
+
+
+def _generate_brand_clips(
+    *,
+    api_key: str,
+    extract_dir: str,
+    brand_name: str,
+    channel_or_series: str,
+    tagline: str,
+    episode_title: str,
+    cta_line: str,
+    sponsor_line: str,
+    aspect: str,
+    visual_style: str,
+    palette: str,
+    intro_music_cue: str,
+    outro_music_cue: str,
+    logo_text: str,
+    intro_reference_image: str,
+    outro_reference_image: str,
+    auto_upload: bool,
+    make_public: bool,
+    prefix_override: str,
+) -> None:
+    if not _can_do_branding():
+        _log("⚠️ Branding not available: missing BrandIntroOutroSpec/generate_sora_brand_intro_outro in video_pipeline.py")
+        st.warning("Branding not available yet. Add Part 4/5 + Part 5/5 to video_pipeline.py first.")
+        return
+
+    brand_dir = _brand_out_dir(extract_dir)
+    spec_cls = getattr(vp, "BrandIntroOutroSpec")
+    gen_fn = getattr(vp, "generate_sora_brand_intro_outro")
+
+    sponsor = sponsor_line.strip() or None
+    logo = logo_text.strip() or None
+
+    spec = spec_cls(
+        brand_name=brand_name.strip() or "UAPpress",
+        channel_or_series=channel_or_series.strip() or "UAPpress Investigations",
+        tagline=tagline.strip() or "Credibility-first UAP documentary",
+        episode_title=episode_title.strip() or "Episode",
+        visual_style=visual_style.strip() or "",
+        palette=palette.strip() or "",
+        logo_text=logo,
+        intro_music_cue=intro_music_cue.strip() or "",
+        outro_music_cue=outro_music_cue.strip() or "",
+        cta_line=cta_line.strip() or "Subscribe for more investigations.",
+        sponsor_line=sponsor,
+        aspect=(aspect or "landscape").strip(),
+    )
+
+    st.info("Generating Sora brand intro/outro…")
+    _log("🎬 Generating Sora brand intro/outro…")
+
+    client = OpenAI(api_key=str(api_key))
+
+    intro_ref = intro_reference_image.strip() or None
+    outro_ref = outro_reference_image.strip() or None
+
+    intro_path, outro_path = gen_fn(
+        client,
+        spec,
+        brand_dir,
+        intro_reference_image=intro_ref,
+        outro_reference_image=outro_ref,
+    )
+
+    st.session_state["brand_intro_outro_paths"] = {"intro": str(intro_path), "outro": str(outro_path)}
+    _log(f"✅ Brand intro: {intro_path}")
+    _log(f"✅ Brand outro: {outro_path}")
+
+    # Auto-upload brand clips if enabled
+    if auto_upload:
+        try:
+            s3, bucket, region, public_base = _spaces_client_and_context()
+            job_prefix = (prefix_override or "").strip() or _job_prefix()
+            if not job_prefix.endswith("/"):
+                job_prefix += "/"
+            st.session_state["spaces_last_prefix"] = job_prefix
+
+            for p in [Path(intro_path), Path(outro_path)]:
+                name = p.name
+                object_key = f"{job_prefix}{name}"
+                url = _upload_file_to_spaces(
+                    s3=s3,
+                    bucket=bucket,
+                    region=region,
+                    public_base=public_base or "",
+                    local_path=str(p),
+                    object_key=object_key,
+                    make_public=bool(make_public),
+                    skip_if_exists=True,
+                )
+                if url not in st.session_state["spaces_public_urls"]:
+                    st.session_state["spaces_public_urls"].append(url)
+                if url not in st.session_state["brand_public_urls"]:
+                    st.session_state["brand_public_urls"].append(url)
+                _ulog(f"✅ (brand) {name} -> {url}")
+
+            # Update manifest (keeps your crash-safe behavior)
+            murl = _write_and_upload_manifest(
+                s3=s3,
+                bucket=bucket,
+                region=region,
+                public_base=public_base or "",
+                job_prefix=job_prefix,
+                make_public=bool(make_public),
+                out_dir=_default_out_dir(extract_dir),
+            )
+            _ulog(f"📄 manifest.json -> {murl}")
+
+        except Exception as e:
+            _ulog(f"❌ Brand clips upload failed: {type(e).__name__}: {e}")
+            st.warning("Brand clips generated locally, but upload failed. See Upload log.")
 
 
 def generate_all_segments_sequential(
@@ -789,6 +929,91 @@ with colU3:
         help="Leave blank to auto-generate: uappress/<job>/<timestamp>/",
     )
 
+# NEW: Sora Branding UI (kept separate; does not affect segment generation unless you opt in)
+st.markdown("---")
+st.subheader("🎞️ Sora Brand Intro/Outro (Optional)")
+
+if not _can_do_branding():
+    st.caption("Brand intro/outro helpers not detected in video_pipeline.py (add Part 4/5 + Part 5/5 there).")
+
+colB1, colB2 = st.columns([1, 1])
+with colB1:
+    brand_enable_after = st.checkbox(
+        "Generate brand intro/outro AFTER segments finish",
+        value=False,
+        disabled=st.session_state["is_generating"],
+        help="If checked, generates two extra MP4s after segment generation completes.",
+    )
+with colB2:
+    brand_only_clicked = st.button(
+        "🎬 Generate Brand Intro/Outro Now",
+        disabled=st.session_state["is_generating"],
+        use_container_width=True,
+        help="Generates intro/outro MP4s into _brand_clips (and uploads if auto-upload is enabled).",
+    )
+
+# Basic brand fields
+c1, c2, c3 = st.columns([1, 1, 1])
+with c1:
+    brand_name = st.text_input("Brand name", value="UAPpress", disabled=st.session_state["is_generating"])
+with c2:
+    channel_or_series = st.text_input("Channel / series", value="UAPpress Investigations", disabled=st.session_state["is_generating"])
+with c3:
+    aspect = st.selectbox("Aspect", options=["landscape", "portrait"], index=0, disabled=st.session_state["is_generating"])
+
+episode_title = st.text_input(
+    "Episode title (used in intro)",
+    value=st.session_state.get("episode_title", "") or "",
+    disabled=st.session_state["is_generating"],
+)
+
+cta_line = st.text_input(
+    "CTA line (outro)",
+    value="Subscribe for more investigations.",
+    disabled=st.session_state["is_generating"],
+)
+
+sponsor_line = st.text_input(
+    "Sponsor line (optional, outro)",
+    value="",
+    disabled=st.session_state["is_generating"],
+    help="Example: Sponsored by OPA Nutrition",
+)
+
+with st.expander("Advanced brand styling", expanded=False):
+    logo_text = st.text_input("Logo text (optional)", value="", disabled=st.session_state["is_generating"])
+    visual_style = st.text_area(
+        "Visual style",
+        value=(
+            "cinematic documentary, restrained, moody, high-contrast, subtle film grain, "
+            "slow camera motion, tasteful typography, premium broadcast look"
+        ),
+        height=90,
+        disabled=st.session_state["is_generating"],
+    )
+    palette = st.text_input("Palette", value="deep charcoal, soft white, muted amber accents", disabled=st.session_state["is_generating"])
+    intro_music_cue = st.text_input(
+        "Intro music cue",
+        value="subtle, tense, minimal, low synth pad, distant rumble, understated",
+        disabled=st.session_state["is_generating"],
+    )
+    outro_music_cue = st.text_input(
+        "Outro music cue",
+        value="calm resolve, minimal, quiet synth pad, gentle rise, understated",
+        disabled=st.session_state["is_generating"],
+    )
+    intro_reference_image = st.text_input(
+        "Intro reference image path (optional)",
+        value="",
+        disabled=st.session_state["is_generating"],
+    )
+    outro_reference_image = st.text_input(
+        "Outro reference image path (optional)",
+        value="",
+        disabled=st.session_state["is_generating"],
+    )
+
+# Buttons: generate segments
 col1, col2 = st.columns([1, 1])
 with col1:
     generate_clicked = st.button(
@@ -805,6 +1030,31 @@ with col2:
         use_container_width=True,
     )
 
+# Brand-only generation
+if brand_only_clicked:
+    _generate_brand_clips(
+        api_key=api_key,
+        extract_dir=extract_dir,
+        brand_name=brand_name,
+        channel_or_series=channel_or_series,
+        tagline="Credibility-first UAP documentary",
+        episode_title=episode_title,
+        cta_line=cta_line,
+        sponsor_line=sponsor_line,
+        aspect=aspect,
+        visual_style=visual_style,
+        palette=palette,
+        intro_music_cue=intro_music_cue,
+        outro_music_cue=outro_music_cue,
+        logo_text=logo_text,
+        intro_reference_image=intro_reference_image,
+        outro_reference_image=outro_reference_image,
+        auto_upload=bool(auto_upload),
+        make_public=bool(make_public),
+        prefix_override=str(prefix_override or ""),
+    )
+
+# Segment generation (+ optional brand-after)
 if generate_clicked:
     _log("Starting sequential generation…")
     generate_all_segments_sequential(
@@ -824,6 +1074,30 @@ if generate_clicked:
         make_public=bool(make_public),
         prefix_override=str(prefix_override or ""),
     )
+
+    # OPTIONAL: generate brand clips after segments (only if user opted in)
+    if bool(brand_enable_after):
+        _generate_brand_clips(
+            api_key=api_key,
+            extract_dir=extract_dir,
+            brand_name=brand_name,
+            channel_or_series=channel_or_series,
+            tagline="Credibility-first UAP documentary",
+            episode_title=episode_title,
+            cta_line=cta_line,
+            sponsor_line=sponsor_line,
+            aspect=aspect,
+            visual_style=visual_style,
+            palette=palette,
+            intro_music_cue=intro_music_cue,
+            outro_music_cue=outro_music_cue,
+            logo_text=logo_text,
+            intro_reference_image=intro_reference_image,
+            outro_reference_image=outro_reference_image,
+            auto_upload=bool(auto_upload),
+            make_public=bool(make_public),
+            prefix_override=str(prefix_override or ""),
+        )
 
 
 # ----------------------------
@@ -847,6 +1121,33 @@ if manifest_url:
 if st.session_state.get("spaces_upload_log"):
     with st.expander("Upload log"):
         st.code("\n".join(st.session_state["spaces_upload_log"][-300:]))
+
+
+# ----------------------------
+# Brand clip local preview (optional)
+# ----------------------------
+st.markdown("---")
+st.subheader("🎬 Brand Clips (Local Preview)")
+
+brand_dir = _brand_out_dir(extract_dir)
+brand_mp4s = _scan_mp4s(brand_dir)
+
+if not brand_mp4s:
+    st.caption("No brand clips generated yet.")
+else:
+    st.caption(f"Found **{len(brand_mp4s)}** brand MP4(s) in `{brand_dir}`.")
+    for p in brand_mp4s:
+        name = Path(p).name
+        st.write(f"`{name}`")
+        st.video(p)
+        with open(p, "rb") as f:
+            st.download_button(
+                label="⬇️ Download MP4",
+                data=f,
+                file_name=name,
+                mime="video/mp4",
+                key=f"dl_brand_{name}",
+            )
 
 
 # ----------------------------
@@ -886,3 +1187,4 @@ if st.session_state.get("gen_log"):
     st.code("\n".join(st.session_state["gen_log"][-200:]))
 else:
     st.caption("Log will appear here.")
+
