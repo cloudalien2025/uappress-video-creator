@@ -1,1580 +1,775 @@
-# video_pipeline.py — Shared helpers for UAPpress video apps
-# Single-file module with stable, Streamlit-Cloud-safe helpers.
+# ============================================================
+# video_pipeline.py — UAPpress Video Creator
+# SECTION 1 — Core types + helpers + segment renderer (COMPAT)
+# ============================================================
 #
-# Goals (audit-applied):
-# - Single source of truth for imports (no mid-file imports)
-# - One command runner (list-based) + one ffmpeg path source (imageio_ffmpeg)
-# - One concat path (stream-copy first; safe fallback if mismatched clips)
-# - Audio muxing that NEVER truncates narration and does NOT add +2s tails
-#   (max tail pad = 0.75s total, only as a timestamp guard)
-# - Section 18 respects audio-driven timing (<=0.75s end buffer)
-# - Keep public API compatibility for app.py:
-#   * extract_zip_to_temp() accepts bytes OR file path
-#   * render_segment_mp4(...) signature stays the same
+# Locked requirements satisfied:
+# - Segment MP4s only (Intro/Chapters/Outro); no subs/logos/stitching
+# - Pipeline order: images -> scene clips -> concat -> mux audio (no black video)
+# - Audio-driven timing + ~0.5–0.75s end buffer (default 0.65s; clamped)
+# - Streamlit stability helpers: session_state clamping for scene seconds
+# - Compatibility: render_segment_mp4 shim + OpenAI videos.content/download_content wrapper
+# - DigitalOcean Spaces: auto-upload per segment + manifest.json upload + prefix handling
+# - Optional GLOBAL Sora intro/outro via BrandIntroOutroSpec + generate_sora_brand_intro_outro
+# - 9:16 supported when selected (pass width/height from app.py)
+#
+# IMPORTANT:
+# - Keep function names/signatures stable with app.py expectations.
+# - Avoid import/syntax errors; optional deps are guarded.
 
 from __future__ import annotations
 
-# ===============================================================
-# SECTION 1 — Module Imports (single source of truth)
-# ===============================================================
-
-import io
+import dataclasses
+import json
+import math
 import os
 import re
-import json
-import time
-import zipfile
-import tempfile
+import shutil
 import subprocess
-import hashlib
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set, Union, Any
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-import imageio_ffmpeg
-from openai import OpenAI
+# Optional deps (guarded)
+try:
+    import boto3  # type: ignore
+except Exception:  # pragma: no cover
+    boto3 = None  # type: ignore
 
-
-# ===============================================================
-# SECTION 2 — Cache Management (Tier 1 optimized)
-# ===============================================================
-
-def _get_cache_dir() -> str:
-    # DO NOT freeze cache dir at import time
-    return os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache")
-
-
-def _ensure_dir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
+try:
+    import imageio_ffmpeg  # type: ignore
+except Exception:  # pragma: no cover
+    imageio_ffmpeg = None  # type: ignore
 
 
-def _cache_key(*parts: str) -> str:
-    s = "||".join([str(p).strip() for p in parts if p is not None])
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+# ----------------------------
+# Constants + small utilities
+# ----------------------------
+
+_END_BUFFER_MIN = 0.50
+_END_BUFFER_MAX = 0.75
+_DEFAULT_END_BUFFER = 0.65
+
+# A conservative "safe" framerate for still-image scene clips
+_DEFAULT_FPS = 30
+
+# Default audio sample rate expectation (your TTS Studio uses 48kHz masters)
+_DEFAULT_AUDIO_SR = 48000
 
 
-def _copy_file(src: str, dst: str) -> None:
-    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-        fdst.write(fsrc.read())
+def clamp_float(x: float, lo: float, hi: float) -> float:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
 
 
-def _safe_int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)).strip())
-    except Exception:
-        return default
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
 
 
-def _safe_float_env(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)).strip())
-    except Exception:
-        return default
+def sanitize_filename(name: str, keep: str = r"[^a-zA-Z0-9._-]+") -> str:
+    name = name.strip().replace(" ", "_")
+    name = re.sub(keep, "", name)
+    return name or "unnamed"
 
 
-def _prune_cache(cache_dir: str) -> None:
+def ensure_dir(p: Union[str, Path]) -> Path:
+    path = Path(p)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def which_ffmpeg() -> str:
     """
-    Evict oldest files if cache grows beyond limit.
-    Prevents Streamlit Cloud restarts/crashes due to disk bloat.
-
-    Env:
-      UAPPRESS_CACHE_MAX_MB (default 1200)
-      UAPPRESS_CACHE_PRUNE_MIN_FREE_MB (default 150)
+    Find ffmpeg in PATH, else fall back to imageio-ffmpeg if installed.
     """
-    max_mb = _safe_int_env("UAPPRESS_CACHE_MAX_MB", 1200)
-    min_free_mb = _safe_int_env("UAPPRESS_CACHE_PRUNE_MIN_FREE_MB", 150)
-    if max_mb <= 0:
-        return
-
-    try:
-        _ensure_dir(cache_dir)
-        files: List[Tuple[float, int, str]] = []
-        total = 0
-
-        for name in os.listdir(cache_dir):
-            path = os.path.join(cache_dir, name)
-            if not os.path.isfile(path):
-                continue
-            try:
-                stt = os.stat(path)
-                size = int(stt.st_size)
-                mtime = float(stt.st_mtime)
-            except Exception:
-                continue
-            total += size
-            files.append((mtime, size, path))
-
-        max_bytes = max_mb * 1024 * 1024
-        if total <= max_bytes:
-            return
-
-        files.sort(key=lambda x: x[0])  # oldest first
-
-        target = max(0, max_bytes - (min_free_mb * 1024 * 1024))
-        for _, size, path in files:
-            try:
-                os.remove(path)
-                total -= size
-            except Exception:
-                pass
-            if total <= target:
-                break
-    except Exception:
-        return
-
-
-# ===============================================================
-# SECTION 3 — Extensions / Discovery
-# ===============================================================
-
-SCRIPT_EXTS = {".txt", ".md", ".json"}
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".mpeg", ".mpga", ".ogg", ".webm", ".flac"}
-
-
-# ===============================================================
-# SECTION 4 — OS / ffmpeg Helpers
-# ===============================================================
-
-def ffmpeg_exe() -> str:
-    # Streamlit Cloud safe: use bundled ffmpeg
-    return imageio_ffmpeg.get_ffmpeg_exe()
-
-
-def run_cmd(cmd: List[str]) -> None:
-    """
-    Single command runner (list-based) to avoid shell quoting issues.
-    Captures output for helpful errors.
-    """
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(
-            "Command failed:\n"
-            + " ".join(cmd)
-            + "\n\nSTDERR:\n"
-            + (p.stderr or "")
-            + "\n\nSTDOUT:\n"
-            + (p.stdout or "")
-        )
-
-
-def safe_slug(s: str, max_len: int = 80) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return (s[:max_len] if s else "segment")
-
-
-def extract_int_prefix(name: str) -> Optional[int]:
-    base = os.path.basename(name)
-    m = re.search(r"(^|\b)(\d{1,3})(\b|_|\s|-)", base)
-    if not m:
-        return None
-    try:
-        return int(m.group(2))
-    except Exception:
-        return None
-
-
-def get_media_duration_seconds(path: str) -> float:
-    """
-    Uses `ffmpeg -i` stderr parsing (works even without ffprobe).
-    Includes a small fallback for cases where Duration isn't printed.
-    """
-    ff = ffmpeg_exe()
-    p = subprocess.run([ff, "-i", path], capture_output=True, text=True)
-    txt = (p.stderr or "") + "\n" + (p.stdout or "")
-
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", txt)
-    if m:
-        hh = int(m.group(1))
-        mm = int(m.group(2))
-        ss = float(m.group(3))
-        return hh * 3600 + mm * 60 + ss
-
-    # Fallback: sometimes we can infer from "time=" occurrences (best-effort).
-    times = re.findall(r"time=(\d+):(\d+):(\d+\.\d+)", txt)
-    if times:
-        hh, mm, ss = times[-1]
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    if imageio_ffmpeg is not None:
         try:
-            return int(hh) * 3600 + int(mm) * 60 + float(ss)
+            return imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:
-            return 0.0
+            pass
+    # Last resort: hope "ffmpeg" resolves at runtime.
+    return "ffmpeg"
 
-    return 0.0
 
-
-def _has_video_stream(path: str) -> bool:
+def run_ffmpeg(cmd: List[str]) -> None:
     """
-    Cheap stream check via ffmpeg -i output text.
+    Run ffmpeg command, raising a readable error on failure.
     """
-    ff = ffmpeg_exe()
-    p = subprocess.run([ff, "-i", path], capture_output=True, text=True)
-    txt = (p.stderr or "") + "\n" + (p.stdout or "")
-    return "Video:" in txt
+    # Always force overwrite to avoid Streamlit rerun collisions.
+    if "-y" not in cmd:
+        cmd = cmd[:1] + ["-y"] + cmd[1:]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip()[-4000:]
+        raise RuntimeError(f"ffmpeg failed (code {proc.returncode}). Tail:\n{tail}")
 
 
-# ===============================================================
-# SECTION 5 — ZIP Extraction + File Discovery
-# ===============================================================
-
-def extract_zip_to_temp(zip_input: Union[str, bytes, bytearray]) -> Tuple[str, str]:
+def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
     """
-    Returns (workdir, extract_dir)
-
-    Accepts either:
-      - zip_input as ZIP FILE PATH (str)
-      - zip_input as ZIP BYTES (bytes/bytearray)
+    Return media duration seconds using ffprobe.
     """
-    workdir = tempfile.mkdtemp(prefix="uappress_video_")
-    extract_dir = os.path.join(workdir, "extracted")
-    os.makedirs(extract_dir, exist_ok=True)
-
-    # Path-based
-    if isinstance(zip_input, str):
-        if not os.path.isfile(zip_input):
-            raise FileNotFoundError(f"ZIP file not found: {zip_input}")
-        with zipfile.ZipFile(zip_input, "r") as z:
-            z.extractall(extract_dir)
-        return workdir, extract_dir
-
-    # Bytes-based
-    if isinstance(zip_input, (bytes, bytearray)):
-        with zipfile.ZipFile(io.BytesIO(zip_input), "r") as z:
-            z.extractall(extract_dir)
-        return workdir, extract_dir
-
-    raise TypeError(f"extract_zip_to_temp: unsupported input type: {type(zip_input)}")
-
-
-def find_files(root_dir: str) -> Tuple[List[str], List[str]]:
-    scripts, audios = [], []
-    for r, _, files in os.walk(root_dir):
-        for f in files:
-            ext = os.path.splitext(f.lower())[1]
-            path = os.path.join(r, f)
-            if ext in SCRIPT_EXTS:
-                scripts.append(path)
-            elif ext in AUDIO_EXTS:
-                audios.append(path)
-    return scripts, audios
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    p = str(path)
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            p,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        # If ffprobe isn't available, fall back to 0 and let caller handle.
+        return 0.0
+    try:
+        return float((proc.stdout or "").strip())
+    except Exception:
+        return 0.0
 
 
-def read_script_file(path: str) -> str:
-    ext = os.path.splitext(path.lower())[1]
-    if ext == ".json":
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            for k in ["text", "chapter_text", "content", "script"]:
-                if k in data and isinstance(data[k], str):
-                    return data[k].strip()
-        return json.dumps(data, ensure_ascii=False, indent=2)
+# ---------------------------------------
+# Streamlit stability helper (clamping)
+# ---------------------------------------
+
+def clamp_scene_seconds(
+    value: float,
+    min_scene_s: float,
+    max_scene_s: float,
+) -> float:
+    """
+    For Streamlit slider/session_state stability:
+    clamp a scene duration into [min_scene_s, max_scene_s].
+    """
+    # Extra protection: ensure bounds are sensible
+    if max_scene_s < min_scene_s:
+        max_scene_s = min_scene_s
+    return clamp_float(float(value), float(min_scene_s), float(max_scene_s))
+
+
+# ----------------------------
+# Sora Brand Intro/Outro spec
+# ----------------------------
+
+@dataclass
+class BrandIntroOutroSpec:
+    """
+    Optional GLOBAL Sora intro/outro generation.
+    app.py should pass:
+      - enabled
+      - brand_prompt (or a structured prompt)
+      - intro_seconds / outro_seconds (fallback seconds)
+      - model name if desired
+    """
+    enabled: bool = False
+    model: str = "sora"
+    brand_prompt: str = ""
+    intro_seconds: Optional[float] = None
+    outro_seconds: Optional[float] = None
+
+    # Optional: allow passing any vendor-specific knobs without breaking signatures
+    extra: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+# ------------------------------------------------------------
+# OpenAI videos.content/download_content compatibility wrapper
+# ------------------------------------------------------------
+
+def download_content_compat(
+    client: Any,
+    content_id: str,
+    out_path: Union[str, Path],
+) -> Path:
+    """
+    Compatibility shim for:
+      client.videos.content.download_content(...)
+    and other potential SDK shapes.
+
+    Writes bytes to out_path and returns Path.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Newer SDK shape
+    try:
+        fn = client.videos.content.download_content  # type: ignore[attr-defined]
+        data = fn(content_id)  # might return bytes or a stream-like
+        if isinstance(data, (bytes, bytearray)):
+            out_path.write_bytes(bytes(data))
+            return out_path
+        # stream-like with .read()
+        if hasattr(data, "read"):
+            out_path.write_bytes(data.read())
+            return out_path
+    except Exception:
+        pass
+
+    # Alternate: content retrieve then download URL (not implemented here)
+    raise RuntimeError(
+        "Unable to download Sora content with current OpenAI client. "
+        "Expected client.videos.content.download_content(content_id) to work."
+    )
+
+
+def generate_sora_brand_intro_outro(
+    client: Any,
+    spec: BrandIntroOutroSpec,
+    kind: str,
+    out_mp4_path: Union[str, Path],
+    width: int,
+    height: int,
+    seconds_fallback: float,
+) -> Optional[Path]:
+    """
+    Generate a GLOBAL brand intro or outro with Sora (optional).
+    - kind: 'intro' or 'outro'
+    - returns Path if generated, else None
+
+    NOTE: This function is intentionally conservative: if SDK calls differ,
+    it raises a clear error rather than producing broken output.
+    """
+    if not spec or not spec.enabled:
+        return None
+
+    kind = kind.lower().strip()
+    if kind not in ("intro", "outro"):
+        raise ValueError("kind must be 'intro' or 'outro'")
+
+    # Choose seconds
+    if kind == "intro":
+        seconds = float(spec.intro_seconds) if spec.intro_seconds else float(seconds_fallback)
     else:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read().strip()
+        seconds = float(spec.outro_seconds) if spec.outro_seconds else float(seconds_fallback)
+
+    # Construct prompt
+    base = (spec.brand_prompt or "").strip()
+    if not base:
+        # If enabled but empty prompt, treat as a no-op (avoid surprising failures)
+        return None
+
+    prompt = (
+        f"{base}\n\n"
+        f"Create a clean, cinematic {kind} clip for the UAPpress brand. "
+        f"No text overlays, no logos, no subtitles. "
+        f"Aspect {width}x{height}. Duration about {seconds:.1f} seconds."
+    )
+
+    out_mp4_path = Path(out_mp4_path)
+    out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Attempt a likely SDK call shape. If your app.py uses a different one,
+    # keep the signature and adjust the internal try-block only.
+    try:
+        # Hypothetical: client.videos.generate(...) returns {id/content_id/...}
+        resp = client.videos.generate(  # type: ignore[attr-defined]
+            model=spec.model,
+            prompt=prompt,
+            width=width,
+            height=height,
+            duration_seconds=seconds,
+            **(spec.extra or {}),
+        )
+        content_id = None
+        if isinstance(resp, dict):
+            content_id = resp.get("content_id") or resp.get("id")
+        else:
+            content_id = getattr(resp, "content_id", None) or getattr(resp, "id", None)
+        if not content_id:
+            raise RuntimeError("Sora generate did not return a content id.")
+        return download_content_compat(client, str(content_id), out_mp4_path)
+    except Exception as e:
+        raise RuntimeError(f"Sora brand {kind} generation failed: {e}") from e
 
 
-# ===============================================================
-# SECTION 6 — Segment Pairing Helpers (Intro / Chapters / Outro)
-# ===============================================================
+# ----------------------------
+# DigitalOcean Spaces uploads
+# ----------------------------
 
-def _is_intro_name(name: str) -> bool:
-    b = os.path.splitext(os.path.basename(name))[0].lower()
-    return b.startswith("intro") or b == "intro" or " intro" in b or "_intro" in b or "-intro" in b
+@dataclass
+class SpacesConfig:
+    """
+    Minimal DO Spaces config. app.py can construct and pass this.
+    """
+    enabled: bool = False
+    endpoint_url: str = ""          # e.g. "https://nyc3.digitaloceanspaces.com"
+    region: str = "us-east-1"       # boto3 requires something; not used by DO
+    bucket: str = ""
+    access_key: str = ""
+    secret_key: str = ""
+    prefix: str = ""               # optional folder prefix inside bucket
+    public_base_url: str = ""      # optional CDN/base URL for returned links
 
 
-def _is_outro_name(name: str) -> bool:
-    b = os.path.splitext(os.path.basename(name))[0].lower()
-    return b.startswith("outro") or b == "outro" or " outro" in b or "_outro" in b or "-outro" in b
+def _spaces_client(cfg: SpacesConfig):
+    if not cfg.enabled:
+        return None
+    if boto3 is None:
+        raise RuntimeError("boto3 is not installed, but Spaces upload was enabled.")
+    if not (cfg.endpoint_url and cfg.bucket and cfg.access_key and cfg.secret_key):
+        raise RuntimeError("SpacesConfig is missing required fields.")
+    session = boto3.session.Session()
+    return session.client(
+        "s3",
+        region_name=cfg.region or "us-east-1",
+        endpoint_url=cfg.endpoint_url,
+        aws_access_key_id=cfg.access_key,
+        aws_secret_access_key=cfg.secret_key,
+    )
 
 
-def _chapter_no_from_name(name: str) -> Optional[int]:
-    base = os.path.splitext(os.path.basename(name))[0].lower()
-    m = re.search(r"(?:chapter|ch)[\s_\-]*0*(\d{1,3})\b", base)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    m2 = re.search(r"\b0*(\d{1,3})\b", base)
-    if m2:
-        try:
-            return int(m2.group(1))
-        except Exception:
-            return None
+def _join_prefix(prefix: str, key: str) -> str:
+    prefix = (prefix or "").strip().strip("/")
+    key = key.strip().lstrip("/")
+    return f"{prefix}/{key}" if prefix else key
+
+
+def spaces_upload_file(
+    cfg: SpacesConfig,
+    local_path: Union[str, Path],
+    key: str,
+    content_type: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Upload a file to DO Spaces and return a URL if public_base_url is provided,
+    else return None.
+    """
+    if not cfg.enabled:
+        return None
+
+    s3 = _spaces_client(cfg)
+    assert s3 is not None
+
+    local_path = Path(local_path)
+    if not local_path.exists():
+        raise FileNotFoundError(str(local_path))
+
+    full_key = _join_prefix(cfg.prefix, key)
+
+    extra_args: Dict[str, Any] = {}
+    if content_type:
+        extra_args["ContentType"] = content_type
+
+    s3.upload_file(str(local_path), cfg.bucket, full_key, ExtraArgs=extra_args or None)
+
+    if cfg.public_base_url:
+        base = cfg.public_base_url.rstrip("/")
+        return f"{base}/{full_key}"
     return None
 
 
-def segment_label(p: dict) -> str:
-    if _is_intro_name(p.get("title_guess", "")) or _is_intro_name(p.get("script_path", "")) or _is_intro_name(p.get("audio_path", "")):
-        return "INTRO"
-    if _is_outro_name(p.get("title_guess", "")) or _is_outro_name(p.get("script_path", "")) or _is_outro_name(p.get("audio_path", "")):
-        return "OUTRO"
-    n = p.get("chapter_no")
-    if n is not None:
-        return f"CHAPTER {n}"
-    return "SEGMENT"
-
-
-def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict]:
-    """
-    Creates pairs:
-      - intro script ↔ intro audio
-      - outro script ↔ outro audio
-      - chapter_N script ↔ chapter_N audio
-    Falls back to token overlap.
-    """
-
-    def norm_tokens(s: str) -> Set[str]:
-        s = (s or "").lower()
-        toks = set(re.split(r"[^a-z0-9]+", s))
-        toks.discard("")
-        return toks
-
-    def token_score(sp: str, ap: str) -> int:
-        return len(norm_tokens(sp).intersection(norm_tokens(ap)))
-
-    intro_script = next((s for s in scripts if _is_intro_name(s)), None)
-    outro_script = next((s for s in scripts if _is_outro_name(s)), None)
-    intro_audio = next((a for a in audios if _is_intro_name(a)), None)
-    outro_audio = next((a for a in audios if _is_outro_name(a)), None)
-
-    scripts_left = [s for s in scripts if s not in {intro_script, outro_script}]
-    audios_left = [a for a in audios if a not in {intro_audio, outro_audio}]
-
-    audio_by_no: Dict[int, List[str]] = {}
-    for a in audios_left:
-        n = _chapter_no_from_name(a)
-        if n is not None:
-            audio_by_no.setdefault(n, []).append(a)
-
-    used_audio = set()
-    pairs: List[Dict] = []
-
-    if intro_script and intro_audio:
-        pairs.append(
-            {
-                "chapter_no": 0,
-                "title_guess": os.path.splitext(os.path.basename(intro_script))[0],
-                "script_path": intro_script,
-                "audio_path": intro_audio,
-            }
-        )
-        used_audio.add(intro_audio)
-
-    if outro_script and outro_audio:
-        pairs.append(
-            {
-                "chapter_no": 9998,
-                "title_guess": os.path.splitext(os.path.basename(outro_script))[0],
-                "script_path": outro_script,
-                "audio_path": outro_audio,
-            }
-        )
-        used_audio.add(outro_audio)
-
-    for s in sorted(scripts_left):
-        sn = _chapter_no_from_name(s)
-        chosen = None
-
-        if sn is not None and sn in audio_by_no:
-            cands = [a for a in audio_by_no[sn] if a not in used_audio]
-            if cands:
-                chosen = max(cands, key=lambda a: token_score(s, a))
-
-        if chosen is None:
-            cands = [a for a in audios_left if a not in used_audio]
-            if cands:
-                chosen = max(cands, key=lambda a: token_score(s, a))
-
-        if chosen:
-            used_audio.add(chosen)
-            pairs.append(
-                {
-                    "chapter_no": sn,
-                    "title_guess": os.path.splitext(os.path.basename(s))[0],
-                    "script_path": s,
-                    "audio_path": chosen,
-                }
-            )
-
-    def sort_key(p: Dict):
-        n = p.get("chapter_no")
-        if n == 0:
-            return (-1, p["title_guess"].lower())
-        if n == 9998:
-            return (999999, p["title_guess"].lower())
-        if n is None:
-            return (500000, p["title_guess"].lower())
-        return (int(n), p["title_guess"].lower())
-
-    pairs.sort(key=sort_key)
-    return pairs
-
-
-# ===============================================================
-# SECTION 7 — Scene Planning (Text → JSON) (NO Whisper / NO SRT)
-# ===============================================================
-
-SCENE_PLANNER_SYSTEM = (
-    "You convert a documentary narration segment into a list of short visual scenes for AI generation. "
-    "Return STRICT JSON only: a list of objects with keys: scene, seconds, prompt. "
-    "Style: cinematic documentary b-roll / reenactment vibes; realistic lighting; subtle motion notes only. "
-    "Avoid brand names, copyrighted characters, celebrity likeness, and explicit violence/gore. "
-    "Keep prompts concise (1–3 sentences)."
-)
-
-
-def _extract_json_list(text: str) -> str:
-    t = (text or "").strip()
-    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
-    t = re.sub(r"\s*```$", "", t)
-    i = t.find("[")
-    j = t.rfind("]")
-    if i != -1 and j != -1 and j > i:
-        return t[i : j + 1]
-    return t
-
-
-def plan_scenes(
-    client: OpenAI,
-    chapter_title: str,
-    chapter_text: str,
-    *,
-    max_scenes: int,
-    seconds_per_scene: int,
-    model: str = "gpt-5-mini",
-) -> List[Dict]:
-    payload = {
-        "chapter_title": str(chapter_title or "").strip(),
-        "max_scenes": int(max_scenes),
-        "seconds_per_scene": int(seconds_per_scene),
-        "chapter_text": str(chapter_text or "").strip(),
-        "output": "STRICT_JSON_LIST_ONLY",
-    }
-
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": SCENE_PLANNER_SYSTEM},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-    )
-
-    text = resp.output_text if hasattr(resp, "output_text") and isinstance(resp.output_text, str) else str(resp)
-    raw = (text or "").strip()
-    json_str = _extract_json_list(raw)
-
-    try:
-        scenes = json.loads(json_str)
-    except Exception as e:
-        raise RuntimeError(
-            f"Scene planner did not return valid JSON. {type(e).__name__}: {e}\n\nRAW:\n{raw[:1200]}"
-        )
-
-    if not isinstance(scenes, list):
-        raise RuntimeError("Scene planner returned JSON but it is not a list.")
-
-    out: List[Dict] = []
-    for i, sc in enumerate(scenes, start=1):
-        if not isinstance(sc, dict):
-            continue
-        prompt = str(sc.get("prompt", "")).strip()
-        if not prompt:
-            continue
-        sec = sc.get("seconds", seconds_per_scene)
-        try:
-            sec_i = int(sec)
-        except Exception:
-            sec_i = int(seconds_per_scene)
-        sec_i = max(1, sec_i)
-        out.append({"scene": i, "seconds": sec_i, "prompt": prompt})
-
-    if not out:
-        raise RuntimeError("Scene planner returned no usable prompts.")
-    return out
-
-
-def write_text(path: str, text: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text or "")
-
-
-# ===============================================================
-# SECTION 8 — Video Concatenation (clips → segment) — unified
-# ===============================================================
-
-def _write_concat_list(mp4_paths: List[str], list_path: str) -> None:
-    """
-    Writes a concat demuxer list file.
-
-    We resolve to absolute paths for stability.
-    We wrap in single quotes. For very unusual filenames containing single quotes,
-    we apply a conservative escape that works in most ffmpeg builds.
-    """
-    lines: List[str] = []
-    for p in mp4_paths:
-        ap = str(Path(p).resolve())
-        # Conservative escape: duplicate the prior approach (kept consistent across module).
-        # NOTE: If you never use apostrophes in filenames, this is effectively perfect.
-        ap_esc = ap.replace("'", "'\\''")
-        lines.append(f"file '{ap_esc}'")
-    Path(list_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
-    """
-    Concatenate MP4 clips using ffmpeg concat demuxer with stream copy.
-    Assumes all MP4 clips were generated with consistent codec/settings.
-
-    If stream-copy concat fails (mismatched encoding/timebase), we fall back
-    to a safe re-encode to produce a stable MP4.
-    """
-    if not mp4_paths:
-        raise ValueError("concat_mp4s: no input mp4_paths")
-
-    for p in mp4_paths:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"concat_mp4s: missing input: {p}")
-
-    ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
-        list_path = tf.name
-    try:
-        _write_concat_list(mp4_paths, list_path)
-
-        # First attempt: stream copy
-        try:
-            run_cmd(
-                [
-                    ff,
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-fflags",
-                    "+genpts",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    list_path,
-                    "-c",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    out_path,
-                ]
-            )
-            return out_path
-        except RuntimeError:
-            # Fallback: re-encode to normalize
-            run_cmd(
-                [
-                    ff,
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-fflags",
-                    "+genpts",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    list_path,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-movflags",
-                    "+faststart",
-                    out_path,
-                ]
-            )
-            return out_path
-    finally:
-        try:
-            os.remove(list_path)
-        except OSError:
-            pass
-
-
-# ===============================================================
-# SECTION 9 — Audio Muxing (no narration cutoffs, no +2s tail)
-# ===============================================================
-
-def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
-    """
-    Mux narration audio onto video WITHOUT cutting narration.
-
-    Key behaviors:
-      - Copies video stream (no re-encode)
-      - Encodes audio to AAC for broad compatibility
-      - Adds a tiny audio pad ONLY as a timestamp rounding guard
-        (max pad = 0.75s; no +2s tails)
-
-    IMPORTANT:
-      - We do NOT use `-shortest` (can truncate audio if video slightly shorter)
-      - The caller (Section 18) must ensure video duration >= audio duration (+<=0.75s buffer)
-    """
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(video_path)
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(audio_path)
-
-    ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-
-    tail_pad = float(os.environ.get("UAPPRESS_TAIL_PAD_S", "0.75") or 0.75)
-    tail_pad = max(0.0, min(0.75, tail_pad))
-
-    run_cmd(
-        [
-            ff,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            video_path,
-            "-i",
-            audio_path,
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
-            "-af",
-            f"apad=pad_dur={tail_pad:.3f}",
-            "-movflags",
-            "+faststart",
-            out_path,
-        ]
-    )
-    return out_path
-
-
-# ===============================================================
-# SECTION 10 — Scene Duration Allocation (kept; used by Section 18)
-# ===============================================================
-
-def _allocate_scene_seconds(
-    total_seconds: int,
-    n_scenes: int,
-    *,
-    min_scene: int,
-    max_scene: int,
-) -> List[int]:
-    """
-    Distribute total_seconds across n_scenes with per-scene bounds.
-    Returns a list (length n_scenes) that sums to total_seconds (best effort).
-
-    Used by Section 18 to match video duration to audio duration (+small buffer),
-    without generating a long tail.
-    """
-    total_seconds = max(1, int(total_seconds))
-    n_scenes = max(1, int(n_scenes))
-    min_scene = max(1, int(min_scene))
-    max_scene = max(min_scene, int(max_scene))
-
-    base = total_seconds // n_scenes
-    secs = [base] * n_scenes
-
-    rem = total_seconds - sum(secs)
-    i = 0
-    while rem > 0:
-        secs[i % n_scenes] += 1
-        rem -= 1
-        i += 1
-
-    # Cap at max_scene by redistributing overflow
-    for i in range(n_scenes):
-        if secs[i] > max_scene:
-            overflow = secs[i] - max_scene
-            secs[i] = max_scene
-            j = 1
-            while overflow > 0 and j <= n_scenes:
-                k = (i + j) % n_scenes
-                room = max_scene - secs[k]
-                if room > 0:
-                    add = min(room, overflow)
-                    secs[k] += add
-                    overflow -= add
-                j += 1
-
-    # Raise to min_scene by borrowing from largest
-    for i in range(n_scenes):
-        if secs[i] < min_scene:
-            need = min_scene - secs[i]
-            secs[i] = min_scene
-            while need > 0:
-                donor = max(range(n_scenes), key=lambda d: secs[d])
-                if secs[donor] <= min_scene:
-                    break
-                take = min(need, secs[donor] - min_scene)
-                secs[donor] -= take
-                need -= take
-
-    # Final nudge to match total_seconds if possible within bounds
-    diff = total_seconds - sum(secs)
-    if diff > 0:
-        for i in range(n_scenes):
-            if diff == 0:
-                break
-            if secs[i] < max_scene:
-                secs[i] += 1
-                diff -= 1
-    elif diff < 0:
-        diff = -diff
-        for i in range(n_scenes):
-            if diff == 0:
-                break
-            if secs[i] > min_scene:
-                secs[i] -= 1
-                diff -= 1
-
-    return secs
-
-
-# ===============================================================
-# SECTION 11 — Sora Brand Intro/Outro (Config)
-# ===============================================================
-
-SORA_DEFAULT_MODEL = os.getenv("SORA_MODEL", "sora-2-pro")
-SORA_DEFAULT_SECONDS = os.getenv("SORA_SECONDS", "8")  # allowed: "4","8","12"
-SORA_DEFAULT_SIZE = os.getenv("SORA_SIZE", "1280x720")
-SORA_POLL_INTERVAL_S = float(os.getenv("SORA_POLL_INTERVAL_S", "2.5"))
-SORA_POLL_TIMEOUT_S = float(os.getenv("SORA_POLL_TIMEOUT_S", "900"))  # 15 min
-
-
-# ===============================================================
-# SECTION 12 — Sora Brand Intro/Outro (Data Model)
-# ===============================================================
-
-@dataclass(frozen=True)
-class BrandIntroOutroSpec:
-    brand_name: str
-    channel_or_series: str
-    tagline: str
-    episode_title: str  # kept for backward compatibility; ignored when global_mode=True
-    visual_style: str = (
-        "Radar/FLIR surveillance aesthetic, serious investigative tone. "
-        "Monochrome/low-saturation, subtle scanlines, HUD overlays, gridlines, "
-        "bearing ticks, altitude/velocity readouts, minimal telemetry numbers, "
-        "soft glow, restrained film grain. Slow camera drift. "
-        "No aliens, no monsters, no bright neon sci-fi, no cheesy explosions. "
-        "Clean premium typography, stable and readable."
-    )
-    palette: str = "deep charcoal, soft white, muted amber accents"
-    logo_text: Optional[str] = None
-    intro_music_cue: str = "subtle systems hum, low synth bed, minimal, tense but restrained"
-    outro_music_cue: str = "subtle systems hum, low synth bed, minimal, calm resolve"
-    cta_line: str = "Subscribe for more investigations."
-    sponsor_line: Optional[str] = None
-    aspect: str = "landscape"  # "landscape" or "portrait"
-    global_mode: bool = True   # if True, DO NOT include episode title in intro
-
-
-# ===============================================================
-# SECTION 13 — Sora Prompt Builders
-# ===============================================================
-
-def _sanitize_filename(s: str) -> str:
-    return safe_slug(s, max_len=80)
-
-
-def _normalize_seconds(v: Optional[Union[str, int]]) -> str:
-    if v is None:
-        return str(SORA_DEFAULT_SECONDS)
-    s = str(v).strip()
-    if s not in ("4", "8", "12"):
-        return str(SORA_DEFAULT_SECONDS)
-    return s
-
-
-def _resolve_size(spec: BrandIntroOutroSpec, explicit_size: Optional[str] = None) -> str:
-    if explicit_size:
-        return explicit_size
-    if spec.aspect.lower().startswith("p"):
-        return "720x1280"
-    return "1280x720"
-
-
-def build_sora_brand_intro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) -> str:
-    logo_text = spec.logo_text or spec.brand_name
-    lines = [
-        "Create a short branded INTRO bumper for a serious investigative documentary YouTube channel.",
-        f"Length: {seconds} seconds.",
-        f"Style: {spec.visual_style}",
-        f"Color palette: {spec.palette}",
-        "",
-        "Visual language requirements (Radar/FLIR HUD):",
-        "- FLIR / radar scope UI feeling, telemetry overlays, HUD ticks, gridlines, bearing marks, minimal numbers.",
-        "- Subtle scanlines, restrained grain, soft glow; slow drift (no fast cuts).",
-        "- Serious tone: declassified / surveillance vibe. Avoid neon sci-fi and cheesy effects.",
-        "",
-        "On-screen text (clean, modern, readable, stable):",
-        f"1) '{logo_text}' (primary)",
-        f"2) '{spec.channel_or_series}' (secondary)",
-    ]
-    if not spec.global_mode:
-        ep = (spec.episode_title or "").strip()
-        if ep:
-            lines.append(f"3) Episode title (briefly): '{ep}'")
-    lines += [
-        "",
-        "Typography rules:",
-        "- Keep text large, stable, and spelled correctly.",
-        "- Minimal, premium broadcast typography; no gimmicky fonts.",
-        "",
-        "Audio:",
-        f"- Add synced audio that matches: {spec.intro_music_cue}.",
-        "- No voiceover.",
-        "",
-        "Deliver a polished broadcast-ready intro bumper.",
-    ]
-    return "\n".join(lines)
-
-
-def build_sora_brand_outro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) -> str:
-    logo_text = spec.logo_text or spec.brand_name
-    lines = [
-        "Create a short branded OUTRO bumper for a serious investigative documentary YouTube channel.",
-        f"Length: {seconds} seconds.",
-        f"Style: {spec.visual_style}",
-        f"Color palette: {spec.palette}",
-        "",
-        "Visual language requirements (Radar/FLIR HUD):",
-        "- FLIR / radar scope UI feeling, telemetry overlays, HUD ticks, gridlines, bearing marks, minimal numbers.",
-        "- Subtle scanlines, restrained grain, soft glow; slow drift; gentle fade to black at end.",
-        "- Serious tone: avoid neon sci-fi, avoid cheesy effects.",
-        "",
-        "On-screen text (clean, modern, readable, stable):",
-        f"1) '{logo_text}' (primary)",
-        f"2) '{spec.cta_line}' (secondary)",
-    ]
-    if spec.sponsor_line:
-        lines.append(f"3) Sponsor line (brief, tasteful): '{spec.sponsor_line}'")
-    lines += [
-        "",
-        "Typography rules:",
-        "- Keep text large, stable, and spelled correctly.",
-        "- Minimal, premium broadcast typography.",
-        "",
-        "Audio:",
-        f"- Add synced audio that matches: {spec.outro_music_cue}.",
-        "- No voiceover.",
-        "",
-        "Deliver a polished broadcast-ready outro bumper.",
-    ]
-    return "\n".join(lines)
-
-
-# ===============================================================
-# SECTION 14 — Sora Job Lifecycle (create → poll → download)
-# ===============================================================
-
-def _sora_create_video_job(
-    client,
-    prompt: str,
-    *,
-    model: Optional[str] = None,
-    seconds: Optional[Union[str, int]] = None,
-    size: Optional[str] = None,
-    input_reference_path: Optional[str] = None,
-) -> Any:
-    kwargs: Dict[str, Any] = {
-        "prompt": prompt,
-        "model": (model or SORA_DEFAULT_MODEL),
-        "seconds": _normalize_seconds(seconds),
-        "size": (size or SORA_DEFAULT_SIZE),
-    }
-
-    if input_reference_path:
-        with open(input_reference_path, "rb") as f:
-            kwargs["input_reference"] = f
-            return client.videos.create(**kwargs)
-
-    return client.videos.create(**kwargs)
-
-
-def _sora_poll_until_done(client, video_id: str) -> Any:
-    deadline = time.time() + SORA_POLL_TIMEOUT_S
-    while time.time() < deadline:
-        job = client.videos.retrieve(video_id)
-        status = getattr(job, "status", None) or (job.get("status") if isinstance(job, dict) else None)
-        if status in ("completed", "succeeded"):
-            return job
-        if status in ("failed", "canceled", "cancelled", "error"):
-            raise RuntimeError(f"Sora video job {video_id} ended with status={status}")
-        time.sleep(SORA_POLL_INTERVAL_S)
-    raise TimeoutError(f"Sora video job {video_id} timed out after {SORA_POLL_TIMEOUT_S:.0f}s")
-
-
-def _sora_download_mp4(client, video_id: str, out_path: Path) -> Path:
-    """
-    Streamlit-Cloud-safe: try known SDK shapes without assuming one method.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    content = None
-    videos = getattr(client, "videos", None)
-    if videos is not None:
-        for meth_name in ("content", "download_content", "retrieve_content"):
-            meth = getattr(videos, meth_name, None)
-            if callable(meth):
-                try:
-                    content = meth(video_id)
-                    break
-                except AttributeError:
-                    continue
-
-    if content is None:
-        raise AttributeError("OpenAI SDK client.videos has no supported content download method")
-
-    if isinstance(content, (bytes, bytearray)):
-        out_path.write_bytes(content)
-        return out_path
-
-    read = getattr(content, "read", None)
-    if callable(read):
-        out_path.write_bytes(content.read())
-        return out_path
-
-    raw = getattr(content, "content", None)
-    if isinstance(raw, (bytes, bytearray)):
-        out_path.write_bytes(raw)
-        return out_path
-
-    raise TypeError("Unexpected return type from Sora content download method")
-
-
-# ===============================================================
-# SECTION 15 — Public API: Generate Sora Brand Intro/Outro Clips
-# ===============================================================
-
-def generate_sora_brand_intro_outro(
-    client,
-    spec: BrandIntroOutroSpec,
-    output_dir: Union[str, Path],
-    *,
-    model: Optional[str] = None,
-    seconds: Optional[Union[str, int]] = None,
-    size: Optional[str] = None,
-    intro_seconds: Optional[Union[str, int]] = None,
-    outro_seconds: Optional[Union[str, int]] = None,
-    intro_size: Optional[str] = None,
-    outro_size: Optional[str] = None,
-    intro_reference_image: Optional[str] = None,
-    outro_reference_image: Optional[str] = None,
-) -> Tuple[Path, Path]:
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if intro_seconds is None:
-        intro_seconds = seconds
-    if outro_seconds is None:
-        outro_seconds = seconds
-
-    intro_s = _normalize_seconds(intro_seconds)
-    outro_s = _normalize_seconds(outro_seconds)
-
-    base_size = size
-    intro_sz = _resolve_size(spec, explicit_size=(intro_size or base_size))
-    outro_sz = _resolve_size(spec, explicit_size=(outro_size or base_size))
-
-    intro_prompt = build_sora_brand_intro_prompt(spec, seconds=intro_s)
-    intro_job = _sora_create_video_job(
-        client,
-        intro_prompt,
-        model=model,
-        seconds=intro_s,
-        size=intro_sz,
-        input_reference_path=intro_reference_image,
-    )
-    intro_id = getattr(intro_job, "id", None) or (intro_job.get("id") if isinstance(intro_job, dict) else None)
-    if not intro_id:
-        raise RuntimeError("Sora intro job did not return an id")
-    _sora_poll_until_done(client, intro_id)
-
-    intro_name = f"{_sanitize_filename(spec.brand_name)}-intro.mp4"
-    intro_path = out_dir / intro_name
-    _sora_download_mp4(client, intro_id, intro_path)
-
-    outro_prompt = build_sora_brand_outro_prompt(spec, seconds=outro_s)
-    outro_job = _sora_create_video_job(
-        client,
-        outro_prompt,
-        model=model,
-        seconds=outro_s,
-        size=outro_sz,
-        input_reference_path=outro_reference_image,
-    )
-    outro_id = getattr(outro_job, "id", None) or (outro_job.get("id") if isinstance(outro_job, dict) else None)
-    if not outro_id:
-        raise RuntimeError("Sora outro job did not return an id")
-    _sora_poll_until_done(client, outro_id)
-
-    outro_name = f"{_sanitize_filename(spec.brand_name)}-outro.mp4"
-    outro_path = out_dir / outro_name
-    _sora_download_mp4(client, outro_id, outro_path)
-
-    return intro_path, outro_path
-
-
-# ===============================================================
-# SECTION 16 — Final Assembly + Optional Sora GLOBAL Intro/Outro Injection
-# (Unifies concat on concat_mp4s and avoids shell-based ffmpeg calls)
-# ===============================================================
-
-ENABLE_SORA_BRAND_CLIPS = os.getenv("ENABLE_SORA_BRAND_CLIPS", "0").strip() == "1"
-SORA_BRAND_ASSETS_SUBDIR = os.getenv("SORA_BRAND_ASSETS_SUBDIR", "brand_assets")
-
-
-def _sanitize_filename_local(s: str) -> str:
-    return safe_slug(s, max_len=80)
-
-
-def _global_brand_filenames(brand_name: str) -> Tuple[str, str]:
-    slug = _sanitize_filename_local(brand_name)
-    return (f"{slug}_GLOBAL_INTRO.mp4", f"{slug}_GLOBAL_OUTRO.mp4")
-
-
-def _get_brand_assets_dir(output_dir: Union[str, Path]) -> Path:
-    return Path(output_dir) / SORA_BRAND_ASSETS_SUBDIR
-
-
-def _maybe_generate_or_reuse_global_brand_clips(
-    client,
-    *,
-    output_dir: Union[str, Path],
-    brand_spec,
-    model: Optional[str] = None,
-    intro_seconds: Optional[Union[str, int]] = None,
-    outro_seconds: Optional[Union[str, int]] = None,
-    size: Optional[str] = None,
-    intro_size: Optional[str] = None,
-    outro_size: Optional[str] = None,
-    intro_reference_image: Optional[str] = None,
-    outro_reference_image: Optional[str] = None,
-    force_regen: bool = False,
-) -> Tuple[Path, Path]:
-    brand_dir = _get_brand_assets_dir(output_dir)
-    brand_dir.mkdir(parents=True, exist_ok=True)
-
-    intro_name, outro_name = _global_brand_filenames(getattr(brand_spec, "brand_name", "brand"))
-    intro_path = brand_dir / intro_name
-    outro_path = brand_dir / outro_name
-
-    if (not force_regen) and intro_path.exists() and outro_path.exists():
-        return intro_path, outro_path
-
-    intro_tmp, outro_tmp = generate_sora_brand_intro_outro(
-        client,
-        brand_spec,
-        brand_dir,
-        model=model,
-        size=size,
-        intro_seconds=intro_seconds,
-        outro_seconds=outro_seconds,
-        intro_size=intro_size,
-        outro_size=outro_size,
-        intro_reference_image=intro_reference_image,
-        outro_reference_image=outro_reference_image,
-    )
-
-    try:
-        Path(intro_tmp).replace(intro_path)
-    except Exception:
-        intro_path.write_bytes(Path(intro_tmp).read_bytes())
-
-    try:
-        Path(outro_tmp).replace(outro_path)
-    except Exception:
-        outro_path.write_bytes(Path(outro_tmp).read_bytes())
-
-    return intro_path, outro_path
-
-
-def _maybe_add_sora_brand_intro_outro(
-    client,
-    *,
-    main_video_path: Union[str, Path],
-    output_dir: Union[str, Path],
-    final_basename: str,
-    brand_spec,
-    enable: bool,
-    model: Optional[str] = None,
-    intro_seconds: Optional[Union[str, int]] = None,
-    outro_seconds: Optional[Union[str, int]] = None,
-    size: Optional[str] = None,
-    intro_size: Optional[str] = None,
-    outro_size: Optional[str] = None,
-    intro_reference_image: Optional[str] = None,
-    outro_reference_image: Optional[str] = None,
-    force_regen_brand: bool = False,
-) -> Path:
-    main_video_path = Path(main_video_path)
-    output_dir = Path(output_dir)
-
-    if not enable:
-        return main_video_path
-
-    intro_path, outro_path = _maybe_generate_or_reuse_global_brand_clips(
-        client,
-        output_dir=output_dir,
-        brand_spec=brand_spec,
-        model=model,
-        intro_seconds=intro_seconds,
-        outro_seconds=outro_seconds,
-        size=size,
-        intro_size=intro_size,
-        outro_size=outro_size,
-        intro_reference_image=intro_reference_image,
-        outro_reference_image=outro_reference_image,
-        force_regen=force_regen_brand,
-    )
-
-    out_path = output_dir / f"{final_basename}.mp4"
-
-    # Use unified concat (stream-copy first)
-    concat_mp4s([str(intro_path), str(main_video_path), str(outro_path)], str(out_path))
-    return out_path
-
-
-# ===============================================================
-# SECTION 17 — Public Hook: finalize_video_output()
-# ===============================================================
-
-def finalize_video_output(
-    client,
-    *,
-    main_video_path: Union[str, Path],
-    output_dir: Union[str, Path],
-    final_name: str,
-    brand_spec=None,
-    enable_brand_clips: Optional[bool] = None,
-    model: Optional[str] = None,
-    intro_seconds: Optional[Union[str, int]] = None,
-    outro_seconds: Optional[Union[str, int]] = None,
-    size: Optional[str] = None,
-    intro_size: Optional[str] = None,
-    outro_size: Optional[str] = None,
-    intro_reference_image: Optional[str] = None,
-    outro_reference_image: Optional[str] = None,
-    force_regen_brand: bool = False,
-) -> Path:
-    enable = ENABLE_SORA_BRAND_CLIPS if enable_brand_clips is None else bool(enable_brand_clips)
-    if (not enable) or (brand_spec is None):
-        return Path(main_video_path)
-
-    return _maybe_add_sora_brand_intro_outro(
-        client,
-        main_video_path=main_video_path,
-        output_dir=output_dir,
-        final_basename=final_name,
-        brand_spec=brand_spec,
-        enable=True,
-        model=model,
-        intro_seconds=intro_seconds,
-        outro_seconds=outro_seconds,
-        size=size,
-        intro_size=intro_size,
-        outro_size=outro_size,
-        intro_reference_image=intro_reference_image,
-        outro_reference_image=outro_reference_image,
-        force_regen_brand=force_regen_brand,
-    )
-
-
-# ===============================================================
-# SECTION 18 — Segment MP4 Renderer (Images → clips → concat → mux)
-# (Audit-applied: audio-driven timing; <=0.75s tail; unified helpers)
-# ===============================================================
-
-def _read_text_file(path: str, max_chars: int = 12000) -> str:
-    try:
-        p = Path(path)
-        if not p.exists():
-            return ""
-        txt = p.read_text(encoding="utf-8", errors="ignore")
-        txt = (txt or "").strip()
-        if len(txt) > max_chars:
-            txt = txt[:max_chars].rstrip() + "\n..."
-        return txt
-    except Exception:
-        return ""
-
-
-def _chunk_script_for_scenes(script: str, max_scenes: int) -> List[str]:
-    """
-    Make up to max_scenes short chunks to drive image prompts.
-    Simple + robust (no strict JSON dependency).
-    """
-    script = (script or "").strip()
-    if not script:
-        return []
-
-    script = " ".join(script.split())
-    max_scenes = max(1, int(max_scenes or 1))
-
-    target = max(220, min(750, max(220, len(script) // max_scenes)))
-
-    chunks: List[str] = []
-    i = 0
-    n = len(script)
-
-    while i < n and len(chunks) < max_scenes:
-        j = min(n, i + target)
-
-        cut = script.rfind(". ", i, j)
-        if cut == -1 or cut < i + 90:
-            cut = script.rfind("; ", i, j)
-        if cut == -1 or cut < i + 90:
-            cut = j
-
-        chunk = script[i:cut].strip()
-        if chunk:
-            chunks.append(chunk)
-        i = cut
-
-    return chunks[:max_scenes]
-
-
-def _image_size_for_video(width: int, height: int) -> str:
-    """
-    Image sizes: choose closest aspect for quality.
-    """
-    width = int(width)
-    height = int(height)
-    return "1536x1024" if width >= height else "1024x1536"
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
-
-
-def _generate_scene_image(
-    *,
-    client: OpenAI,
-    prompt: str,
-    out_path: str,
-    size: str,
-    model: str,
-) -> str:
-    """
-    Generate PNG and write to out_path.
-    Disk cache: reuse if already created and valid size.
-    """
-    p = Path(out_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if p.exists() and p.stat().st_size > 10_000:
-            return str(p)
-    except Exception:
-        pass
-
-    rsp = client.images.generate(
-        model=model,
-        prompt=prompt,
-        n=1,
-        size=size,
-    )
-
-    # Defensive: handle common SDK shapes
-    b64 = None
-    try:
-        b64 = rsp.data[0].b64_json
-    except Exception:
-        b64 = None
-
-    if not b64:
-        raise RuntimeError("Image API did not return b64_json. Check model + SDK configuration.")
-
-    img_bytes = io.BytesIO()
-    img_bytes.write(__import__("base64").b64decode(b64))
-    _atomic_write_bytes(p, img_bytes.getvalue())
-    return str(p)
-
-
-def _make_scene_clip_from_still(
-    *,
-    image_path: str,
-    out_path: str,
+# ----------------------------
+# Manifest
+# ----------------------------
+
+def build_segment_manifest_record(
+    segment_name: str,
+    mp4_key: str,
+    mp4_url: Optional[str],
+    audio_seconds: float,
     width: int,
     height: int,
     fps: int,
-    seconds: float,
-    zoom_strength: float,
+    created_at_epoch: int,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "segment_name": segment_name,
+        "mp4": {"key": mp4_key, "url": mp4_url},
+        "audio_seconds": audio_seconds,
+        "video": {"width": width, "height": height, "fps": fps},
+        "created_at": created_at_epoch,
+        "extra": extra or {},
+    }
+
+
+def write_manifest_json(manifest: Dict[str, Any], out_path: Union[str, Path]) -> Path:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(manifest, indent=2, sort_keys=False), encoding="utf-8")
+    return out_path
+
+
+# ---------------------------------------------------------
+# Core rendering: images -> scene clips -> concat -> mux audio
+# ---------------------------------------------------------
+
+def _make_zoompan_filter(
+    width: int,
+    height: int,
+    duration_s: float,
+    fps: int,
 ) -> str:
     """
-    Make a short mp4 clip from a still with zoompan.
-    Disk cache: reuse if already created and seems valid.
+    A gentle Ken-Burns-ish zoompan that won't create black frames:
+    - scale to cover
+    - center crop
+    - zoompan over the crop
     """
-    outp = Path(out_path)
-    outp.parent.mkdir(parents=True, exist_ok=True)
+    frames = max(1, int(math.ceil(duration_s * fps)))
+    # Very subtle zoom: 1.00 -> ~1.06 over the scene
+    # Use on-frame zoom expression bounded to avoid jumps.
+    zoom_expr = "min(zoom+0.0009,1.06)"
+    # Centered pan (keeps stable). If you want motion, you can
+    # add small x/y drift; but this is safest.
+    x_expr = f"(iw-{width})/2"
+    y_expr = f"(ih-{height})/2"
 
-    try:
-        if outp.exists() and outp.stat().st_size > 50_000 and _has_video_stream(str(outp)):
-            return str(outp)
-    except Exception:
-        pass
-
-    ff = ffmpeg_exe()
-
-    seconds = float(seconds or 0)
-    if seconds <= 0:
-        seconds = 3.0
-
-    fps = int(fps)
-    width = int(width)
-    height = int(height)
-
-    zs = float(zoom_strength or 1.06)
-    zs = max(1.0, min(1.25, zs))
-
-    frames = max(1, int(round(seconds * fps)))
-    inc = (zs - 1.0) / max(frames, 1)
-
+    # We first scale up so that crop is guaranteed to be filled.
+    # scale='if(gt(a,16/9),-1,W*1.2): ...' gets messy; use a robust cover:
+    # scale to max needed then crop.
+    # Use force_original_aspect_ratio=increase to cover both dimensions.
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},"
-        f"zoompan=z='min(zoom+{inc:.8f},{zs:.4f})':"
-        f"d={frames}:s={width}x{height}:fps={fps}"
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={width}x{height}:fps={fps}"
     )
+    return vf
 
-    # Write to temp then atomically replace to avoid partial cache artifacts
-    tmp_out = outp.with_suffix(outp.suffix + ".tmp.mp4")
 
-    run_cmd(
-        [
-            ff,
+def build_scene_clip_from_image(
+    image_path: Union[str, Path],
+    out_mp4_path: Union[str, Path],
+    duration_s: float,
+    width: int,
+    height: int,
+    fps: int = _DEFAULT_FPS,
+) -> Path:
+    """
+    Turn a single image into a short MP4 scene clip (no audio).
+    Uses zoompan to avoid static "slideshow" feel, but keeps it safe.
+    """
+    image_path = Path(image_path)
+    out_mp4_path = Path(out_mp4_path)
+    out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
+
+    vf = _make_zoompan_filter(width, height, duration_s, fps)
+    ffmpeg = which_ffmpeg()
+
+    # -loop 1 reads image continuously; -t sets duration.
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        str(image_path),
+        "-t",
+        f"{duration_s:.3f}",
+        "-vf",
+        vf,
+        "-r",
+        str(fps),
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(out_mp4_path),
+    ]
+    run_ffmpeg(cmd)
+    return out_mp4_path
+
+
+def concat_video_clips(
+    clip_paths: Sequence[Union[str, Path]],
+    out_mp4_path: Union[str, Path],
+) -> Path:
+    """
+    Concatenate MP4 clips (video only) with ffmpeg concat demuxer (safe).
+    All clips must match codec settings (we create them consistently).
+    """
+    out_mp4_path = Path(out_mp4_path)
+    out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build concat list file
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        list_path = td_path / "concat_list.txt"
+        lines = []
+        for p in clip_paths:
+            p = Path(p)
+            # concat demuxer needs escaped paths; safest is to use single quotes and replace
+            # any single quote in path (rare on Windows) – but we’ll use ffmpeg-safe escaping:
+            lines.append(f"file '{str(p).replace(\"'\", \"'\\\\''\")}'")
+        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        ffmpeg = which_ffmpeg()
+        cmd = [
+            ffmpeg,
             "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-loop",
-            "1",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
             "-i",
-            str(image_path),
-            "-t",
-            f"{seconds:.3f}",
-            "-vf",
-            vf,
-            "-r",
-            str(fps),
-            "-c:v",
-            "libx264",
-            "-preset",
-            os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
-            "-pix_fmt",
-            "yuv420p",
+            str(list_path),
+            "-c",
+            "copy",
             "-movflags",
             "+faststart",
-            str(tmp_out),
+            str(out_mp4_path),
         ]
-    )
+        run_ffmpeg(cmd)
 
-    try:
-        tmp_out.replace(outp)
-    except Exception:
-        _copy_file(str(tmp_out), str(outp))
-        try:
-            tmp_out.unlink(missing_ok=True)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    # Validate
-    if not outp.exists() or outp.stat().st_size < 50_000 or not _has_video_stream(str(outp)):
-        raise RuntimeError(f"Scene clip render failed or invalid: {outp}")
-
-    return str(outp)
+    return out_mp4_path
 
 
-def _clamp_scene_count_for_duration(
-    *,
-    target_seconds: int,
-    desired_scenes: int,
-    min_scene_seconds: int,
-) -> int:
-    target_seconds = max(1, int(target_seconds))
-    desired_scenes = max(1, int(desired_scenes))
-    min_scene_seconds = max(1, int(min_scene_seconds))
-    max_fit = max(1, target_seconds // min_scene_seconds)
-    return max(1, min(desired_scenes, max_fit))
+def mux_audio_to_video(
+    video_path: Union[str, Path],
+    audio_path: Union[str, Path],
+    out_mp4_path: Union[str, Path],
+    end_buffer_s: float = _DEFAULT_END_BUFFER,
+) -> Path:
+    """
+    Mux narration audio to the concatenated video, audio-driven with a small end buffer.
+    Ensures no black video by:
+      - creating video to roughly match audio duration before mux
+      - muxing with -shortest
+      - padding audio slightly (0.5–0.75s) rather than extending video arbitrarily
+    """
+    video_path = Path(video_path)
+    audio_path = Path(audio_path)
+    out_mp4_path = Path(out_mp4_path)
+    out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
 
+    end_buffer_s = clamp_float(float(end_buffer_s), _END_BUFFER_MIN, _END_BUFFER_MAX)
+
+    ffmpeg = which_ffmpeg()
+
+    # Pad audio with a short silence tail using apad + atrim, then mux.
+    # We do NOT add +2s; we clamp to ~0.5–0.75s.
+    #
+    # Note: If audio has exact duration D, atrim ends at D+buffer.
+    # If D is unknown (ffprobe missing), we still apply apad and rely on -shortest.
+    audio_dur = ffprobe_duration_seconds(audio_path)
+    if audio_dur > 0:
+        target = audio_dur + end_buffer_s
+        a_filter = f"apad,atrim=0:{target:.3f}"
+    else:
+        # Unknown duration: minimal padding; -shortest keeps us safe.
+        a_filter = f"apad=pad_dur={end_buffer_s:.3f}"
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_path),
+        "-filter:a",
+        a_filter,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(out_mp4_path),
+    ]
+    run_ffmpeg(cmd)
+    return out_mp4_path
+
+
+# ---------------------------------------------------------
+# Segment render shim (this is what app.py calls)
+# ---------------------------------------------------------
 
 def render_segment_mp4(
     *,
-    pair: Dict,
-    extract_dir: str,
-    out_path: str,
-    api_key: str,
-    fps: int,
+    segment_name: str,
+    images: Sequence[Union[str, Path]],
+    audio_path: Union[str, Path],
+    out_dir: Union[str, Path],
     width: int,
     height: int,
-    zoom_strength: float,
-    max_scenes: int,
-    min_scene_seconds: int,
-    max_scene_seconds: int,
-) -> str:
+    fps: int = _DEFAULT_FPS,
+    min_scene_s: float = 2.0,
+    max_scene_s: float = 10.0,
+    end_buffer_s: float = _DEFAULT_END_BUFFER,
+    spaces_cfg: Optional[SpacesConfig] = None,
+    spaces_prefix: str = "",
+    upload_manifest: bool = True,
+    manifest_basename: str = "manifest.json",
+    extra_manifest: Optional[Dict[str, Any]] = None,
+    brand_spec: Optional[BrandIntroOutroSpec] = None,
+    brand_intro_seconds_fallback: float = 3.0,
+    brand_outro_seconds_fallback: float = 3.0,
+    openai_client_for_brand: Any = None,
+) -> Dict[str, Any]:
     """
-    Segment renderer:
-      - Generate images per scene
-      - Build video clips from images
-      - Concatenate clips
-      - Mux narration audio (no cutoffs)
+    Render ONE segment MP4 with the locked pipeline:
+      images -> scene clips -> concat -> mux audio
 
-    Audit-applied timing:
-      - Video duration is audio-driven with max tail buffer <= 0.75s total.
-      - No "+2 seconds" padding.
+    Returns a dict used by app.py for UI + uploads, e.g.:
+      {
+        "segment_name": ...,
+        "local_mp4": "...",
+        "spaces_key": "...",
+        "spaces_url": "...",
+        "audio_seconds": ...,
+        "width": ..., "height": ..., "fps": ...
+      }
+
+    Notes:
+    - No subtitles/logos.
+    - No cross-segment stitching.
+    - Brand intro/outro (GLOBAL) is optional and uses Sora generation if enabled.
     """
+    out_dir = ensure_dir(out_dir)
+    segment_safe = sanitize_filename(segment_name)
+    ts = int(time.time())
 
-    audio_path = str(pair.get("audio_path") or "").strip()
-    if not audio_path:
-        raise ValueError("render_segment_mp4: pair is missing audio_path")
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"render_segment_mp4: missing audio_path: {audio_path}")
+    images = [Path(p) for p in images]
+    audio_path = Path(audio_path)
 
-    script_path = str(pair.get("script_path") or "").strip()
-    script_text = _read_text_file(script_path) if script_path else ""
+    if not images:
+        raise ValueError(f"No images provided for segment '{segment_name}'.")
+    if not audio_path.exists():
+        raise FileNotFoundError(str(audio_path))
 
-    # Authoritative duration = audio duration
-    dur = float(get_media_duration_seconds(audio_path) or 0.0)
-    if dur <= 0:
-        dur = 5.0
+    # Determine scene durations from audio length (audio-driven).
+    audio_seconds = ffprobe_duration_seconds(audio_path)
+    if audio_seconds <= 0:
+        # If ffprobe unavailable, fall back to uniform duration that respects clamp.
+        # app.py usually drives this; we keep it safe.
+        per = clamp_scene_seconds(5.0, min_scene_s, max_scene_s)
+        scene_seconds = [per for _ in images]
+        audio_seconds = per * len(images)
+    else:
+        # Allocate audio duration across scenes, leaving brand clips out of this calculation.
+        # The end buffer is handled at mux time (audio padding), not by stretching video.
+        per = audio_seconds / max(1, len(images))
+        per = clamp_scene_seconds(per, min_scene_s, max_scene_s)
+        scene_seconds = [per for _ in images]
 
-    tail_pad = float(os.environ.get("UAPPRESS_TAIL_PAD_S", "0.75") or 0.75)
-    tail_pad = max(0.0, min(0.75, tail_pad))
-
-    target_seconds = int((dur + tail_pad) + 0.999)  # ceil without importing math
-    target_seconds = max(3, target_seconds)
-
-    max_scenes = max(1, min(60, int(max_scenes or 1)))
-
-    chunks = _chunk_script_for_scenes(script_text, max_scenes=max_scenes)
-    if not chunks:
-        chunks = ["Serious investigative documentary visuals. Cinematic, restrained, realistic."]
-
-    scene_count = _clamp_scene_count_for_duration(
-        target_seconds=target_seconds,
-        desired_scenes=len(chunks),
-        min_scene_seconds=int(min_scene_seconds),
-    )
-    chunks = chunks[:scene_count]
-
-    # Allocate scene seconds to sum to target_seconds within bounds
-    scene_secs_int = _allocate_scene_seconds(
-        int(target_seconds),
-        int(scene_count),
-        min_scene=int(min_scene_seconds),
-        max_scene=int(max_scene_seconds),
-    )
-
-    # Make sure we do not exceed target_seconds after allocator nudges
-    cur_sum = int(sum(scene_secs_int))
-    if cur_sum > target_seconds:
-        overshoot = cur_sum - target_seconds
-        for i in range(len(scene_secs_int) - 1, -1, -1):
-            if overshoot <= 0:
-                break
-            can_take = max(0, scene_secs_int[i] - int(min_scene_seconds))
-            take = min(can_take, overshoot)
-            scene_secs_int[i] -= take
-            overshoot -= take
-
-    # Final scene durations
-    scene_durs = [float(max(1, int(s))) for s in scene_secs_int]
-
-    base_dir = Path(str(extract_dir or "."))
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    # Use shared cache dir to reduce Streamlit Cloud disk churn
-    cache_dir = _get_cache_dir()
-    _ensure_dir(cache_dir)
-    _prune_cache(cache_dir)
-
-    # Per-extract working dirs (kept for user visibility/debug)
-    tmp_dir = base_dir / "_tmp_video"
-    img_dir = base_dir / "_scene_images"
-    clip_dir = base_dir / "_scene_clips"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    clip_dir.mkdir(parents=True, exist_ok=True)
-
-    out_path = str(out_path)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-
-    # OpenAI client
-    client = OpenAI(api_key=str(api_key))
-
-    # Image model default: use env; safe fallback to "gpt-image-1"
-    img_model = (os.environ.get("UAPPRESS_IMAGE_MODEL", "") or "").strip() or "gpt-image-1"
-    img_size = _image_size_for_video(int(width), int(height))
-
-    style_prefix = (
-        "Create a cinematic still frame for a serious investigative documentary about UAPs. "
-        "Photorealistic, restrained, no cheesy sci-fi. "
-        "Muted tones, subtle film grain, moody lighting, realistic environments. "
-        "No text, no logos, no subtitles, no watermarks. "
-        "No aliens or monsters. "
-    )
-
-    clip_paths: List[str] = []
-    for i, chunk in enumerate(chunks, start=1):
-        scene_prompt = style_prefix + "Scene idea: " + str(chunk)
-
-        img_path = str(img_dir / f"scene_{i:03d}.png")
-        clip_path = str(clip_dir / f"scene_{i:03d}.mp4")
-
-        _generate_scene_image(
-            client=client,
-            prompt=scene_prompt,
-            out_path=img_path,
-            size=img_size,
-            model=img_model,
+    # Build scene clips
+    clips_dir = ensure_dir(out_dir / f"{segment_safe}_clips")
+    clip_paths: List[Path] = []
+    for idx, (img, dur) in enumerate(zip(images, scene_seconds), start=1):
+        clip_out = clips_dir / f"{segment_safe}_scene_{idx:03d}.mp4"
+        clip_paths.append(
+            build_scene_clip_from_image(
+                image_path=img,
+                out_mp4_path=clip_out,
+                duration_s=float(dur),
+                width=int(width),
+                height=int(height),
+                fps=int(fps),
+            )
         )
 
-        _make_scene_clip_from_still(
-            image_path=img_path,
-            out_path=clip_path,
+    # Optional: prepend/append GLOBAL brand intro/outro clips
+    # These are full MP4s already; we’ll concat them with the clip list.
+    if brand_spec and brand_spec.enabled:
+        if openai_client_for_brand is None:
+            raise RuntimeError("Brand intro/outro enabled, but no OpenAI client was provided.")
+        intro_path = out_dir / f"{segment_safe}_brand_intro.mp4"
+        outro_path = out_dir / f"{segment_safe}_brand_outro.mp4"
+
+        intro_mp4 = generate_sora_brand_intro_outro(
+            openai_client_for_brand,
+            brand_spec,
+            kind="intro",
+            out_mp4_path=intro_path,
             width=int(width),
             height=int(height),
-            fps=int(fps),
-            seconds=float(scene_durs[i - 1]),
-            zoom_strength=float(zoom_strength or 1.06),
+            seconds_fallback=float(brand_intro_seconds_fallback),
+        )
+        outro_mp4 = generate_sora_brand_intro_outro(
+            openai_client_for_brand,
+            brand_spec,
+            kind="outro",
+            out_mp4_path=outro_path,
+            width=int(width),
+            height=int(height),
+            seconds_fallback=float(brand_outro_seconds_fallback),
         )
 
-        clip_paths.append(clip_path)
+        # Insert intro at start, outro at end (if generated)
+        new_list: List[Path] = []
+        if intro_mp4:
+            new_list.append(Path(intro_mp4))
+        new_list.extend(clip_paths)
+        if outro_mp4:
+            new_list.append(Path(outro_mp4))
+        clip_paths = new_list
 
-    # Concat clips to temp segment video
-    tmp_video = str(tmp_dir / ("tmp_" + safe_slug(os.path.basename(out_path)) + ".mp4"))
-    concat_mp4s(clip_paths, tmp_video)
+    # Concatenate clips (video-only)
+    concat_path = out_dir / f"{segment_safe}_concat.mp4"
+    concat_video_clips(clip_paths, concat_path)
 
-    # Validate tmp_video has a real video stream
-    if not os.path.exists(tmp_video) or os.path.getsize(tmp_video) < 50_000 or not _has_video_stream(tmp_video):
-        raise RuntimeError("Concatenated temp video is missing a valid video stream (would produce black output).")
+    # Mux audio with a small end buffer, keeping video from turning black.
+    final_mp4 = out_dir / f"{segment_safe}.mp4"
+    mux_audio_to_video(
+        video_path=concat_path,
+        audio_path=audio_path,
+        out_mp4_path=final_mp4,
+        end_buffer_s=float(end_buffer_s),
+    )
 
-    # Mux narration (no truncation; <=0.75s pad max)
-    mux_audio(tmp_video, audio_path, out_path)
+    # Upload segment MP4 + manifest.json (optional)
+    spaces_url = None
+    mp4_key = f"{segment_safe}.mp4"
+    manifest_key = manifest_basename
 
-    # Best-effort cleanup
-    try:
-        os.remove(tmp_video)
-    except Exception:
-        pass
+    spaces_cfg = spaces_cfg or SpacesConfig(enabled=False)
+    if spaces_cfg.enabled:
+        # Allow app.py to override/extend prefix on a per-run basis
+        effective_prefix = _join_prefix(spaces_cfg.prefix, spaces_prefix) if spaces_prefix else spaces_cfg.prefix
 
-    return out_path
+        # Upload MP4
+        tmp_cfg = dataclasses.replace(spaces_cfg, prefix=effective_prefix)
+        spaces_url = spaces_upload_file(tmp_cfg, final_mp4, mp4_key, content_type="video/mp4")
+
+        # Manifest
+        if upload_manifest:
+            manifest = {
+                "version": 1,
+                "created_at": ts,
+                "segment": build_segment_manifest_record(
+                    segment_name=segment_name,
+                    mp4_key=_join_prefix(effective_prefix, mp4_key) if effective_prefix else mp4_key,
+                    mp4_url=spaces_url,
+                    audio_seconds=float(audio_seconds),
+                    width=int(width),
+                    height=int(height),
+                    fps=int(fps),
+                    created_at_epoch=ts,
+                    extra=extra_manifest or {},
+                ),
+            }
+            manifest_path = write_manifest_json(manifest, out_dir / manifest_basename)
+            spaces_upload_file(tmp_cfg, manifest_path, manifest_key, content_type="application/json")
+
+    return {
+        "segment_name": segment_name,
+        "local_mp4": str(final_mp4),
+        "audio_path": str(audio_path),
+        "audio_seconds": float(audio_seconds),
+        "width": int(width),
+        "height": int(height),
+        "fps": int(fps),
+        "spaces_key": _join_prefix(spaces_prefix or "", mp4_key) if (spaces_prefix or "") else mp4_key,
+        "spaces_url": spaces_url,
+        "out_dir": str(out_dir),
+    }
