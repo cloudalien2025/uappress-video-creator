@@ -1151,20 +1151,19 @@ def finalize_video_output(
 
 # SECTION 18 — Segment MP4 Renderer (Images → MP4 + narration mux)
 # ---------------------------------------------------------------
-# FIX GOAL (your exact complaint):
-# - Video should NOT outlast the narration by a huge margin.
-# - Target: video duration ~= (audio_duration + ~2s)
-# - Root cause: too many scenes + high min_scene_seconds forces total scene time > audio time.
-#
-# ✅ Fixes included:
-# 1) Compute a hard target duration: target_seconds = ceil(audio_seconds) + 2
-# 2) Clamp scene_count so we can actually fit inside target_seconds given min_scene_seconds
-# 3) Allocate scene seconds to SUM EXACTLY target_seconds (best effort within bounds)
-# 4) Cache images/clips to disk to avoid regen on reruns
-# 5) ultrafast x264 preset for Streamlit Cloud stability
+# FIX GOALS:
+# - Generate scene images -> clips -> MP4 video track
+# - Mux narration audio WITHOUT cutoffs
+# - ✅ Keep video tightly matched to audio (video ~= audio + 2s)
+# - ✅ Avoid SyntaxError landmines (no backslash-heavy f-strings)
+# - ✅ Streamlit Cloud stability (disk cache + ultrafast)
 
+import os
 import base64
 import math
+from pathlib import Path
+from typing import Dict, List
+from openai import OpenAI
 
 
 def _read_text_file(path: str, max_chars: int = 12000) -> str:
@@ -1183,8 +1182,8 @@ def _read_text_file(path: str, max_chars: int = 12000) -> str:
 
 def _chunk_script_for_scenes(script: str, max_scenes: int) -> List[str]:
     """
-    Make up to max_scenes short chunks to drive image generation prompts.
-    Simple + robust (no JSON parsing).
+    Make up to max_scenes short chunks to drive image prompts.
+    Simple + robust (no strict JSON dependency).
     """
     script = (script or "").strip()
     if not script:
@@ -1193,7 +1192,6 @@ def _chunk_script_for_scenes(script: str, max_scenes: int) -> List[str]:
     script = " ".join(script.split())
     max_scenes = max(1, int(max_scenes or 1))
 
-    # Rough target chunk size
     target = max(220, min(750, max(220, len(script) // max_scenes)))
 
     chunks: List[str] = []
@@ -1203,7 +1201,6 @@ def _chunk_script_for_scenes(script: str, max_scenes: int) -> List[str]:
     while i < n and len(chunks) < max_scenes:
         j = min(n, i + target)
 
-        # Prefer sentence boundary
         cut = script.rfind(". ", i, j)
         if cut == -1 or cut < i + 90:
             cut = script.rfind("; ", i, j)
@@ -1221,7 +1218,7 @@ def _chunk_script_for_scenes(script: str, max_scenes: int) -> List[str]:
 def _image_size_for_video(width: int, height: int) -> str:
     """
     GPT Image sizes: 1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), or auto.
-    We pick closest aspect.
+    Pick closest aspect.
     """
     width = int(width)
     height = int(height)
@@ -1237,13 +1234,12 @@ def _generate_scene_image(
     model: str = "gpt-image-1.5",
 ) -> str:
     """
-    Generates a PNG using OpenAI Images API and writes it to out_path.
-    Uses disk cache: if out_path exists and is non-trivial, reuse it.
+    Generate PNG and write to out_path.
+    Disk cache: reuse if already created.
     """
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    # Cache hit
     try:
         if p.exists() and p.stat().st_size > 10_000:
             return str(p)
@@ -1274,13 +1270,12 @@ def _make_scene_clip_from_still(
     zoom_strength: float,
 ) -> str:
     """
-    Builds a short MP4 clip from a still image using ffmpeg + zoompan.
-    Uses disk cache: if out_path exists and is non-trivial, reuse it.
+    Make a short mp4 clip from a still with zoompan.
+    Disk cache: reuse if already created.
     """
     outp = Path(out_path)
     outp.parent.mkdir(parents=True, exist_ok=True)
 
-    # Cache hit
     try:
         if outp.exists() and outp.stat().st_size > 50_000:
             return str(outp)
@@ -1297,7 +1292,6 @@ def _make_scene_clip_from_still(
     width = int(width)
     height = int(height)
 
-    # clamp zoom strength
     zs = float(zoom_strength or 1.06)
     zs = max(1.0, min(1.25, zs))
 
@@ -1345,6 +1339,7 @@ def _make_scene_clip_from_still(
 def _concat_scene_clips(*, clip_paths: List[str], out_path: str) -> str:
     """
     Concatenate MP4 clips using ffmpeg concat demuxer (re-encode safe).
+    Uses safe quoting without backslash-heavy f-strings.
     """
     if not clip_paths:
         raise ValueError("_concat_scene_clips: no clip_paths")
@@ -1353,10 +1348,12 @@ def _concat_scene_clips(*, clip_paths: List[str], out_path: str) -> str:
     outp = Path(out_path)
     outp.parent.mkdir(parents=True, exist_ok=True)
 
-    list_path = str(outp.with_suffix(".concat.txt"))
+    list_path = outp.with_suffix(".concat.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for p in clip_paths:
-            f.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
+            # concat demuxer expects: file '...'
+            safe_p = str(p).replace("'", "'\\''")
+            f.write("file '" + safe_p + "'\n")
 
     try:
         run_cmd(
@@ -1371,7 +1368,7 @@ def _concat_scene_clips(*, clip_paths: List[str], out_path: str) -> str:
                 "-safe",
                 "0",
                 "-i",
-                list_path,
+                str(list_path),
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -1399,9 +1396,9 @@ def _clamp_scene_count_for_duration(
     min_scene_seconds: int,
 ) -> int:
     """
-    Prevent the classic overshoot:
-    if desired_scenes * min_scene_seconds > target_seconds,
-    we MUST reduce scene count or video will be longer than audio.
+    Prevent overshoot:
+    If desired_scenes * min_scene_seconds > target_seconds,
+    we must reduce scene count or video will outlast audio.
     """
     target_seconds = max(1, int(target_seconds))
     desired_scenes = max(1, int(desired_scenes))
@@ -1428,7 +1425,7 @@ def render_segment_mp4(
     """
     Real renderer:
     - Generate images per scene
-    - Build a silent video track
+    - Build silent video track
     - Mux narration audio (no cutoffs)
     - ✅ Duration match: video ~= ceil(audio) + 2 seconds
     """
@@ -1442,25 +1439,19 @@ def render_segment_mp4(
     script_path = str(pair.get("script_path") or "").strip()
     script_text = _read_text_file(script_path) if script_path else ""
 
-    # ---- Duration target (THIS is the fix) ----
-    # We want video to be just slightly longer than the narration.
+    # Target duration = audio + 2s (tight match like you want)
     dur = float(get_media_duration_seconds(audio_path) or 0.0)
     if dur <= 0:
         dur = 5.0
-
-    # Target: audio + ~2s (your request)
     target_seconds = int(math.ceil(dur)) + 2
     target_seconds = max(3, target_seconds)
 
-    # ---- Scene count clamping to avoid overshoot ----
     max_scenes = max(1, min(60, int(max_scenes or 1)))
 
-    # Build chunks (scene ideas)
     chunks = _chunk_script_for_scenes(script_text, max_scenes=max_scenes)
     if not chunks:
         chunks = ["Serious investigative documentary visuals. Cinematic, restrained, realistic."]
 
-    # Clamp scenes so min_scene_seconds * scenes <= target_seconds
     scene_count = _clamp_scene_count_for_duration(
         target_seconds=target_seconds,
         desired_scenes=len(chunks),
@@ -1468,7 +1459,7 @@ def render_segment_mp4(
     )
     chunks = chunks[:scene_count]
 
-    # Allocate per-scene seconds (SECTION 10 allocator)
+    # Allocate seconds to sum to target_seconds (best effort within bounds)
     scene_secs_int = _allocate_scene_seconds(
         int(target_seconds),
         int(scene_count),
@@ -1476,12 +1467,9 @@ def render_segment_mp4(
         max_scene=int(max_scene_seconds),
     )
 
-    # Hard enforce: sum equals target_seconds when possible (allocator best-effort)
-    # If allocator couldn't hit target due to tight bounds, we still proceed,
-    # but this clamp minimizes drift.
+    # Hard nudge to target if allocator couldn't hit it perfectly
     cur_sum = int(sum(scene_secs_int))
     if cur_sum > target_seconds:
-        # shave from the end down to min_scene_seconds
         overshoot = cur_sum - target_seconds
         for i in range(len(scene_secs_int) - 1, -1, -1):
             if overshoot <= 0:
@@ -1491,7 +1479,6 @@ def render_segment_mp4(
             scene_secs_int[i] -= take
             overshoot -= take
     elif cur_sum < target_seconds:
-        # add to the end up to max_scene_seconds
         need = target_seconds - cur_sum
         for i in range(len(scene_secs_int) - 1, -1, -1):
             if need <= 0:
@@ -1503,7 +1490,6 @@ def render_segment_mp4(
 
     scene_durs = [float(max(1, int(s))) for s in scene_secs_int]
 
-    # Work dirs
     base_dir = Path(str(extract_dir or "."))
     tmp_dir = base_dir / "_tmp_video"
     img_dir = base_dir / "_scene_images"
@@ -1515,9 +1501,7 @@ def render_segment_mp4(
     out_path = str(out_path)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # OpenAI client
     client = OpenAI(api_key=str(api_key))
-
     img_model = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1.5")
     img_size = _image_size_for_video(int(width), int(height))
 
@@ -1532,7 +1516,7 @@ def render_segment_mp4(
     clip_paths: List[str] = []
 
     for i, chunk in enumerate(chunks, start=1):
-        scene_prompt = style_prefix + f"Scene idea: {chunk}"
+        scene_prompt = style_prefix + "Scene idea: " + str(chunk)
         img_path = str(img_dir / f"scene_{i:03d}.png")
         clip_path = str(clip_dir / f"scene_{i:03d}.mp4")
 
@@ -1556,20 +1540,18 @@ def render_segment_mp4(
 
         clip_paths.append(clip_path)
 
-    # Concat into silent master
-    tmp_video = str(tmp_dir / f"tmp_{safe_slug(os.path.basename(out_path))}.mp4")
+    tmp_video = str(tmp_dir / ("tmp_" + safe_slug(os.path.basename(out_path)) + ".mp4"))
     _concat_scene_clips(clip_paths=clip_paths, out_path=tmp_video)
 
-    # Mux narration audio (your muxer is cutoff-safe; it also pads audio slightly)
     mux_audio(tmp_video, audio_path, out_path)
 
-    # Cleanup only the temporary concat master (keep images/clips for debugging)
     try:
         os.remove(tmp_video)
     except Exception:
         pass
 
     return out_path
+
 
 
 
