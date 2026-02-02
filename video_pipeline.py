@@ -1,5 +1,5 @@
 # ============================================================
-# video_pipeline.py — UAPpress Video Creator (CORRECTED)
+# video_pipeline.py — UAPpress Video Creator
 #
 # SECTION 1 — Core helpers + core render primitives
 # SECTION 2 — app.py compatibility layer
@@ -18,29 +18,32 @@
 #                        width=..., height=..., zoom_strength=..., max_scenes=...,
 #                        min_scene_seconds=..., max_scene_seconds=...) -> None
 #
-# Locked pipeline order:
-#   images -> scene clips -> concatenate -> mux audio (no black video)
+# Notes:
+# - No subtitles/logos; no stitching.
+# - Pipeline order: images -> scene clips -> concatenate -> mux audio (no black video).
+# - Audio-driven timing + end buffer ~0.5–0.75s (default 0.65s).
+# - Optional branding functions/classes exist for app.py detection:
+#     BrandIntroOutroSpec + generate_sora_brand_intro_outro(...)
+# - 9:16 is supported via width/height passed in from app.py.
 #
-# Audio-driven timing:
-#   end buffer ~0.5–0.75s (default 0.65s)
+# IMPORTANT:
+# - This file keeps external dependencies optional/guarded.
+# - Image generation uses OpenAI Images API when available; falls back to local placeholders
+#   if generation fails (to avoid crashing the whole pipeline).
 #
-# Branding helpers for app.py detection:
-#   BrandIntroOutroSpec + generate_sora_brand_intro_outro(...)
-#
-# IMPORTANT FIXES in this corrected version:
-#   1) ✅ Removes Cloud-breaking concat list f-string escaping risk (no SyntaxError)
-#   2) ✅ Fixes “same images across segments” by using a provably unique, stable
-#      per-segment cache key (hash of script/audio identity) instead of collapsing dirs.
-#   3) ✅ Default behavior: DO NOT reuse cached images across reruns unless explicitly enabled:
-#         set env UAPPRESS_REUSE_IMAGES=1 to reuse.
-#   4) ✅ Writes small debug breadcrumbs per segment image run (cache dir, source script/audio)
-#      to make future diagnosis obvious.
+# FIXES INCLUDED (per your issues):
+#   1) ffprobe missing on Streamlit Cloud: duration detection now falls back to parsing ffmpeg output
+#      if ffprobe isn't available.
+#   2) Repeated images across segments: cache key collisions fixed by using a stable per-file hash
+#      in pair['base_name'], so different segments never share the same image cache folder.
+#   3) Black video symptom: placeholders are still possible if image generation fails, but:
+#      - supported image sizes are used by default (gpt-image-1 friendly)
+#      - placeholders are a bit brighter (not near-black) so failures are visually obvious
 # ============================================================
 
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import io
 import json
 import math
@@ -52,8 +55,9 @@ import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
+from hashlib import sha1
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Optional deps (guarded)
 try:
@@ -83,17 +87,13 @@ _DEFAULT_END_BUFFER = 0.65
 _DEFAULT_FPS = 30
 
 # Image generation defaults (override via env if desired)
+# IMPORTANT: gpt-image-1 supports sizes like 1024x1024, 1536x1024, 1024x1536.
 _DEFAULT_IMAGE_MODEL = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1")
 _DEFAULT_IMAGE_SIZE_169 = os.environ.get("UAPPRESS_IMAGE_SIZE_169", "1536x1024")
 _DEFAULT_IMAGE_SIZE_916 = os.environ.get("UAPPRESS_IMAGE_SIZE_916", "1024x1536")
 
-# Cache reuse toggle:
-#   - Default OFF to guarantee segments do not share images and to make debugging honest.
-#   - Enable reuse (cheaper) only when you're sure cache keys are stable and correct.
-_REUSE_IMAGES = os.environ.get("UAPPRESS_REUSE_IMAGES", "").strip() == "1"
-
-# Debug breadcrumbs toggle (writes tiny JSON beside images)
-_DEBUG_IMAGES = os.environ.get("UAPPRESS_DEBUG_IMAGES", "").strip() != "0"
+# Cache version knob (bump if you ever want to invalidate all cached images)
+_IMAGE_CACHE_ROOT = os.environ.get("UAPPRESS_IMAGE_CACHE_ROOT", "_image_cache_v2")
 
 
 def clamp_float(x: float, lo: float, hi: float) -> float:
@@ -130,6 +130,14 @@ def safe_slug(text: str, max_len: int = 60) -> str:
     return s[:max_len].strip("-") or "untitled"
 
 
+def _stable_hash(s: str, n: int = 12) -> str:
+    """
+    Stable short hash for cache keys (prevents collisions across segments).
+    """
+    h = sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
+    return h[: max(6, int(n))]
+
+
 def ensure_dir(p: Union[str, Path]) -> Path:
     path = Path(p)
     path.mkdir(parents=True, exist_ok=True)
@@ -148,11 +156,12 @@ def which_ffmpeg() -> str:
     return "ffmpeg"
 
 
-def which_ffprobe() -> str:
+def which_ffprobe() -> Optional[str]:
     exe = shutil.which("ffprobe")
     if exe:
         return exe
-    return "ffprobe"
+    # Streamlit Cloud often doesn't have ffprobe. Return None so we can fall back.
+    return None
 
 
 def run_cmd(cmd: List[str]) -> None:
@@ -181,33 +190,67 @@ def run_ffmpeg(cmd: List[str]) -> None:
     run_cmd(cmd)
 
 
+def _parse_duration_from_ffmpeg_stderr(stderr_text: str) -> float:
+    """
+    Parse: Duration: 00:01:23.45 from ffmpeg -i output.
+    Returns seconds or 0.0 if not found.
+    """
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr_text or "")
+    if not m:
+        return 0.0
+    try:
+        hh = float(m.group(1))
+        mm = float(m.group(2))
+        ss = float(m.group(3))
+        return hh * 3600.0 + mm * 60.0 + ss
+    except Exception:
+        return 0.0
+
+
 def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
     """
-    Return media duration seconds using ffprobe (best-effort).
+    Return media duration seconds.
+
+    Primary: ffprobe if installed.
+    Fallback: ffmpeg -i <file> parse Duration line (works on Streamlit Cloud where ffprobe is missing).
     """
-    ffprobe = which_ffprobe()
     p = str(path)
-    proc = subprocess.run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            p,
-        ],
+
+    ffprobe = which_ffprobe()
+    if ffprobe:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                p,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode == 0:
+            try:
+                return float((proc.stdout or "").strip())
+            except Exception:
+                pass
+
+    # Fallback: ffmpeg -i parse stderr
+    ffmpeg = which_ffmpeg()
+    proc2 = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", p],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    if proc.returncode != 0:
-        return 0.0
-    try:
-        return float((proc.stdout or "").strip())
-    except Exception:
-        return 0.0
+    if proc2.returncode != 0:
+        # ffmpeg returns non-zero on -i without output often; stderr still contains Duration.
+        pass
+    return _parse_duration_from_ffmpeg_stderr(proc2.stderr or "")
 
 
 def clamp_scene_seconds(value: float, min_scene_s: float, max_scene_s: float) -> float:
@@ -219,13 +262,6 @@ def clamp_scene_seconds(value: float, min_scene_s: float, max_scene_s: float) ->
     if max_scene_s < min_scene_s:
         max_scene_s = min_scene_s
     return clamp_float(float(value), min_scene_s, max_scene_s)
-
-
-def _now_iso() -> str:
-    try:
-        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-    except Exception:
-        return ""
 
 
 # ----------------------------
@@ -275,14 +311,12 @@ def _download_openai_video_content(client: Any, content_id: str, out_path: Path)
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Preferred: app.py compat wrapper provides client.videos.content(video_id)
     try:
         data = client.videos.content(str(content_id))
         return _write_bytes_to_file(data, out_path)
     except Exception:
         pass
 
-    # Fallbacks for other SDK shapes
     try:
         if hasattr(client.videos, "download_content"):
             data = client.videos.download_content(str(content_id))
@@ -308,10 +342,6 @@ def generate_sora_brand_intro_outro(
     """
     app.py expects:
       intro_path, outro_path = generate_sora_brand_intro_outro(...)
-
-    Conservative Sora call:
-      resp = client.videos.generate(...)
-      then downloads returned content id.
     """
     out_dir = ensure_dir(out_dir)
     brand_slug = safe_slug(spec.brand_name or "brand", max_len=40)
@@ -321,13 +351,11 @@ def generate_sora_brand_intro_outro(
     intro_s = clamp_int(intro_s, 2, 20)
     outro_s = clamp_int(outro_s, 2, 20)
 
-    base_style = (spec.visual_style or "").strip()
-    if not base_style:
-        base_style = (
-            "Radar/FLIR surveillance aesthetic, monochrome/low-saturation, subtle scanlines, "
-            "HUD overlays, gridlines, bearing ticks, minimal telemetry numbers, soft glow, restrained film grain. "
-            "Slow camera drift. Serious investigative tone. No aliens, no monsters, no cheesy explosions."
-        )
+    base_style = (spec.visual_style or "").strip() or (
+        "Radar/FLIR surveillance aesthetic, monochrome/low-saturation, subtle scanlines, "
+        "HUD overlays, gridlines, bearing ticks, minimal telemetry numbers, soft glow, restrained film grain. "
+        "Slow camera drift. Serious investigative tone. No aliens, no monsters, no cheesy explosions."
+    )
 
     intro_prompt = (
         f"{base_style}\n\n"
@@ -386,7 +414,6 @@ def generate_sora_brand_intro_outro(
 
     intro_path = _gen_one(intro_prompt, intro_s, intro_reference_image, intro_out)
     outro_path = _gen_one(outro_prompt, outro_s, outro_reference_image, outro_out)
-
     return (str(intro_path), str(outro_path))
 
 
@@ -404,31 +431,20 @@ def _make_zoompan_filter(
     """
     Ken Burns style zoompan that avoids black edges:
       scale cover -> crop -> zoompan.
-
-    zoom_strength is expected ~[1.00, 1.20] from app.py.
     """
     frames = max(1, int(math.ceil(duration_s * fps)))
-
     zoom_target = clamp_float(float(zoom_strength), 1.0, 1.25)
     inc = (zoom_target - 1.0) / max(1, frames)
-    inc = max(0.00005, min(0.005, inc))  # stable bounds
+    inc = max(0.00005, min(0.005, inc))
 
-    zoom_expr = "min(zoom+{0},{1})".format(f"{inc:.6f}", f"{zoom_target:.4f}")
-    x_expr = "(iw-{0})/2".format(int(width))
-    y_expr = "(ih-{0})/2".format(int(height))
+    zoom_expr = f"min(zoom+{inc:.6f},{zoom_target:.4f})"
+    x_expr = f"(iw-{width})/2"
+    y_expr = f"(ih-{height})/2"
 
     vf = (
-        "scale={w}:{h}:force_original_aspect_ratio=increase,"
-        "crop={w}:{h},"
-        "zoompan=z='{z}':x='{x}':y='{y}':d={d}:s={w}x{h}:fps={fps}"
-    ).format(
-        w=int(width),
-        h=int(height),
-        z=zoom_expr,
-        x=x_expr,
-        y=y_expr,
-        d=int(frames),
-        fps=int(fps),
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},"
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={width}x{height}:fps={fps}"
     )
     return vf
 
@@ -455,34 +471,17 @@ def build_scene_clip_from_image(
     cmd = [
         ffmpeg,
         "-y",
-        "-loop",
-        "1",
-        "-i",
-        str(image_path),
-        "-t",
-        "{0:.3f}".format(float(duration_s)),
-        "-vf",
-        vf,
-        "-r",
-        str(int(fps)),
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
+        "-loop", "1",
+        "-i", str(image_path),
+        "-t", f"{float(duration_s):.3f}",
+        "-vf", vf,
+        "-r", str(int(fps)),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
         str(out_mp4_path),
     ]
     run_ffmpeg(cmd)
     return out_mp4_path
-
-
-def _ffmpeg_concat_escape(path_str: str) -> str:
-    """
-    Escape a path for ffmpeg concat demuxer list file.
-    We use single quotes around the path and escape internal single quotes.
-    """
-    # ffmpeg concat list uses: file '...'
-    # To include a single quote inside, close/open and escape: 'foo'\''bar'
-    return path_str.replace("'", "'\\''")
 
 
 def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Union[str, Path]) -> Path:
@@ -495,28 +494,21 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         list_path = td_path / "concat_list.txt"
-
         lines: List[str] = []
         for p in clip_paths:
             pth = Path(p)
-            esc = _ffmpeg_concat_escape(str(pth))
-            lines.append("file '{0}'".format(esc))
+            lines.append(f"file '{str(pth).replace(\"'\", \"'\\\\''\")}'")
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         ffmpeg = which_ffmpeg()
         cmd = [
             ffmpeg,
             "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_path),
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_path),
+            "-c", "copy",
+            "-movflags", "+faststart",
             str(out_mp4_path),
         ]
         run_ffmpeg(cmd)
@@ -544,28 +536,21 @@ def mux_audio_to_video(
     audio_dur = ffprobe_duration_seconds(audio_path)
     if audio_dur > 0:
         target = audio_dur + end_buffer_s
-        a_filter = "apad,atrim=0:{0:.3f}".format(target)
+        a_filter = f"apad,atrim=0:{target:.3f}"
     else:
-        a_filter = "apad=pad_dur={0:.3f}".format(end_buffer_s)
+        a_filter = f"apad=pad_dur={end_buffer_s:.3f}"
 
     cmd = [
         ffmpeg,
         "-y",
-        "-i",
-        str(video_path),
-        "-i",
-        str(audio_path),
-        "-filter:a",
-        a_filter,
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-filter:a", a_filter,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
         "-shortest",
-        "-movflags",
-        "+faststart",
+        "-movflags", "+faststart",
         str(out_mp4_path),
     ]
     run_ffmpeg(cmd)
@@ -591,8 +576,7 @@ def extract_zip_to_temp(zip_bytes_or_path: Union[bytes, str, Path]) -> Tuple[str
     ensure_dir(extract_dir)
 
     if isinstance(zip_bytes_or_path, (str, Path)):
-        zp = Path(zip_bytes_or_path)
-        data = zp.read_bytes()
+        data = Path(zip_bytes_or_path).read_bytes()
     else:
         data = bytes(zip_bytes_or_path)
 
@@ -631,10 +615,10 @@ def _guess_kind_from_name(name: str) -> str:
         return "OUTRO"
     m = re.search(r"(chapter|ch)[\s_\-]*0*(\d+)", n)
     if m:
-        return "CHAPTER {0}".format(int(m.group(2)))
+        return f"CHAPTER {int(m.group(2))}"
     m2 = re.search(r"\b0*(\d{1,2})\b", n)
     if m2 and ("chapter" in n or "ch_" in n or n.startswith("ch")):
-        return "CHAPTER {0}".format(int(m2.group(1)))
+        return f"CHAPTER {int(m2.group(1))}"
     return "SEGMENT"
 
 
@@ -675,12 +659,9 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
       - kind_guess (INTRO/OUTRO/CHAPTER X/SEGMENT)
       - chapter_no (optional int)
       - title_guess (best-effort)
-      - base_name (legacy; kept for compatibility / display)
+      - base_name (for stable ids / cache; MUST be unique to prevent image reuse)
     """
-    audio_by_stem: Dict[str, str] = {}
-    for a in audios:
-        audio_by_stem[Path(a).stem.lower()] = a
-
+    audio_by_stem: Dict[str, str] = {Path(a).stem.lower(): a for a in audios}
     pairs: List[Dict[str, Any]] = []
     used_audio: set[str] = set()
 
@@ -700,15 +681,9 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                 if stem and (stem in an or an in stem):
                     best = a
                     break
-            a_match = best
+            a_match = best or ""
 
-        if not a_match:
-            a_match = ""
-
-        if a_match and a_match in used_audio:
-            # allow reuse only if nothing else available
-            pass
-        if a_match:
+        if a_match and a_match not in used_audio:
             used_audio.add(a_match)
 
         kind = _guess_kind_from_name(sp.name)
@@ -725,6 +700,11 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                 title_guess = t[:120]
                 break
 
+        # FIX: unique base_name to prevent cache collisions across segments.
+        # Use absolute path + paired audio path (if any) for a stable unique hash.
+        uniq_seed = f"script:{str(sp.resolve())}|audio:{str(Path(a_match).resolve()) if a_match else ''}"
+        base_name = f"{stem}_{_stable_hash(uniq_seed, 12)}"
+
         pairs.append(
             {
                 "script_path": str(sp),
@@ -732,17 +712,22 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                 "kind_guess": kind,
                 "chapter_no": chapter_no,
                 "title_guess": title_guess,
-                "base_name": stem,  # legacy
+                "base_name": base_name,
             }
         )
 
+    # Also include "audio-only" files if any (rare) as segments
     script_stems = {Path(s).stem.lower() for s in scripts}
     for a in audios:
-        if Path(a).stem.lower() in script_stems:
-            continue
         ap = Path(a)
+        if ap.stem.lower() in script_stems:
+            continue
         kind = _guess_kind_from_name(ap.name)
         chapter_no = _guess_chapter_no(kind)
+
+        uniq_seed = f"audio_only:{str(ap.resolve())}"
+        base_name = f"{ap.stem.lower()}_{_stable_hash(uniq_seed, 12)}"
+
         pairs.append(
             {
                 "script_path": "",
@@ -750,7 +735,7 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                 "kind_guess": kind,
                 "chapter_no": chapter_no,
                 "title_guess": "",
-                "base_name": ap.stem.lower(),
+                "base_name": base_name,
             }
         )
 
@@ -770,7 +755,7 @@ def segment_label(pair: Dict[str, Any]) -> str:
             if m:
                 n = int(m.group(1))
         if n is not None:
-            return "CHAPTER {0}".format(int(n))
+            return f"CHAPTER {int(n)}"
         return "CHAPTER"
     if kind in ("INTRO", "OUTRO"):
         return kind
@@ -786,7 +771,7 @@ def segment_label(pair: Dict[str, Any]) -> str:
 
 
 # ----------------------------
-# Image generation (segment-scoped, FIXED)
+# Image generation (segment-scoped)
 # ----------------------------
 
 def _image_size_for_mode(width: int, height: int) -> str:
@@ -798,45 +783,40 @@ def _image_size_for_mode(width: int, height: int) -> str:
 def _make_placeholder_image(path: Path, width: int, height: int) -> None:
     """
     Local fallback if OpenAI image generation fails.
-    Creates a plain dark image (no text overlays).
+    Creates a plain image (no text overlays).
+    NOTE: slightly brighter than near-black so you can immediately see it's a placeholder.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if Image is None:
-        # Last resort: create a 1x1 PNG (ffmpeg will still scale/crop)
+        # Minimal valid PNG (1x1) fallback
         path.write_bytes(
             b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
             b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\nIDAT\x08\xd7c``\x00\x00\x00\x04\x00\x01"
-            b"\x0d\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+            b"\x0d\n\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
         )
         return
 
-    img = Image.new("RGB", (max(64, int(width)), max(64, int(height))), color=(12, 12, 12))
+    w = max(64, int(width))
+    h = max(64, int(height))
+    img = Image.new("RGB", (w, h), color=(40, 40, 40))
     img.save(path, format="PNG")
 
 
 def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     """
-    Attempts to generate a single image via OpenAI Images API.
+    Generate a single image via OpenAI Images API.
     Returns raw image bytes (PNG/JPG), or raises.
     """
     if OpenAI is None:
         raise RuntimeError("OpenAI SDK not available in this environment.")
     client = OpenAI(api_key=str(api_key))
 
-    # Prefer b64_json output; fall back if SDK doesn't support response_format.
-    try:
-        resp = client.images.generate(
-            model=_DEFAULT_IMAGE_MODEL,
-            prompt=prompt,
-            size=size,
-            response_format="b64_json",
-        )
-    except TypeError:
-        resp = client.images.generate(
-            model=_DEFAULT_IMAGE_MODEL,
-            prompt=prompt,
-            size=size,
-        )
+    resp = client.images.generate(
+        model=_DEFAULT_IMAGE_MODEL,
+        prompt=prompt,
+        size=size,
+        response_format="b64_json",
+    )
 
     data0 = None
     try:
@@ -863,7 +843,6 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         return base64.b64decode(b64)
 
     if url:
-        # We avoid fetching remote URLs here; fail over to placeholder upstream.
         raise RuntimeError("Image API returned URL-only output; URL fetch not supported in this pipeline.")
     raise RuntimeError("Image API returned neither b64_json nor url.")
 
@@ -901,92 +880,20 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[
             "Cinematic, realistic, restrained, credibility-first. "
             "No text, no logos, no subtitles, no watermarks. "
             "Moody lighting, archival / military / night-ops / radar / airbase / forest / coast as appropriate. "
-            "Scene context: {0}".format(snippet)
+            f"Scene context: {snippet}"
         )
-
     return prompts
-
-
-def _rel_to_extract(extract_dir: Union[str, Path], p: Union[str, Path]) -> str:
-    """
-    Best-effort path identity relative to extract_dir (stable across temp root).
-    """
-    try:
-        extract_dir = Path(extract_dir).resolve()
-        pp = Path(p).resolve()
-        return str(pp.relative_to(extract_dir)).replace("\\", "/")
-    except Exception:
-        return str(p).replace("\\", "/")
-
-
-def _segment_cache_key(extract_dir: Union[str, Path], pair: Dict[str, Any]) -> str:
-    """
-    FIX: Generate a stable, provably unique cache key per segment.
-    We use relative script/audio identity (plus kind/chapter) then hash.
-    """
-    kind = segment_label(pair)
-    ch = pair.get("chapter_no")
-    ch_s = "" if ch is None else str(int(ch))
-
-    sp = pair.get("script_path") or ""
-    ap = pair.get("audio_path") or ""
-
-    sp_rel = _rel_to_extract(extract_dir, sp) if sp else ""
-    ap_rel = _rel_to_extract(extract_dir, ap) if ap else ""
-
-    # Include filenames too for extra human readability
-    sp_name = Path(sp).name if sp else ""
-    ap_name = Path(ap).name if ap else ""
-
-    raw = "|".join([kind, ch_s, sp_rel, ap_rel, sp_name, ap_name]).strip()
-    if not raw:
-        raw = json.dumps(pair, sort_keys=True)
-
-    h = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
-    # Keep dir name short and filesystem-safe
-    label = kind.lower().replace(" ", "_")
-    return "{0}_{1}".format(label, h)
 
 
 def _segment_image_dir(extract_dir: Union[str, Path], pair: Dict[str, Any]) -> Path:
     """
-    Segment-scoped image directory (FIXED).
+    Segment-scoped image directory to prevent cross-segment reuse.
+    base_name is already collision-safe (hashed) from pair_segments().
     """
     extract_dir = Path(extract_dir)
-    key = _segment_cache_key(extract_dir, pair)
-    return ensure_dir(extract_dir / "_image_cache" / key)
-
-
-def _write_image_debug(img_dir: Path, info: Dict[str, Any]) -> None:
-    if not _DEBUG_IMAGES:
-        return
-    try:
-        p = img_dir / "debug.json"
-        info2 = dict(info)
-        info2["updated_at"] = _now_iso()
-        p.write_text(json.dumps(info2, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _clear_dir_contents(dir_path: Path, patterns: Optional[List[str]] = None) -> None:
-    """
-    Delete files in a directory (used to avoid reusing cached images unless enabled).
-    """
-    try:
-        if not dir_path.exists():
-            return
-        if patterns is None:
-            patterns = ["*.png", "*.jpg", "*.jpeg", "*.webp"]
-        for pat in patterns:
-            for p in dir_path.glob(pat):
-                try:
-                    if p.is_file():
-                        p.unlink()
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    base = safe_slug(str(pair.get("base_name") or "segment"), max_len=80)
+    label = segment_label(pair).lower().replace(" ", "_")
+    return ensure_dir(extract_dir / _IMAGE_CACHE_ROOT / f"{label}_{base}")
 
 
 def _generate_segment_images(
@@ -1000,67 +907,28 @@ def _generate_segment_images(
 ) -> List[Path]:
     """
     Generate (or reuse cached) images for this segment.
-
-    FIXED behavior:
-      - Cache dir is truly segment-unique (hash key).
-      - Default: do NOT reuse cached images (prevents “same images across segments”
-        and avoids stale reuse during testing).
-      - Enable reuse only with env UAPPRESS_REUSE_IMAGES=1.
+    Uses a segment-specific cache folder to avoid shared images across segments.
     """
     img_dir = _segment_image_dir(extract_dir, pair)
     size = _image_size_for_mode(int(width), int(height))
-    max_scenes = max(1, int(max_scenes))
 
-    if not _REUSE_IMAGES:
-        # Ensure we never accidentally reuse old images during testing.
-        _clear_dir_contents(img_dir)
-
-    existing = sorted([p for p in img_dir.glob("*.png") if p.is_file()])
-    if existing and _REUSE_IMAGES:
-        _write_image_debug(
-            img_dir,
-            {
-                "mode": "reuse",
-                "cache_dir": str(img_dir),
-                "segment_label": segment_label(pair),
-                "script_path": str(pair.get("script_path") or ""),
-                "audio_path": str(pair.get("audio_path") or ""),
-                "image_count": len(existing),
-                "size": size,
-                "max_scenes": max_scenes,
-            },
-        )
-        return existing[:max_scenes]
+    existing = sorted([p for p in img_dir.glob("scene_*.png") if p.is_file()])
+    if existing:
+        return existing[: max(1, int(max_scenes))]
 
     script_path = str(pair.get("script_path") or "")
     script_text = _read_text_preview(script_path, max_chars=12000) if script_path else ""
-    prompts = _build_scene_prompts_from_script(script_text, max_scenes=max_scenes) if script_text else []
+    prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes)) if script_text else []
 
     if not prompts:
         prompts = [
             "Cinematic documentary still, restrained investigative tone, no text, no logos, no subtitles. "
             "UAP investigation mood: night sky, distant lights, radar room, airbase perimeter, forest trail."
-        ] * max(3, min(8, max_scenes))
-
-    _write_image_debug(
-        img_dir,
-        {
-            "mode": "generate",
-            "cache_dir": str(img_dir),
-            "segment_label": segment_label(pair),
-            "script_path": script_path,
-            "audio_path": str(pair.get("audio_path") or ""),
-            "size": size,
-            "max_scenes": max_scenes,
-            "prompt_count": len(prompts),
-            "prompt_preview": prompts[:2],
-            "reuse_enabled": _REUSE_IMAGES,
-        },
-    )
+        ] * max(3, min(8, int(max_scenes)))
 
     images: List[Path] = []
-    for i, prompt in enumerate(prompts[:max_scenes], start=1):
-        out = img_dir / "scene_{0:03d}.png".format(i)
+    for i, prompt in enumerate(prompts, start=1):
+        out = img_dir / f"scene_{i:03d}.png"
         try:
             data = _openai_generate_image_bytes(str(api_key), prompt, size)
             out.write_bytes(data)
@@ -1090,8 +958,6 @@ def render_segment_mp4(
     max_scene_seconds: int,
 ) -> None:
     """
-    Exact call signature app.py uses.
-
     Locked pipeline:
       generate images -> build scene clips -> concatenate -> mux audio
 
@@ -1113,7 +979,7 @@ def render_segment_mp4(
 
     audio_seconds = ffprobe_duration_seconds(audio_p)
 
-    # Determine target scene count based on audio length and clamp window
+    # Choose a good scene count for pacing
     if audio_seconds <= 0:
         target_scenes = clamp_int(int(max_scenes), 3, int(max_scenes))
     else:
@@ -1129,7 +995,6 @@ def render_segment_mp4(
         height=int(height),
         max_scenes=int(target_scenes),
     )
-
     if not images:
         raise RuntimeError("Image generation produced zero images (unexpected).")
 
@@ -1138,18 +1003,17 @@ def render_segment_mp4(
 
     if audio_seconds <= 0:
         per = clamp_scene_seconds(5.0, float(min_s), float(max_s))
-        scene_seconds = [per for _ in images]
     else:
-        per = audio_seconds / float(len(images))
-        per = clamp_scene_seconds(per, float(min_s), float(max_s))
-        scene_seconds = [per for _ in images]
+        per = clamp_scene_seconds(audio_seconds / float(len(images)), float(min_s), float(max_s))
+
+    scene_seconds = [float(per) for _ in images]
 
     seg_slug = safe_slug(str(pair.get("title_guess") or segment_label(pair) or "segment"), max_len=48)
-    clips_dir = ensure_dir(out_path_p.parent / "_{0}_clips".format(seg_slug))
+    clips_dir = ensure_dir(out_path_p.parent / f"_{seg_slug}_clips")
 
     clip_paths: List[Path] = []
     for idx, (img, dur) in enumerate(zip(images, scene_seconds), start=1):
-        clip_out = clips_dir / "scene_{0:03d}.mp4".format(idx)
+        clip_out = clips_dir / f"scene_{idx:03d}.mp4"
         clip_paths.append(
             build_scene_clip_from_image(
                 image_path=img,
@@ -1162,7 +1026,7 @@ def render_segment_mp4(
             )
         )
 
-    concat_path = out_path_p.parent / "_{0}_concat.mp4".format(seg_slug)
+    concat_path = out_path_p.parent / f"_{seg_slug}_concat.mp4"
     concat_video_clips(clip_paths, concat_path)
 
     mux_audio_to_video(
