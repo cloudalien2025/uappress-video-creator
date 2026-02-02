@@ -497,7 +497,8 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
         lines: List[str] = []
         for p in clip_paths:
             pth = Path(p)
-            lines.append(f"file '{str(pth).replace(\"'\", \"'\\\\''\")}'")
+            path_str = str(pth).replace("'", "'\\\\''")
+            lines.append("file '" + path_str + "'")
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         ffmpeg = which_ffmpeg()
