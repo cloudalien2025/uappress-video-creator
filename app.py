@@ -1553,8 +1553,8 @@ if uploaded_bonus:
 
 
 # Build upload-only dropdown options (scan _bonus_uploads on every rerun; no caching).
-bonus_dir.mkdir(parents=True, exist_ok=True)
-bonus_names = sorted([p.name for p in bonus_dir.glob("*.mp4")])
+bonus_path = Path(bonus_dir)  # bonus_dir is a str path from _bonus_upload_dir()
+bonus_names = sorted([p.name for p in bonus_path.glob("*.mp4")])
 
 colS1, colS2, colS3 = st.columns([1, 1, 1])
 
