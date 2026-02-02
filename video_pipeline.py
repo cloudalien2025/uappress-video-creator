@@ -460,37 +460,22 @@ def build_scene_clip_from_image(
 ) -> Path:
     """
     Turn a single image into a short MP4 scene clip (no audio).
-
-    Key stability goals:
-    - Always encode H.264 + yuv420p (widest compatibility; avoids "black video" playback edge cases).
-    - Use -tune stillimage for cleaner quality at lower bitrate.
     """
     image_path = Path(image_path)
     out_mp4_path = Path(out_mp4_path)
     out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
 
-    dur = max(0.05, float(duration_s))
-    vf = _make_zoompan_filter(int(width), int(height), dur, int(fps), float(zoom_strength))
+    vf = _make_zoompan_filter(width, height, float(duration_s), int(fps), float(zoom_strength))
     ffmpeg = which_ffmpeg()
 
-    # NOTE:
-    # - We intentionally re-encode every scene clip to a known-good baseline.
-    # - This makes concatenation reliable and prevents codec/pix_fmt mismatches.
     cmd = [
         ffmpeg,
         "-y",
-        "-hide_banner",
-        "-loglevel",
-        os.environ.get("UAPPRESS_FFMPEG_LOGLEVEL", "error"),
         "-loop", "1",
         "-i", str(image_path),
-        "-t", f"{dur:.3f}",
+        "-t", f"{float(duration_s):.3f}",
         "-vf", vf,
         "-r", str(int(fps)),
-        "-c:v", "libx264",
-        "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
-        "-crf", os.environ.get("UAPPRESS_X264_CRF", "18"),
-        "-tune", "stillimage",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(out_mp4_path),
@@ -498,54 +483,38 @@ def build_scene_clip_from_image(
     run_ffmpeg(cmd)
     return out_mp4_path
 
+
 def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Union[str, Path]) -> Path:
     """
-    Concatenate MP4 clips (video only).
-
-    Why we re-encode (instead of -c copy):
-    - concat demuxer + stream copy is fragile if *anything* differs between clips
-      (timebase, encoder params, metadata). That can yield hard-to-debug playback issues,
-      including "black video" in some players.
-    - Re-encoding produces a deterministic, widely compatible result.
-
-    The clips are short and already H.264; this re-encode is usually fast.
+    Concatenate MP4 clips (video only) using concat demuxer.
     """
     out_mp4_path = Path(out_mp4_path)
     out_mp4_path.parent.mkdir(parents=True, exist_ok=True)
-
-    clip_paths = [Path(p) for p in clip_paths if p]
-    if not clip_paths:
-        raise RuntimeError("No clip paths provided to concat_video_clips().")
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         list_path = td_path / "concat_list.txt"
         lines: List[str] = []
-        for pth in clip_paths:
-            safe = str(pth).replace("'", "'\\''")
-            lines.append(f"file '{safe}'")
+        for p in clip_paths:
+            pth = Path(p)
+            lines.append(f"file '{str(pth).replace(\"'\", \"'\\\\''\")}'")
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         ffmpeg = which_ffmpeg()
         cmd = [
             ffmpeg,
             "-y",
-            "-hide_banner",
-            "-loglevel",
-            os.environ.get("UAPPRESS_FFMPEG_LOGLEVEL", "error"),
             "-f", "concat",
             "-safe", "0",
             "-i", str(list_path),
-            "-c:v", "libx264",
-            "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
-            "-crf", os.environ.get("UAPPRESS_X264_CRF", "18"),
-            "-pix_fmt", "yuv420p",
+            "-c", "copy",
             "-movflags", "+faststart",
             str(out_mp4_path),
         ]
         run_ffmpeg(cmd)
 
     return out_mp4_path
+
 
 def mux_audio_to_video(
     video_path: Union[str, Path],
@@ -554,12 +523,7 @@ def mux_audio_to_video(
     end_buffer_s: float = _DEFAULT_END_BUFFER,
 ) -> Path:
     """
-    Mux narration audio to the concatenated video, audio-driven with a small end buffer.
-
-    Stability goals:
-    - Explicit stream mapping (avoid accidentally selecting a cover-art stream, etc.).
-    - Re-encode video to baseline H.264/yuv420p to maximize player compatibility.
-    - Audio padded + trimmed to (audio_duration + end_buffer) with a tight buffer (~0.5–0.75s).
+    Mux narration audio to the concatenated video, audio-driven with small end buffer.
     """
     video_path = Path(video_path)
     audio_path = Path(audio_path)
@@ -574,24 +538,15 @@ def mux_audio_to_video(
         target = audio_dur + end_buffer_s
         a_filter = f"apad,atrim=0:{target:.3f}"
     else:
-        # If duration unknown, still pad a little so we don't clip abruptly.
         a_filter = f"apad=pad_dur={end_buffer_s:.3f}"
 
     cmd = [
         ffmpeg,
         "-y",
-        "-hide_banner",
-        "-loglevel",
-        os.environ.get("UAPPRESS_FFMPEG_LOGLEVEL", "error"),
         "-i", str(video_path),
         "-i", str(audio_path),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
         "-filter:a", a_filter,
-        "-c:v", "libx264",
-        "-preset", os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
-        "-crf", os.environ.get("UAPPRESS_X264_CRF", "18"),
-        "-pix_fmt", "yuv420p",
+        "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
         "-shortest",
@@ -600,6 +555,15 @@ def mux_audio_to_video(
     ]
     run_ffmpeg(cmd)
     return out_mp4_path
+
+
+# ============================================================
+# SECTION 2 — app.py compatibility: ZIP, pairing, rendering shim
+# ============================================================
+
+_SCRIPT_EXTS = {".txt", ".md", ".json"}
+_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+
 
 def extract_zip_to_temp(zip_bytes_or_path: Union[bytes, str, Path]) -> Tuple[str, str]:
     """
@@ -689,129 +653,38 @@ def _read_text_preview(path: Union[str, Path], max_chars: int = 2400) -> str:
 
 def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]:
     """
-    Pair scripts to audio files robustly.
-
-    app.py requires that every returned pair has a valid audio_path, because it will
-    call render_segment_mp4(pair=...) for every segment.
-
-    Matching strategy:
-    1) Exact stem match (case-insensitive)
-    2) Normalized match (remove common tokens/punctuation)
-    3) Chapter/intro/outro semantic match
-    4) Best fuzzy overlap score
-    5) If still ambiguous and there is exactly one unused audio left, assign it
-       (better than returning an unusable segment).
-
-    Returned dict keys:
+    app.py expects a list of dicts (pair objects). We include keys:
       - script_path
-      - audio_path  (ALWAYS non-empty)
-      - kind_guess
-      - chapter_no
-      - title_guess
-      - base_name   (collision-safe id for image cache)
+      - audio_path
+      - kind_guess (INTRO/OUTRO/CHAPTER X/SEGMENT)
+      - chapter_no (optional int)
+      - title_guess (best-effort)
+      - base_name (for stable ids / cache; MUST be unique to prevent image reuse)
     """
-    def _norm(s: str) -> str:
-        s = (s or "").lower().strip()
-        s = s.replace("&", "and")
-        # Drop common junk tokens that often appear in exports
-        s = re.sub(r"\b(uappress|tts|studio|audio|narration|voice|final|master|export|segment)\b", "", s)
-        s = re.sub(r"[^a-z0-9]+", "", s)
-        return s
-
-    def _tokenize(s: str) -> List[str]:
-        s = (s or "").lower()
-        s = re.sub(r"[^a-z0-9]+", " ", s).strip()
-        toks = [t for t in s.split() if t]
-        # Remove common junk tokens
-        junk = {"uappress","tts","studio","audio","narration","voice","final","master","export","segment"}
-        return [t for t in toks if t not in junk]
-
-    # Index audio by exact and normalized stems
     audio_by_stem: Dict[str, str] = {Path(a).stem.lower(): a for a in audios}
-    audio_by_norm: Dict[str, List[str]] = {}
-    for a in audios:
-        audio_by_norm.setdefault(_norm(Path(a).stem), []).append(a)
-
-    used_audio: set[str] = set()
     pairs: List[Dict[str, Any]] = []
-
-    # Pre-tokenize audios for fuzzy scoring
-    audio_tokens: Dict[str, set[str]] = {a: set(_tokenize(Path(a).stem)) for a in audios}
-
-    def _pick_best_audio(script_path: Path) -> Optional[str]:
-        stem = script_path.stem.lower()
-        norm_stem = _norm(stem)
-
-        # 1) Exact stem
-        cand = audio_by_stem.get(stem)
-        if cand and cand not in used_audio:
-            return cand
-
-        # 2) Normalized stem
-        cands = [c for c in audio_by_norm.get(norm_stem, []) if c not in used_audio]
-        if len(cands) == 1:
-            return cands[0]
-
-        # 3) Semantic match for intro/outro/chapter
-        kind = _guess_kind_from_name(script_path.name)
-        kind_u = kind.upper()
-        if kind_u in ("INTRO", "OUTRO"):
-            for a in audios:
-                if a in used_audio:
-                    continue
-                if kind_u.lower() in Path(a).name.lower():
-                    return a
-
-        chap = _guess_chapter_no(kind)
-        if chap is not None:
-            # Prefer audio with same chapter number
-            pat = re.compile(rf"(chapter|ch)[\s_\-]*0*{int(chap)}\b", re.I)
-            matches = [a for a in audios if a not in used_audio and pat.search(Path(a).stem)]
-            if len(matches) == 1:
-                return matches[0]
-
-        # 4) Fuzzy token overlap score
-        stoks = set(_tokenize(stem))
-        best_a = None
-        best_score = -1.0
-        for a in audios:
-            if a in used_audio:
-                continue
-            atoks = audio_tokens.get(a, set())
-            if not stoks and not atoks:
-                continue
-            inter = len(stoks & atoks)
-            union = len(stoks | atoks) or 1
-            score = inter / union
-            # Bonus if one stem contains the other (normalized)
-            an = _norm(Path(a).stem)
-            if norm_stem and (norm_stem in an or an in norm_stem):
-                score += 0.2
-            if score > best_score:
-                best_score = score
-                best_a = a
-
-        if best_a and best_score >= 0.20:
-            return best_a
-
-        return None
+    used_audio: set[str] = set()
 
     for s in scripts:
         sp = Path(s)
+        stem = sp.stem.lower()
 
-        a_match = _pick_best_audio(sp)
+        a_match = audio_by_stem.get(stem)
 
-        # 5) If still nothing, but exactly one unused audio remains, use it.
         if not a_match:
-            remaining = [a for a in audios if a not in used_audio]
-            if len(remaining) == 1:
-                a_match = remaining[0]
+            best = None
+            for a in audios:
+                an = Path(a).stem.lower()
+                if an == stem:
+                    best = a
+                    break
+                if stem and (stem in an or an in stem):
+                    best = a
+                    break
+            a_match = best or ""
 
-        # If we still have no audio, skip this script (can't render)
-        if not a_match:
-            continue
-
-        used_audio.add(a_match)
+        if a_match and a_match not in used_audio:
+            used_audio.add(a_match)
 
         kind = _guess_kind_from_name(sp.name)
         chapter_no = _guess_chapter_no(kind)
@@ -827,9 +700,10 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                 title_guess = t[:120]
                 break
 
-        # Collision-safe base_name for image cache folder
-        uniq_seed = f"script:{str(sp.resolve())}|audio:{str(Path(a_match).resolve())}"
-        base_name = f"{sp.stem.lower()}_{_stable_hash(uniq_seed, 12)}"
+        # FIX: unique base_name to prevent cache collisions across segments.
+        # Use absolute path + paired audio path (if any) for a stable unique hash.
+        uniq_seed = f"script:{str(sp.resolve())}|audio:{str(Path(a_match).resolve()) if a_match else ''}"
+        base_name = f"{stem}_{_stable_hash(uniq_seed, 12)}"
 
         pairs.append(
             {
@@ -842,15 +716,18 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
             }
         )
 
-    # Also include audio-only files that were not used (rare)
+    # Also include "audio-only" files if any (rare) as segments
+    script_stems = {Path(s).stem.lower() for s in scripts}
     for a in audios:
-        if a in used_audio:
-            continue
         ap = Path(a)
+        if ap.stem.lower() in script_stems:
+            continue
         kind = _guess_kind_from_name(ap.name)
         chapter_no = _guess_chapter_no(kind)
+
         uniq_seed = f"audio_only:{str(ap.resolve())}"
         base_name = f"{ap.stem.lower()}_{_stable_hash(uniq_seed, 12)}"
+
         pairs.append(
             {
                 "script_path": "",
@@ -863,6 +740,7 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
         )
 
     return pairs
+
 
 def segment_label(pair: Dict[str, Any]) -> str:
     """
@@ -920,7 +798,7 @@ def _make_placeholder_image(path: Path, width: int, height: int) -> None:
 
     w = max(64, int(width))
     h = max(64, int(height))
-    img = Image.new("RGB", (w, h), color=(70, 70, 70))
+    img = Image.new("RGB", (w, h), color=(40, 40, 40))
     img.save(path, format="PNG")
 
 
