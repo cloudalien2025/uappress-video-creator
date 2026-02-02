@@ -1157,8 +1157,8 @@ def finalize_video_output(
 # - Creates a simple black video at (width x height) and duration ~= narration duration (+ pad)
 # - Muxes narration audio onto it using mux_audio() (which avoids cutting narration)
 #
-# Later you can upgrade this to your full scene/image pipeline, but this unblocks the app
-# and allows Intro/Chapters/Outro MP4s + DO Spaces upload to work end-to-end.
+# ✅ FIX (Streamlit Cloud stability):
+# - Add x264 preset "ultrafast" to reduce CPU and prevent crashes during encoding.
 
 def _make_placeholder_video(
     *,
@@ -1192,6 +1192,9 @@ def _make_placeholder_video(
             f"{seconds:.3f}",
             "-c:v",
             "libx264",
+            # ✅ Fix: cloud-robust encode
+            "-preset",
+            "ultrafast",
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -1236,6 +1239,7 @@ def render_segment_mp4(
 
     # Determine duration from narration audio
     dur = get_media_duration_seconds(audio_path)
+
     # Add a small pad so the video is never microscopically shorter than audio
     # (mux_audio already pads audio too, but this keeps timelines stable)
     dur_padded = max(3.0, float(dur) + 2.0)
@@ -1263,4 +1267,5 @@ def render_segment_mp4(
         pass
 
     return out_path
+
 
