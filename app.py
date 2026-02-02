@@ -633,6 +633,78 @@ def _generate_global_brand_clips(
 
 # SECTION 6 — Segment MP4 Generation (Sequential, Crash-Safe) + Auto-upload
 # ----------------------------
+def _render_segment_mp4_compat(
+    *,
+    pair: dict,
+    extract_dir: str,
+    out_path: str,
+    api_key: str,
+    fps: int,
+    width: int,
+    height: int,
+    zoom_strength: float,
+    max_scenes: int,
+    min_scene_seconds: int,
+    max_scene_seconds: int,
+) -> None:
+    """
+    Compatibility wrapper:
+    Your app.py was calling vp.render_segment_mp4(), but your deployed video_pipeline.py
+    does not expose that symbol (AttributeError).
+
+    This wrapper tries a few likely function names if they exist, otherwise raises a
+    clear error that tells you exactly what’s missing.
+    """
+    candidates = [
+        "render_segment_mp4",
+        "render_segment_video",
+        "render_segment",
+        "build_segment_mp4",
+        "make_segment_mp4",
+        "generate_segment_mp4",
+    ]
+
+    fn = None
+    used_name = ""
+    for name in candidates:
+        if hasattr(vp, name) and callable(getattr(vp, name)):
+            fn = getattr(vp, name)
+            used_name = name
+            break
+
+    if fn is None:
+        # Show helpful diagnostics right in the Streamlit log
+        available = sorted([n for n in dir(vp) if "render" in n.lower() or "segment" in n.lower()])
+        raise AttributeError(
+            "video_pipeline is missing a segment render function. "
+            "app.py expects something like render_segment_mp4(). "
+            f"Tried: {', '.join(candidates)}. "
+            f"Found similar names: {available[:40]}"
+        )
+
+    # Call the discovered function.
+    # We pass keyword args that match the signature you were using.
+    # If the underlying function is older/different, it may throw TypeError (which is fine;
+    # that will surface and tell us exactly what signature it expects).
+    result = fn(
+        pair=pair,
+        extract_dir=extract_dir,
+        out_path=out_path,
+        api_key=str(api_key),
+        fps=int(fps),
+        width=int(width),
+        height=int(height),
+        zoom_strength=float(zoom_strength),
+        max_scenes=int(max_scenes),
+        min_scene_seconds=int(min_scene_seconds),
+        max_scene_seconds=int(max_scene_seconds),
+    )
+
+    # If the underlying function returns a path, we ignore it because out_path is authoritative.
+    # (But leaving this here avoids “unused variable” confusion during debugging.)
+    _ = result
+
+
 def generate_all_segments_sequential(
     *,
     segments: list,
@@ -732,7 +804,8 @@ def generate_all_segments_sequential(
 
         t0 = time.time()
         try:
-            vp.render_segment_mp4(
+            # ✅ FIX: use a compatibility wrapper instead of calling a missing symbol
+            _render_segment_mp4_compat(
                 pair=seg["pair"],
                 extract_dir=extract_dir,
                 out_path=out_path,
@@ -794,7 +867,6 @@ def generate_all_segments_sequential(
         progress.progress(min(1.0, i / n))
 
     _reset_gen_flags()
-
 
 # SECTION 7 — UI (Generate + Branding + Results + Previews + Logs)
 # ----------------------------
