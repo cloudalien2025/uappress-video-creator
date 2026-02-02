@@ -1,5 +1,5 @@
 # ============================================================
-# video_pipeline.py — UAPpress Video Creator
+# video_pipeline.py — UAPpress Video Creator (CORRECTED)
 #
 # SECTION 1 — Core helpers + core render primitives
 # SECTION 2 — app.py compatibility layer
@@ -18,23 +18,29 @@
 #                        width=..., height=..., zoom_strength=..., max_scenes=...,
 #                        min_scene_seconds=..., max_scene_seconds=...) -> None
 #
-# Notes:
-# - No subtitles/logos; no stitching.
-# - Pipeline order: images -> scene clips -> concatenate -> mux audio (no black video).
-# - Audio-driven timing + end buffer ~0.5–0.75s (default 0.65s).
-# - Optional branding functions/classes exist for app.py detection:
-#     BrandIntroOutroSpec + generate_sora_brand_intro_outro(...)
-# - 9:16 is supported via width/height passed in from app.py.
+# Locked pipeline order:
+#   images -> scene clips -> concatenate -> mux audio (no black video)
 #
-# IMPORTANT:
-# - This file intentionally keeps external dependencies optional/guarded.
-# - Image generation uses OpenAI Images API when available; falls back to local placeholders
-#   if generation fails (to avoid crashing the whole pipeline).
+# Audio-driven timing:
+#   end buffer ~0.5–0.75s (default 0.65s)
+#
+# Branding helpers for app.py detection:
+#   BrandIntroOutroSpec + generate_sora_brand_intro_outro(...)
+#
+# IMPORTANT FIXES in this corrected version:
+#   1) ✅ Removes Cloud-breaking concat list f-string escaping risk (no SyntaxError)
+#   2) ✅ Fixes “same images across segments” by using a provably unique, stable
+#      per-segment cache key (hash of script/audio identity) instead of collapsing dirs.
+#   3) ✅ Default behavior: DO NOT reuse cached images across reruns unless explicitly enabled:
+#         set env UAPPRESS_REUSE_IMAGES=1 to reuse.
+#   4) ✅ Writes small debug breadcrumbs per segment image run (cache dir, source script/audio)
+#      to make future diagnosis obvious.
 # ============================================================
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import io
 import json
 import math
@@ -81,9 +87,13 @@ _DEFAULT_IMAGE_MODEL = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1")
 _DEFAULT_IMAGE_SIZE_169 = os.environ.get("UAPPRESS_IMAGE_SIZE_169", "1024x576")
 _DEFAULT_IMAGE_SIZE_916 = os.environ.get("UAPPRESS_IMAGE_SIZE_916", "576x1024")
 
-# When the OpenAI Images API returns b64 JSON vs a URL, we handle both
-# but we do NOT fetch remote URLs here (no network tools); we prefer b64.
-# If URL-only responses occur, we raise a clear error and fall back.
+# Cache reuse toggle:
+#   - Default OFF to guarantee segments do not share images and to make debugging honest.
+#   - Enable reuse (cheaper) only when you're sure cache keys are stable and correct.
+_REUSE_IMAGES = os.environ.get("UAPPRESS_REUSE_IMAGES", "").strip() == "1"
+
+# Debug breadcrumbs toggle (writes tiny JSON beside images)
+_DEBUG_IMAGES = os.environ.get("UAPPRESS_DEBUG_IMAGES", "").strip() != "0"
 
 
 def clamp_float(x: float, lo: float, hi: float) -> float:
@@ -142,7 +152,6 @@ def which_ffprobe() -> str:
     exe = shutil.which("ffprobe")
     if exe:
         return exe
-    # No imageio ffprobe helper; fall back.
     return "ffprobe"
 
 
@@ -212,6 +221,13 @@ def clamp_scene_seconds(value: float, min_scene_s: float, max_scene_s: float) ->
     return clamp_float(float(value), min_scene_s, max_scene_s)
 
 
+def _now_iso() -> str:
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    except Exception:
+        return ""
+
+
 # ----------------------------
 # Branding API (app.py compat)
 # ----------------------------
@@ -236,7 +252,6 @@ class BrandIntroOutroSpec:
     sponsor_line: Optional[str] = None
     aspect: str = "landscape"  # "landscape" or "portrait"
     global_mode: bool = True
-    # Extra vendor knobs without signature breakage
     extra: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
@@ -294,11 +309,9 @@ def generate_sora_brand_intro_outro(
     app.py expects:
       intro_path, outro_path = generate_sora_brand_intro_outro(...)
 
-    This function attempts a conservative Sora call:
+    Conservative Sora call:
       resp = client.videos.generate(...)
       then downloads returned content id.
-
-    If your SDK/model params differ, adjust inside try-block only.
     """
     out_dir = ensure_dir(out_dir)
     brand_slug = safe_slug(spec.brand_name or "brand", max_len=40)
@@ -308,15 +321,14 @@ def generate_sora_brand_intro_outro(
     intro_s = clamp_int(intro_s, 2, 20)
     outro_s = clamp_int(outro_s, 2, 20)
 
-    # Build prompts (keep them stable + restrained)
     base_style = (spec.visual_style or "").strip()
-    base_style = base_style or (
-        "Radar/FLIR surveillance aesthetic, monochrome/low-saturation, subtle scanlines, "
-        "HUD overlays, gridlines, bearing ticks, minimal telemetry numbers, soft glow, restrained film grain. "
-        "Slow camera drift. Serious investigative tone. No aliens, no monsters, no cheesy explosions."
-    )
+    if not base_style:
+        base_style = (
+            "Radar/FLIR surveillance aesthetic, monochrome/low-saturation, subtle scanlines, "
+            "HUD overlays, gridlines, bearing ticks, minimal telemetry numbers, soft glow, restrained film grain. "
+            "Slow camera drift. Serious investigative tone. No aliens, no monsters, no cheesy explosions."
+        )
 
-    # Keep text guidance minimal; typography is allowed in the creative but app.py wants clean, readable
     intro_prompt = (
         f"{base_style}\n\n"
         f"GLOBAL channel intro bumper for {spec.brand_name}. "
@@ -338,11 +350,9 @@ def generate_sora_brand_intro_outro(
     outro_out = out_dir / f"{brand_slug}_outro_tmp.mp4"
 
     def _gen_one(prompt: str, duration_s: int, ref_img: Optional[str], dst: Path) -> Path:
-        # This call shape may differ per SDK. Keep it isolated in one try.
         try:
             kwargs: Dict[str, Any] = {}
             if ref_img:
-                # Some SDKs accept reference_image; if unsupported it will TypeError -> handled.
                 kwargs["reference_image"] = ref_img
 
             resp = client.videos.generate(
@@ -360,7 +370,6 @@ def generate_sora_brand_intro_outro(
                 raise RuntimeError("Sora generate did not return a content id.")
             return _download_openai_video_content(client, str(content_id), dst)
         except TypeError:
-            # Retry without any optional kwargs (like reference_image)
             resp = client.videos.generate(
                 model=model,
                 prompt=prompt,
@@ -400,22 +409,26 @@ def _make_zoompan_filter(
     """
     frames = max(1, int(math.ceil(duration_s * fps)))
 
-    # Bound zoom target to avoid insane values
     zoom_target = clamp_float(float(zoom_strength), 1.0, 1.25)
-
-    # We move from 1.0 to zoom_target slowly; expression increments per frame.
-    # Approx increment: (zoom_target - 1.0) / frames
     inc = (zoom_target - 1.0) / max(1, frames)
-    inc = max(0.00005, min(0.005, inc))  # keep stable
+    inc = max(0.00005, min(0.005, inc))  # stable bounds
 
-    zoom_expr = f"min(zoom+{inc:.6f},{zoom_target:.4f})"
-    x_expr = f"(iw-{width})/2"
-    y_expr = f"(ih-{height})/2"
+    zoom_expr = "min(zoom+{0},{1})".format(f"{inc:.6f}", f"{zoom_target:.4f}")
+    x_expr = "(iw-{0})/2".format(int(width))
+    y_expr = "(ih-{0})/2".format(int(height))
 
     vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},"
-        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={width}x{height}:fps={fps}"
+        "scale={w}:{h}:force_original_aspect_ratio=increase,"
+        "crop={w}:{h},"
+        "zoompan=z='{z}':x='{x}':y='{y}':d={d}:s={w}x{h}:fps={fps}"
+    ).format(
+        w=int(width),
+        h=int(height),
+        z=zoom_expr,
+        x=x_expr,
+        y=y_expr,
+        d=int(frames),
+        fps=int(fps),
     )
     return vf
 
@@ -447,7 +460,7 @@ def build_scene_clip_from_image(
         "-i",
         str(image_path),
         "-t",
-        f"{float(duration_s):.3f}",
+        "{0:.3f}".format(float(duration_s)),
         "-vf",
         vf,
         "-r",
@@ -462,6 +475,16 @@ def build_scene_clip_from_image(
     return out_mp4_path
 
 
+def _ffmpeg_concat_escape(path_str: str) -> str:
+    """
+    Escape a path for ffmpeg concat demuxer list file.
+    We use single quotes around the path and escape internal single quotes.
+    """
+    # ffmpeg concat list uses: file '...'
+    # To include a single quote inside, close/open and escape: 'foo'\''bar'
+    return path_str.replace("'", "'\\''")
+
+
 def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Union[str, Path]) -> Path:
     """
     Concatenate MP4 clips (video only) using concat demuxer.
@@ -472,11 +495,12 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         list_path = td_path / "concat_list.txt"
+
         lines: List[str] = []
         for p in clip_paths:
             pth = Path(p)
-            # Use -safe 0; quote path; escape single quotes for concat file
-            lines.append(f"file '{str(pth).replace(\"'\", \"'\\\\''\")}'")
+            esc = _ffmpeg_concat_escape(str(pth))
+            lines.append("file '{0}'".format(esc))
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         ffmpeg = which_ffmpeg()
@@ -520,9 +544,9 @@ def mux_audio_to_video(
     audio_dur = ffprobe_duration_seconds(audio_path)
     if audio_dur > 0:
         target = audio_dur + end_buffer_s
-        a_filter = f"apad,atrim=0:{target:.3f}"
+        a_filter = "apad,atrim=0:{0:.3f}".format(target)
     else:
-        a_filter = f"apad=pad_dur={end_buffer_s:.3f}"
+        a_filter = "apad=pad_dur={0:.3f}".format(end_buffer_s)
 
     cmd = [
         ffmpeg,
@@ -594,7 +618,6 @@ def find_files(extract_dir: Union[str, Path]) -> Tuple[List[str], List[str]]:
         elif ext in _AUDIO_EXTS:
             audios.append(str(p))
 
-    # Stable ordering
     scripts.sort(key=lambda x: Path(x).name.lower())
     audios.sort(key=lambda x: Path(x).name.lower())
     return scripts, audios
@@ -606,13 +629,12 @@ def _guess_kind_from_name(name: str) -> str:
         return "INTRO"
     if "outro" in n:
         return "OUTRO"
-    # chapter patterns
     m = re.search(r"(chapter|ch)[\s_\-]*0*(\d+)", n)
     if m:
-        return f"CHAPTER {int(m.group(2))}"
+        return "CHAPTER {0}".format(int(m.group(2)))
     m2 = re.search(r"\b0*(\d{1,2})\b", n)
     if m2 and ("chapter" in n or "ch_" in n or n.startswith("ch")):
-        return f"CHAPTER {int(m2.group(1))}"
+        return "CHAPTER {0}".format(int(m2.group(1)))
     return "SEGMENT"
 
 
@@ -653,9 +675,8 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
       - kind_guess (INTRO/OUTRO/CHAPTER X/SEGMENT)
       - chapter_no (optional int)
       - title_guess (best-effort)
-      - base_name (for stable ids)
+      - base_name (legacy; kept for compatibility / display)
     """
-    # Build audio map by stem
     audio_by_stem: Dict[str, str] = {}
     for a in audios:
         audio_by_stem[Path(a).stem.lower()] = a
@@ -667,10 +688,8 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
         sp = Path(s)
         stem = sp.stem.lower()
 
-        # Direct stem match
         a_match = audio_by_stem.get(stem)
 
-        # Fallback: try partial match
         if not a_match:
             best = None
             for a in audios:
@@ -684,11 +703,10 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
             a_match = best
 
         if not a_match:
-            # Leave unpaired audio_path empty; app.py will still list segment but generation will fail clearly
             a_match = ""
 
         if a_match and a_match in used_audio:
-            # If already used, allow reuse only if nothing else available
+            # allow reuse only if nothing else available
             pass
         if a_match:
             used_audio.add(a_match)
@@ -696,14 +714,12 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
         kind = _guess_kind_from_name(sp.name)
         chapter_no = _guess_chapter_no(kind)
 
-        # Title guess: first non-empty line
         preview = _read_text_preview(sp, max_chars=1200)
         title_guess = ""
         for line in (preview or "").splitlines():
             t = line.strip()
             if not t:
                 continue
-            # skip markdown headings markers but keep text
             t = t.lstrip("#").strip()
             if t:
                 title_guess = t[:120]
@@ -716,11 +732,10 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                 "kind_guess": kind,
                 "chapter_no": chapter_no,
                 "title_guess": title_guess,
-                "base_name": stem,
+                "base_name": stem,  # legacy
             }
         )
 
-    # Also include "audio-only" files if any (rare) as segments
     script_stems = {Path(s).stem.lower() for s in scripts}
     for a in audios:
         if Path(a).stem.lower() in script_stems:
@@ -749,33 +764,32 @@ def segment_label(pair: Dict[str, Any]) -> str:
     """
     kind = str(pair.get("kind_guess") or "").strip().upper()
     if kind.startswith("CHAPTER"):
-        # normalize to "CHAPTER X"
         n = pair.get("chapter_no")
         if n is None:
             m = re.search(r"CHAPTER\s+(\d+)", kind)
             if m:
                 n = int(m.group(1))
         if n is not None:
-            return f"CHAPTER {int(n)}"
+            return "CHAPTER {0}".format(int(n))
         return "CHAPTER"
     if kind in ("INTRO", "OUTRO"):
         return kind
-    # Fallback from filenames
+
     sp = str(pair.get("script_path") or "")
     ap = str(pair.get("audio_path") or "")
-    if "intro" in (sp + ap).lower():
+    combo = (sp + " " + ap).lower()
+    if "intro" in combo:
         return "INTRO"
-    if "outro" in (sp + ap).lower():
+    if "outro" in combo:
         return "OUTRO"
     return "SEGMENT"
 
 
 # ----------------------------
-# Image generation (segment-scoped)
+# Image generation (segment-scoped, FIXED)
 # ----------------------------
 
 def _image_size_for_mode(width: int, height: int) -> str:
-    # Choose a reasonable generation size based on aspect
     if height > width:
         return _DEFAULT_IMAGE_SIZE_916
     return _DEFAULT_IMAGE_SIZE_169
@@ -792,7 +806,7 @@ def _make_placeholder_image(path: Path, width: int, height: int) -> None:
         path.write_bytes(
             b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
             b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\nIDAT\x08\xd7c``\x00\x00\x00\x04\x00\x01"
-            b"\x0d\n\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+            b"\x0d\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
         )
         return
 
@@ -809,21 +823,25 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         raise RuntimeError("OpenAI SDK not available in this environment.")
     client = OpenAI(api_key=str(api_key))
 
-    # Prefer b64_json output
-    resp = client.images.generate(
-        model=_DEFAULT_IMAGE_MODEL,
-        prompt=prompt,
-        size=size,
-        # Some SDKs accept response_format="b64_json"; if unsupported, it will TypeError.
-        response_format="b64_json",
-    )
+    # Prefer b64_json output; fall back if SDK doesn't support response_format.
+    try:
+        resp = client.images.generate(
+            model=_DEFAULT_IMAGE_MODEL,
+            prompt=prompt,
+            size=size,
+            response_format="b64_json",
+        )
+    except TypeError:
+        resp = client.images.generate(
+            model=_DEFAULT_IMAGE_MODEL,
+            prompt=prompt,
+            size=size,
+        )
 
-    # Try common response shapes
     data0 = None
     try:
         data0 = resp.data[0]  # type: ignore[attr-defined]
     except Exception:
-        # dict-like
         data = resp.get("data") if isinstance(resp, dict) else None
         if data and isinstance(data, list) and data:
             data0 = data[0]
@@ -832,6 +850,7 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         raise RuntimeError("Image response missing data[0].")
 
     b64 = None
+    url = None
     if isinstance(data0, dict):
         b64 = data0.get("b64_json")
         url = data0.get("url")
@@ -840,11 +859,11 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         url = getattr(data0, "url", None)
 
     if b64:
-        import base64  # local import
+        import base64
         return base64.b64decode(b64)
 
-    # If we only got a URL, we avoid fetching here and fail over to placeholder.
     if url:
+        # We avoid fetching remote URLs here; fail over to placeholder upstream.
         raise RuntimeError("Image API returned URL-only output; URL fetch not supported in this pipeline.")
     raise RuntimeError("Image API returned neither b64_json nor url.")
 
@@ -858,16 +877,13 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[
     if not text:
         return []
 
-    # Split into paragraphs; filter short
     paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     paras = [p for p in paras if len(p) >= 80] or paras
 
-    # Choose up to max_scenes evenly across the script
-    n = min(max_scenes, max(1, len(paras)))
+    n = min(int(max_scenes), max(1, len(paras)))
     if n <= 0:
         return []
 
-    idxs = []
     if len(paras) <= n:
         idxs = list(range(len(paras)))
     else:
@@ -875,9 +891,8 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[
         idxs = [min(len(paras) - 1, int(i * step)) for i in range(n)]
 
     prompts: List[str] = []
-    for i, pi in enumerate(idxs, start=1):
-        snippet = paras[pi]
-        snippet = re.sub(r"\s+", " ", snippet).strip()
+    for pi in idxs:
+        snippet = re.sub(r"\s+", " ", paras[pi]).strip()
         if len(snippet) > 420:
             snippet = snippet[:420].rstrip() + "…"
 
@@ -886,20 +901,92 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[
             "Cinematic, realistic, restrained, credibility-first. "
             "No text, no logos, no subtitles, no watermarks. "
             "Moody lighting, archival / military / night-ops / radar / airbase / forest / coast as appropriate. "
-            f"Scene context: {snippet}"
+            "Scene context: {0}".format(snippet)
         )
 
     return prompts
 
 
+def _rel_to_extract(extract_dir: Union[str, Path], p: Union[str, Path]) -> str:
+    """
+    Best-effort path identity relative to extract_dir (stable across temp root).
+    """
+    try:
+        extract_dir = Path(extract_dir).resolve()
+        pp = Path(p).resolve()
+        return str(pp.relative_to(extract_dir)).replace("\\", "/")
+    except Exception:
+        return str(p).replace("\\", "/")
+
+
+def _segment_cache_key(extract_dir: Union[str, Path], pair: Dict[str, Any]) -> str:
+    """
+    FIX: Generate a stable, provably unique cache key per segment.
+    We use relative script/audio identity (plus kind/chapter) then hash.
+    """
+    kind = segment_label(pair)
+    ch = pair.get("chapter_no")
+    ch_s = "" if ch is None else str(int(ch))
+
+    sp = pair.get("script_path") or ""
+    ap = pair.get("audio_path") or ""
+
+    sp_rel = _rel_to_extract(extract_dir, sp) if sp else ""
+    ap_rel = _rel_to_extract(extract_dir, ap) if ap else ""
+
+    # Include filenames too for extra human readability
+    sp_name = Path(sp).name if sp else ""
+    ap_name = Path(ap).name if ap else ""
+
+    raw = "|".join([kind, ch_s, sp_rel, ap_rel, sp_name, ap_name]).strip()
+    if not raw:
+        raw = json.dumps(pair, sort_keys=True)
+
+    h = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    # Keep dir name short and filesystem-safe
+    label = kind.lower().replace(" ", "_")
+    return "{0}_{1}".format(label, h)
+
+
 def _segment_image_dir(extract_dir: Union[str, Path], pair: Dict[str, Any]) -> Path:
     """
-    Segment-scoped image directory to prevent cross-segment reuse.
+    Segment-scoped image directory (FIXED).
     """
     extract_dir = Path(extract_dir)
-    base = safe_slug(str(pair.get("base_name") or "segment"), max_len=60)
-    label = segment_label(pair).lower().replace(" ", "_")
-    return ensure_dir(extract_dir / "_image_cache" / f"{label}_{base}")
+    key = _segment_cache_key(extract_dir, pair)
+    return ensure_dir(extract_dir / "_image_cache" / key)
+
+
+def _write_image_debug(img_dir: Path, info: Dict[str, Any]) -> None:
+    if not _DEBUG_IMAGES:
+        return
+    try:
+        p = img_dir / "debug.json"
+        info2 = dict(info)
+        info2["updated_at"] = _now_iso()
+        p.write_text(json.dumps(info2, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_dir_contents(dir_path: Path, patterns: Optional[List[str]] = None) -> None:
+    """
+    Delete files in a directory (used to avoid reusing cached images unless enabled).
+    """
+    try:
+        if not dir_path.exists():
+            return
+        if patterns is None:
+            patterns = ["*.png", "*.jpg", "*.jpeg", "*.webp"]
+        for pat in patterns:
+            for p in dir_path.glob(pat):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def _generate_segment_images(
@@ -913,35 +1000,71 @@ def _generate_segment_images(
 ) -> List[Path]:
     """
     Generate (or reuse cached) images for this segment.
-    Uses a segment-specific cache folder to avoid shared images across segments.
+
+    FIXED behavior:
+      - Cache dir is truly segment-unique (hash key).
+      - Default: do NOT reuse cached images (prevents “same images across segments”
+        and avoids stale reuse during testing).
+      - Enable reuse only with env UAPPRESS_REUSE_IMAGES=1.
     """
     img_dir = _segment_image_dir(extract_dir, pair)
     size = _image_size_for_mode(int(width), int(height))
+    max_scenes = max(1, int(max_scenes))
 
-    # If images already exist, reuse them (stable + cheaper).
+    if not _REUSE_IMAGES:
+        # Ensure we never accidentally reuse old images during testing.
+        _clear_dir_contents(img_dir)
+
     existing = sorted([p for p in img_dir.glob("*.png") if p.is_file()])
-    if existing:
-        return existing[: max(1, int(max_scenes))]
+    if existing and _REUSE_IMAGES:
+        _write_image_debug(
+            img_dir,
+            {
+                "mode": "reuse",
+                "cache_dir": str(img_dir),
+                "segment_label": segment_label(pair),
+                "script_path": str(pair.get("script_path") or ""),
+                "audio_path": str(pair.get("audio_path") or ""),
+                "image_count": len(existing),
+                "size": size,
+                "max_scenes": max_scenes,
+            },
+        )
+        return existing[:max_scenes]
 
     script_path = str(pair.get("script_path") or "")
     script_text = _read_text_preview(script_path, max_chars=12000) if script_path else ""
-    prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes)) if script_text else []
+    prompts = _build_scene_prompts_from_script(script_text, max_scenes=max_scenes) if script_text else []
 
     if not prompts:
-        # No script? generate a few generic placeholders
         prompts = [
             "Cinematic documentary still, restrained investigative tone, no text, no logos, no subtitles. "
             "UAP investigation mood: night sky, distant lights, radar room, airbase perimeter, forest trail."
-        ] * max(3, min(8, int(max_scenes)))
+        ] * max(3, min(8, max_scenes))
+
+    _write_image_debug(
+        img_dir,
+        {
+            "mode": "generate",
+            "cache_dir": str(img_dir),
+            "segment_label": segment_label(pair),
+            "script_path": script_path,
+            "audio_path": str(pair.get("audio_path") or ""),
+            "size": size,
+            "max_scenes": max_scenes,
+            "prompt_count": len(prompts),
+            "prompt_preview": prompts[:2],
+            "reuse_enabled": _REUSE_IMAGES,
+        },
+    )
 
     images: List[Path] = []
-    for i, prompt in enumerate(prompts, start=1):
-        out = img_dir / f"scene_{i:03d}.png"
+    for i, prompt in enumerate(prompts[:max_scenes], start=1):
+        out = img_dir / "scene_{0:03d}.png".format(i)
         try:
             data = _openai_generate_image_bytes(str(api_key), prompt, size)
             out.write_bytes(data)
         except Exception:
-            # Fallback placeholder (never crash the whole segment for one image)
             _make_placeholder_image(out, int(width), int(height))
         images.append(out)
 
@@ -967,7 +1090,7 @@ def render_segment_mp4(
     max_scene_seconds: int,
 ) -> None:
     """
-    This is the exact call signature app.py uses.
+    Exact call signature app.py uses.
 
     Locked pipeline:
       generate images -> build scene clips -> concatenate -> mux audio
@@ -988,21 +1111,16 @@ def render_segment_mp4(
     if not audio_p.exists():
         raise FileNotFoundError(str(audio_p))
 
-    # Scene count target:
-    # - At most max_scenes
-    # - At least 3 (to avoid overly static segments), unless audio is extremely short
     audio_seconds = ffprobe_duration_seconds(audio_p)
+
+    # Determine target scene count based on audio length and clamp window
     if audio_seconds <= 0:
-        # Unknown duration: choose a conservative count
         target_scenes = clamp_int(int(max_scenes), 3, int(max_scenes))
     else:
-        # Prefer enough scenes to keep per-scene within clamp range
-        # Approx scene count = audio / clamp_mid
         mid = (float(min_scene_seconds) + float(max_scene_seconds)) / 2.0
         approx = int(max(1, round(audio_seconds / max(1.0, mid))))
         target_scenes = clamp_int(approx, 3, int(max_scenes))
 
-    # Generate or reuse segment-scoped images
     images = _generate_segment_images(
         api_key=str(api_key),
         extract_dir=extract_dir_p,
@@ -1015,11 +1133,8 @@ def render_segment_mp4(
     if not images:
         raise RuntimeError("Image generation produced zero images (unexpected).")
 
-    # Compute per-scene duration (audio-driven) with clamp
-    min_s = int(min_scene_seconds)
-    max_s = int(max_scene_seconds)
-    min_s = clamp_int(min_s, 1, 600)
-    max_s = clamp_int(max_s, min_s, 600)
+    min_s = clamp_int(int(min_scene_seconds), 1, 600)
+    max_s = clamp_int(int(max_scene_seconds), min_s, 600)
 
     if audio_seconds <= 0:
         per = clamp_scene_seconds(5.0, float(min_s), float(max_s))
@@ -1029,13 +1144,12 @@ def render_segment_mp4(
         per = clamp_scene_seconds(per, float(min_s), float(max_s))
         scene_seconds = [per for _ in images]
 
-    # Build scene clips in a segment-specific temp folder next to out_path
     seg_slug = safe_slug(str(pair.get("title_guess") or segment_label(pair) or "segment"), max_len=48)
-    clips_dir = ensure_dir(out_path_p.parent / f"_{seg_slug}_clips")
+    clips_dir = ensure_dir(out_path_p.parent / "_{0}_clips".format(seg_slug))
 
     clip_paths: List[Path] = []
     for idx, (img, dur) in enumerate(zip(images, scene_seconds), start=1):
-        clip_out = clips_dir / f"scene_{idx:03d}.mp4"
+        clip_out = clips_dir / "scene_{0:03d}.mp4".format(idx)
         clip_paths.append(
             build_scene_clip_from_image(
                 image_path=img,
@@ -1048,11 +1162,9 @@ def render_segment_mp4(
             )
         )
 
-    # Concatenate
-    concat_path = out_path_p.parent / f"_{seg_slug}_concat.mp4"
+    concat_path = out_path_p.parent / "_{0}_concat.mp4".format(seg_slug)
     concat_video_clips(clip_paths, concat_path)
 
-    # Mux audio with small end buffer (default 0.65s, clamped)
     mux_audio_to_video(
         video_path=concat_path,
         audio_path=audio_p,
@@ -1060,7 +1172,6 @@ def render_segment_mp4(
         end_buffer_s=_DEFAULT_END_BUFFER,
     )
 
-    # Optional: cleanup temp clips to save disk (keep if debugging)
     if os.environ.get("UAPPRESS_KEEP_CLIPS", "").strip() != "1":
         try:
             shutil.rmtree(str(clips_dir), ignore_errors=True)
@@ -1068,6 +1179,9 @@ def render_segment_mp4(
             pass
         try:
             if concat_path.exists():
-                concat_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+                try:
+                    concat_path.unlink()
+                except Exception:
+                    pass
         except Exception:
             pass
