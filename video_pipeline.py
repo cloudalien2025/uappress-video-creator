@@ -1151,22 +1151,20 @@ def finalize_video_output(
 
 # SECTION 18 — Segment MP4 Renderer (Images → MP4 + narration mux)
 # ---------------------------------------------------------------
-# Goal:
-# - Read script text (if available)
-# - Plan "scenes" by chunking the script (robust; no strict JSON dependency)
-# - Generate scene images using OpenAI Images API (gpt-image-1.5 / gpt-image-1)
-# - Assemble image clips into a video track
-# - Mux narration audio on top (no cutoffs)
+# FIX GOAL (your exact complaint):
+# - Video should NOT outlast the narration by a huge margin.
+# - Target: video duration ~= (audio_duration + ~2s)
+# - Root cause: too many scenes + high min_scene_seconds forces total scene time > audio time.
 #
-# ✅ Streamlit Cloud stability:
-# - Caches images + clips on disk so reruns don't regenerate
-# - Uses x264 preset ultrafast to reduce CPU spikes
-#
-# ✅ FIX (SyntaxError):
-# - f-strings cannot contain backslashes inside `{...}` expressions.
-#   We compute the escaped path BEFORE writing the concat file.
+# ✅ Fixes included:
+# 1) Compute a hard target duration: target_seconds = ceil(audio_seconds) + 2
+# 2) Clamp scene_count so we can actually fit inside target_seconds given min_scene_seconds
+# 3) Allocate scene seconds to SUM EXACTLY target_seconds (best effort within bounds)
+# 4) Cache images/clips to disk to avoid regen on reruns
+# 5) ultrafast x264 preset for Streamlit Cloud stability
 
 import base64
+import math
 
 
 def _read_text_file(path: str, max_chars: int = 12000) -> str:
@@ -1186,7 +1184,7 @@ def _read_text_file(path: str, max_chars: int = 12000) -> str:
 def _chunk_script_for_scenes(script: str, max_scenes: int) -> List[str]:
     """
     Make up to max_scenes short chunks to drive image generation prompts.
-    Simple + robust (no JSON parsing, no extra model calls required).
+    Simple + robust (no JSON parsing).
     """
     script = (script or "").strip()
     if not script:
@@ -1356,12 +1354,9 @@ def _concat_scene_clips(*, clip_paths: List[str], out_path: str) -> str:
     outp.parent.mkdir(parents=True, exist_ok=True)
 
     list_path = str(outp.with_suffix(".concat.txt"))
-
-    # IMPORTANT: escape single quotes for concat demuxer safely WITHOUT backslashes in f-string expressions
     with open(list_path, "w", encoding="utf-8") as f:
         for p in clip_paths:
-            safe_p = str(p).replace("'", "'\\''")  # concat demuxer escaping
-            f.write("file '{}'\n".format(safe_p))
+            f.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
 
     try:
         run_cmd(
@@ -1397,6 +1392,25 @@ def _concat_scene_clips(*, clip_paths: List[str], out_path: str) -> str:
     return str(outp)
 
 
+def _clamp_scene_count_for_duration(
+    *,
+    target_seconds: int,
+    desired_scenes: int,
+    min_scene_seconds: int,
+) -> int:
+    """
+    Prevent the classic overshoot:
+    if desired_scenes * min_scene_seconds > target_seconds,
+    we MUST reduce scene count or video will be longer than audio.
+    """
+    target_seconds = max(1, int(target_seconds))
+    desired_scenes = max(1, int(desired_scenes))
+    min_scene_seconds = max(1, int(min_scene_seconds))
+
+    max_fit = max(1, target_seconds // min_scene_seconds)
+    return max(1, min(desired_scenes, max_fit))
+
+
 def render_segment_mp4(
     *,
     pair: Dict,
@@ -1416,6 +1430,7 @@ def render_segment_mp4(
     - Generate images per scene
     - Build a silent video track
     - Mux narration audio (no cutoffs)
+    - ✅ Duration match: video ~= ceil(audio) + 2 seconds
     """
 
     audio_path = str(pair.get("audio_path") or "").strip()
@@ -1427,11 +1442,17 @@ def render_segment_mp4(
     script_path = str(pair.get("script_path") or "").strip()
     script_text = _read_text_file(script_path) if script_path else ""
 
-    # Duration (pad slightly so video isn't microscopically shorter)
-    dur = float(get_media_duration_seconds(audio_path) or 0)
-    dur_padded = max(3.0, dur + 2.0)
+    # ---- Duration target (THIS is the fix) ----
+    # We want video to be just slightly longer than the narration.
+    dur = float(get_media_duration_seconds(audio_path) or 0.0)
+    if dur <= 0:
+        dur = 5.0
 
-    # Determine scene count
+    # Target: audio + ~2s (your request)
+    target_seconds = int(math.ceil(dur)) + 2
+    target_seconds = max(3, target_seconds)
+
+    # ---- Scene count clamping to avoid overshoot ----
     max_scenes = max(1, min(60, int(max_scenes or 1)))
 
     # Build chunks (scene ideas)
@@ -1439,17 +1460,48 @@ def render_segment_mp4(
     if not chunks:
         chunks = ["Serious investigative documentary visuals. Cinematic, restrained, realistic."]
 
-    scene_count = len(chunks)
+    # Clamp scenes so min_scene_seconds * scenes <= target_seconds
+    scene_count = _clamp_scene_count_for_duration(
+        target_seconds=target_seconds,
+        desired_scenes=len(chunks),
+        min_scene_seconds=int(min_scene_seconds),
+    )
+    chunks = chunks[:scene_count]
 
-    # Allocate per-scene seconds using your existing allocator (SECTION 10)
-    total_int = int(round(dur_padded))
+    # Allocate per-scene seconds (SECTION 10 allocator)
     scene_secs_int = _allocate_scene_seconds(
-        total_int,
-        scene_count,
+        int(target_seconds),
+        int(scene_count),
         min_scene=int(min_scene_seconds),
         max_scene=int(max_scene_seconds),
     )
-    scene_durs = [float(s) for s in scene_secs_int]
+
+    # Hard enforce: sum equals target_seconds when possible (allocator best-effort)
+    # If allocator couldn't hit target due to tight bounds, we still proceed,
+    # but this clamp minimizes drift.
+    cur_sum = int(sum(scene_secs_int))
+    if cur_sum > target_seconds:
+        # shave from the end down to min_scene_seconds
+        overshoot = cur_sum - target_seconds
+        for i in range(len(scene_secs_int) - 1, -1, -1):
+            if overshoot <= 0:
+                break
+            can_take = max(0, scene_secs_int[i] - int(min_scene_seconds))
+            take = min(can_take, overshoot)
+            scene_secs_int[i] -= take
+            overshoot -= take
+    elif cur_sum < target_seconds:
+        # add to the end up to max_scene_seconds
+        need = target_seconds - cur_sum
+        for i in range(len(scene_secs_int) - 1, -1, -1):
+            if need <= 0:
+                break
+            room = max(0, int(max_scene_seconds) - scene_secs_int[i])
+            add = min(room, need)
+            scene_secs_int[i] += add
+            need -= add
+
+    scene_durs = [float(max(1, int(s))) for s in scene_secs_int]
 
     # Work dirs
     base_dir = Path(str(extract_dir or "."))
@@ -1508,7 +1560,7 @@ def render_segment_mp4(
     tmp_video = str(tmp_dir / f"tmp_{safe_slug(os.path.basename(out_path))}.mp4")
     _concat_scene_clips(clip_paths=clip_paths, out_path=tmp_video)
 
-    # Mux narration audio (your muxer is already cutoff-safe)
+    # Mux narration audio (your muxer is cutoff-safe; it also pads audio slightly)
     mux_audio(tmp_video, audio_path, out_path)
 
     # Cleanup only the temporary concat master (keep images/clips for debugging)
@@ -1518,6 +1570,7 @@ def render_segment_mp4(
         pass
 
     return out_path
+
 
 
 
