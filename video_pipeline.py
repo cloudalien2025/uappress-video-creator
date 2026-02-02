@@ -1152,12 +1152,18 @@ def finalize_video_output(
 # SECTION 18 — Segment MP4 Renderer (Images → MP4 + narration mux)
 # ---------------------------------------------------------------
 # Goal:
-# - Generate scene images using OpenAI (gpt-image-1.5 or gpt-image-1)
-# - Assemble them into an MP4 video track
+# - Read script text (if available)
+# - Plan "scenes" by chunking the script (robust; no strict JSON dependency)
+# - Generate scene images using OpenAI Images API (gpt-image-1.5 / gpt-image-1)
+# - Assemble image clips into a video track
 # - Mux narration audio on top (no cutoffs)
+#
+# ✅ Streamlit Cloud stability:
+# - Caches images + clips on disk so reruns don't regenerate
+# - Uses x264 preset ultrafast to reduce CPU spikes
 
 import base64
-from pathlib import Path
+
 
 def _read_text_file(path: str, max_chars: int = 12000) -> str:
     try:
@@ -1173,33 +1179,33 @@ def _read_text_file(path: str, max_chars: int = 12000) -> str:
         return ""
 
 
-def _chunk_script_for_scenes(script: str, max_scenes: int) -> list[str]:
+def _chunk_script_for_scenes(script: str, max_scenes: int) -> List[str]:
     """
-    Makes max_scenes short-ish chunks to drive image prompts.
-    We keep this intentionally simple and robust.
+    Make up to max_scenes short chunks to drive image generation prompts.
+    Simple + robust (no JSON parsing, no extra model calls required).
     """
     script = (script or "").strip()
     if not script:
         return []
 
-    # Normalize whitespace
     script = " ".join(script.split())
-
-    # Target chunk size (rough)
     max_scenes = max(1, int(max_scenes or 1))
-    target = max(200, min(700, max(200, len(script) // max_scenes)))
 
-    chunks = []
+    # Rough target chunk size
+    target = max(220, min(750, max(220, len(script) // max_scenes)))
+
+    chunks: List[str] = []
     i = 0
     n = len(script)
+
     while i < n and len(chunks) < max_scenes:
         j = min(n, i + target)
 
-        # try to break on sentence boundary
+        # Prefer sentence boundary
         cut = script.rfind(". ", i, j)
-        if cut == -1 or cut < i + 80:
+        if cut == -1 or cut < i + 90:
             cut = script.rfind("; ", i, j)
-        if cut == -1 or cut < i + 80:
+        if cut == -1 or cut < i + 90:
             cut = j
 
         chunk = script[i:cut].strip()
@@ -1210,54 +1216,14 @@ def _chunk_script_for_scenes(script: str, max_scenes: int) -> list[str]:
     return chunks[:max_scenes]
 
 
-def _scene_durations(total_seconds: float, scene_count: int, min_s: int, max_s: int) -> list[float]:
-    """
-    Distribute total_seconds across scene_count with guardrails.
-    """
-    total_seconds = float(total_seconds or 0)
-    if total_seconds <= 0:
-        total_seconds = 10.0
-
-    scene_count = max(1, int(scene_count or 1))
-    min_s = max(1, int(min_s or 1))
-    max_s = max(min_s, int(max_s or min_s))
-
-    base = total_seconds / scene_count
-    base = max(min_s, min(max_s, base))
-
-    durs = [base] * scene_count
-
-    # Adjust to match total_seconds as closely as possible
-    cur = sum(durs)
-    diff = total_seconds - cur
-
-    # Spread leftover seconds across scenes without violating max/min
-    step = 0.25  # fine adjustment
-    guard = 20000
-    k = 0
-    while abs(diff) > 0.01 and guard > 0:
-        idx = k % scene_count
-        proposed = durs[idx] + (step if diff > 0 else -step)
-        if min_s <= proposed <= max_s:
-            durs[idx] = proposed
-            cur = sum(durs)
-            diff = total_seconds - cur
-        k += 1
-        guard -= 1
-
-    return durs
-
-
 def _image_size_for_video(width: int, height: int) -> str:
     """
-    Pick an allowed GPT image size that is closest to the target aspect.
     GPT Image sizes: 1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), or auto.
+    We pick closest aspect.
     """
     width = int(width)
     height = int(height)
-    if width >= height:
-        return "1536x1024"
-    return "1024x1536"
+    return "1536x1024" if width >= height else "1024x1536"
 
 
 def _generate_scene_image(
@@ -1269,9 +1235,19 @@ def _generate_scene_image(
     model: str = "gpt-image-1.5",
 ) -> str:
     """
-    Uses OpenAI Images API and writes PNG bytes to out_path.
+    Generates a PNG using OpenAI Images API and writes it to out_path.
+    Uses disk cache: if out_path exists and is non-trivial, reuse it.
     """
-    # Generate
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    # Cache hit
+    try:
+        if p.exists() and p.stat().st_size > 10_000:
+            return str(p)
+    except Exception:
+        pass
+
     rsp = client.images.generate(
         model=model,
         prompt=prompt,
@@ -1281,8 +1257,8 @@ def _generate_scene_image(
 
     b64 = rsp.data[0].b64_json
     img_bytes = base64.b64decode(b64)
-    Path(out_path).write_bytes(img_bytes)
-    return out_path
+    p.write_bytes(img_bytes)
+    return str(p)
 
 
 def _make_scene_clip_from_still(
@@ -1296,11 +1272,20 @@ def _make_scene_clip_from_still(
     zoom_strength: float,
 ) -> str:
     """
-    Builds a short mp4 clip from a single still image using ffmpeg.
-    Includes a gentle zoompan so it's not totally static.
+    Builds a short MP4 clip from a still image using ffmpeg + zoompan.
+    Uses disk cache: if out_path exists and is non-trivial, reuse it.
     """
+    outp = Path(out_path)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+
+    # Cache hit
+    try:
+        if outp.exists() and outp.stat().st_size > 50_000:
+            return str(outp)
+    except Exception:
+        pass
+
     ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     seconds = float(seconds or 0)
     if seconds <= 0:
@@ -1310,27 +1295,18 @@ def _make_scene_clip_from_still(
     width = int(width)
     height = int(height)
 
-    # Zoompan: subtle slow zoom-in
-    zs = float(zoom_strength or 1.0)
-    if zs < 1.0:
-        zs = 1.0
-    if zs > 1.25:
-        zs = 1.25
+    # clamp zoom strength
+    zs = float(zoom_strength or 1.06)
+    zs = max(1.0, min(1.25, zs))
 
-    # Frames needed
     frames = max(1, int(round(seconds * fps)))
+    inc = (zs - 1.0) / max(frames, 1)
 
-    # We:
-    # - scale to cover
-    # - center crop
-    # - zoompan for motion
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},"
-        f"zoompan=z='min(zoom+{(zs-1.0)/max(frames,1):.8f},{zs:.4f})':"
-        f"d={frames}:"
-        f"s={width}x{height}:"
-        f"fps={fps}"
+        f"zoompan=z='min(zoom+{inc:.8f},{zs:.4f})':"
+        f"d={frames}:s={width}x{height}:fps={fps}"
     )
 
     run_cmd(
@@ -1343,7 +1319,7 @@ def _make_scene_clip_from_still(
             "-loop",
             "1",
             "-i",
-            image_path,
+            str(image_path),
             "-t",
             f"{seconds:.3f}",
             "-vf",
@@ -1353,66 +1329,66 @@ def _make_scene_clip_from_still(
             "-c:v",
             "libx264",
             "-preset",
-            "ultrafast",   # cloud-robust
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            out_path,
-        ]
-    )
-    return out_path
-
-
-def _concat_scene_clips(
-    *,
-    clip_paths: list[str],
-    out_path: str,
-) -> str:
-    """
-    Concatenate mp4 clips using ffmpeg concat demuxer (re-encode safe).
-    """
-    ff = ffmpeg_exe()
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-
-    list_path = str(Path(out_path).with_suffix(".concat.txt"))
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in clip_paths:
-            # concat demuxer requires: file 'path'
-            f.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
-
-    # We re-encode to be safe across differing clip metadata
-    run_cmd(
-        [
-            ff,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            list_path,
-            "-c:v",
-            "libx264",
-            "-preset",
             "ultrafast",
             "-pix_fmt",
             "yuv420p",
             "-movflags",
             "+faststart",
-            out_path,
+            str(outp),
         ]
     )
+    return str(outp)
+
+
+def _concat_scene_clips(*, clip_paths: List[str], out_path: str) -> str:
+    """
+    Concatenate MP4 clips using ffmpeg concat demuxer (re-encode safe).
+    """
+    if not clip_paths:
+        raise ValueError("_concat_scene_clips: no clip_paths")
+
+    ff = ffmpeg_exe()
+    outp = Path(out_path)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+
+    list_path = str(outp.with_suffix(".concat.txt"))
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in clip_paths:
+            # concat format requires: file '...'
+            f.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
 
     try:
-        os.remove(list_path)
-    except Exception:
-        pass
+        run_cmd(
+            [
+                ff,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                list_path,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(outp),
+            ]
+        )
+    finally:
+        try:
+            os.remove(list_path)
+        except Exception:
+            pass
 
-    return out_path
+    return str(outp)
 
 
 def render_segment_mp4(
@@ -1431,9 +1407,9 @@ def render_segment_mp4(
 ) -> str:
     """
     Real renderer:
-    - Generates images per scene
-    - Builds a video track
-    - Muxes narration audio
+    - Generate images per scene
+    - Build a silent video track
+    - Mux narration audio (no cutoffs)
     """
 
     audio_path = str(pair.get("audio_path") or "").strip()
@@ -1445,29 +1421,31 @@ def render_segment_mp4(
     script_path = str(pair.get("script_path") or "").strip()
     script_text = _read_text_file(script_path) if script_path else ""
 
-    # Total duration
+    # Duration (pad slightly so video isn't microscopically shorter)
     dur = float(get_media_duration_seconds(audio_path) or 0)
     dur_padded = max(3.0, dur + 2.0)
 
     # Determine scene count
-    max_scenes = int(max_scenes or 1)
-    max_scenes = max(1, min(60, max_scenes))
+    max_scenes = max(1, min(60, int(max_scenes or 1)))
 
-    # If we have script, chunk it. If not, create generic scene prompts.
+    # Build chunks (scene ideas)
     chunks = _chunk_script_for_scenes(script_text, max_scenes=max_scenes)
     if not chunks:
-        # fallback: at least 1 scene
-        chunks = ["Serious investigative documentary visuals. Subtle, cinematic, restrained."]
+        chunks = ["Serious investigative documentary visuals. Cinematic, restrained, realistic."]
 
     scene_count = len(chunks)
-    scene_durs = _scene_durations(
-        total_seconds=dur_padded,
-        scene_count=scene_count,
-        min_s=int(min_scene_seconds),
-        max_s=int(max_scene_seconds),
-    )
 
-    # Paths
+    # Allocate per-scene seconds using your existing allocator (SECTION 10)
+    total_int = int(round(dur_padded))
+    scene_secs_int = _allocate_scene_seconds(
+        total_int,
+        scene_count,
+        min_scene=int(min_scene_seconds),
+        max_scene=int(max_scene_seconds),
+    )
+    scene_durs = [float(s) for s in scene_secs_int]
+
+    # Work dirs
     base_dir = Path(str(extract_dir or "."))
     tmp_dir = base_dir / "_tmp_video"
     img_dir = base_dir / "_scene_images"
@@ -1477,16 +1455,14 @@ def render_segment_mp4(
     clip_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = str(out_path)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     # OpenAI client
     client = OpenAI(api_key=str(api_key))
 
-    # Image model + size
-    img_model = "gpt-image-1.5"  # supports strong instruction following
+    img_model = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1.5")
     img_size = _image_size_for_video(int(width), int(height))
 
-    # Scene style prompt (tuned for your UAPpress vibe)
     style_prefix = (
         "Create a cinematic still frame for a serious investigative documentary about UAPs. "
         "Photorealistic, restrained, no cheesy sci-fi. "
@@ -1495,15 +1471,13 @@ def render_segment_mp4(
         "No aliens or monsters. "
     )
 
-    image_paths = []
-    clip_paths = []
+    clip_paths: List[str] = []
 
     for i, chunk in enumerate(chunks, start=1):
         scene_prompt = style_prefix + f"Scene idea: {chunk}"
         img_path = str(img_dir / f"scene_{i:03d}.png")
         clip_path = str(clip_dir / f"scene_{i:03d}.mp4")
 
-        # Generate image
         _generate_scene_image(
             client=client,
             prompt=scene_prompt,
@@ -1511,9 +1485,7 @@ def render_segment_mp4(
             size=img_size,
             model=img_model,
         )
-        image_paths.append(img_path)
 
-        # Turn still into motion clip
         _make_scene_clip_from_still(
             image_path=img_path,
             out_path=clip_path,
@@ -1523,16 +1495,17 @@ def render_segment_mp4(
             seconds=float(scene_durs[i - 1]),
             zoom_strength=float(zoom_strength or 1.06),
         )
+
         clip_paths.append(clip_path)
 
-    # Concat scene clips into a silent video master
+    # Concat into silent master
     tmp_video = str(tmp_dir / f"tmp_{safe_slug(os.path.basename(out_path))}.mp4")
     _concat_scene_clips(clip_paths=clip_paths, out_path=tmp_video)
 
-    # Mux narration audio onto it (your mux_audio handles cutoff robustness)
+    # Mux narration audio (your muxer is already cutoff-safe)
     mux_audio(tmp_video, audio_path, out_path)
 
-    # Best-effort cleanup (leave images by default so you can inspect/debug)
+    # Cleanup only the temporary concat master (keep images/clips for debugging)
     try:
         os.remove(tmp_video)
     except Exception:
