@@ -858,6 +858,10 @@ w, h = _get_resolution_wh()
 # --- Crash-safe defaults for dependent sliders (Min/Max scene seconds) ---
 # Streamlit persists widget values across reruns. If Min increases above a previously saved Max,
 # the Max slider can crash because its stored value is now < min_value.
+#
+# ✅ FIX (also removes Streamlit warning):
+# If you set st.session_state["min_scene_seconds"] and use key="min_scene_seconds",
+# DO NOT pass value=... into the slider. Same for max_scene_seconds.
 if "min_scene_seconds" not in st.session_state:
     st.session_state["min_scene_seconds"] = 20
 if "max_scene_seconds" not in st.session_state:
@@ -916,20 +920,18 @@ with colE:
         "Min seconds per scene",
         min_value=5,
         max_value=60,
-        value=int(st.session_state.get("min_scene_seconds", 20)),
         step=1,
         disabled=st.session_state["is_generating"],
         key="min_scene_seconds",
         on_change=_clamp_max_scene_seconds,
     )
 with colF:
-    # ✅ Use session_state value (already clamped) and set slider bounds accordingly
+    # Ensure max is valid before rendering the max slider
     _clamp_max_scene_seconds()
     max_scene_seconds = st.slider(
         "Max seconds per scene",
         min_value=int(st.session_state["min_scene_seconds"]),
         max_value=120,
-        value=int(st.session_state.get("max_scene_seconds", max(40, int(st.session_state["min_scene_seconds"])))),
         step=1,
         disabled=st.session_state["is_generating"],
         key="max_scene_seconds",
@@ -989,11 +991,27 @@ with colB2:
 
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
-    brand_name = st.text_input("Brand name", value="UAPpress", disabled=st.session_state["is_generating"], key="brand_name_value")
+    brand_name = st.text_input(
+        "Brand name",
+        value="UAPpress",
+        disabled=st.session_state["is_generating"],
+        key="brand_name_value",
+    )
 with c2:
-    channel_or_series = st.text_input("Channel / series", value="UAPpress Investigations", disabled=st.session_state["is_generating"], key="channel_series_value")
+    channel_or_series = st.text_input(
+        "Channel / series",
+        value="UAPpress Investigations",
+        disabled=st.session_state["is_generating"],
+        key="channel_series_value",
+    )
 with c3:
-    aspect = st.selectbox("Aspect", options=["landscape", "portrait"], index=0, disabled=st.session_state["is_generating"], key="aspect_value")
+    aspect = st.selectbox(
+        "Aspect",
+        options=["landscape", "portrait"],
+        index=0,
+        disabled=st.session_state["is_generating"],
+        key="aspect_value",
+    )
 
 c4, c5, c6 = st.columns([1, 1, 1])
 with c4:
@@ -1160,7 +1178,12 @@ manifest_url = st.session_state.get("spaces_manifest_url", "")
 
 if urls:
     st.success(f"Uploaded **{len(urls)}** file(s) to Spaces:")
-    st.text_area("Public URLs (copy/paste)", value="\n".join(urls), height=180, key="public_urls_textarea")
+    st.text_area(
+        "Public URLs (copy/paste)",
+        value="\n".join(urls),
+        height=180,
+        key="public_urls_textarea",
+    )
 else:
     st.caption("No uploaded URLs yet (generate a segment with auto-upload enabled).")
 
@@ -1223,4 +1246,5 @@ if st.session_state.get("gen_log"):
     st.code("\n".join(st.session_state["gen_log"][-200:]))
 else:
     st.caption("Log will appear here.")
+
 
