@@ -1,6 +1,7 @@
 # ============================
 # app.py — UAPpress Video Creator
 # Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).
+# + BONUS: Optional Shorts/TikTok/Reels vertical exports (only when selected)
 # ============================
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 
@@ -42,7 +43,9 @@ st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos
 
 DEFAULTS = {
     "api_key": "",                 # OpenAI key (session only)
-    "ui_resolution": "1280x720",
+    "video_mode": "Long-form (16:9)",   # NEW: output mode selector
+    "ui_resolution_169": "1280x720",
+    "ui_resolution_916": "1080x1920",   # NEW: vertical default
     "zip_path": "",                # absolute path to uploaded zip on disk
     "zip_root": "",                # temp dir containing the saved zip (so we can clean it)
     "workdir": "",                 # temp working directory (created by extract_zip_to_temp)
@@ -83,6 +86,14 @@ if "brand_intro_outro_paths" not in st.session_state:
 if "brand_public_urls" not in st.session_state:
     st.session_state["brand_public_urls"] = []  # list[str]
 
+# BONUS shorts-maker state
+if "shorts_src_choice" not in st.session_state:
+    st.session_state["shorts_src_choice"] = ""
+if "shorts_trim_seconds" not in st.session_state:
+    st.session_state["shorts_trim_seconds"] = 60
+if "shorts_make_vertical" not in st.session_state:
+    st.session_state["shorts_make_vertical"] = True
+
 
 with st.sidebar:
     st.header("🔑 API Settings")
@@ -90,18 +101,39 @@ with st.sidebar:
         "OpenAI API Key",
         type="password",
         value=st.session_state.get("api_key", ""),
-        help="Required for image generation (gpt-image-1) + Sora. Stored only in this session.",
+        help="Required for image generation + Sora. Stored only in this session.",
     )
     st.session_state["api_key"] = (api_key_input or "").strip()
 
     st.divider()
     st.header("🎞️ Video Settings")
-    st.session_state["ui_resolution"] = st.selectbox(
-        "Resolution",
-        options=["1280x720", "1920x1080"],
-        index=0 if st.session_state.get("ui_resolution", "1280x720") == "1280x720" else 1,
-        help="Final segment MP4 resolution.",
+
+    # NEW: Mode selector (Shorts/Reels only show when selected)
+    st.session_state["video_mode"] = st.selectbox(
+        "Output mode",
+        options=["Long-form (16:9)", "Shorts / TikTok / Reels (9:16)"],
+        index=0 if st.session_state.get("video_mode", "Long-form (16:9)") == "Long-form (16:9)" else 1,
+        help="Choose 16:9 for YouTube long-form, or 9:16 for Shorts/TikTok/Reels.",
+        key="video_mode_select",
     )
+
+    # Only show the relevant resolution control for the selected mode
+    if st.session_state["video_mode"].startswith("Long-form"):
+        st.session_state["ui_resolution_169"] = st.selectbox(
+            "Resolution (16:9)",
+            options=["1280x720", "1920x1080"],
+            index=0 if st.session_state.get("ui_resolution_169", "1280x720") == "1280x720" else 1,
+            help="Final segment MP4 resolution.",
+            key="resolution_169_select",
+        )
+    else:
+        st.session_state["ui_resolution_916"] = st.selectbox(
+            "Resolution (9:16)",
+            options=["720x1280", "1080x1920"],
+            index=1 if st.session_state.get("ui_resolution_916", "1080x1920") == "1080x1920" else 0,
+            help="Vertical resolution for Shorts/TikTok/Reels.",
+            key="resolution_916_select",
+        )
 
 
 # ===============================================================
@@ -129,10 +161,6 @@ def _reset_zip_state() -> None:
     st.session_state.extract_dir = ""
     st.session_state.segments = []
     st.session_state.last_error = ""
-
-    # Do not wipe generation logs by default (helps debugging)
-    # st.session_state["gen_log"] = []
-    # st.session_state["generated"] = {}
 
 
 def _save_uploaded_zip(uploaded_file) -> Tuple[str, str]:
@@ -276,11 +304,18 @@ def _safe_mkdir(p: str) -> str:
 
 
 def _default_out_dir(extract_dir: str) -> str:
-    return _safe_mkdir(str(Path(extract_dir) / "_mp4_segments"))
+    # Separate output folders by mode to avoid confusion
+    mode = st.session_state.get("video_mode", "Long-form (16:9)")
+    suffix = "_mp4_segments_9x16" if mode.startswith("Shorts") else "_mp4_segments"
+    return _safe_mkdir(str(Path(extract_dir) / suffix))
 
 
 def _brand_out_dir(extract_dir: str) -> str:
     return _safe_mkdir(str(Path(extract_dir) / "_brand_clips"))
+
+
+def _shorts_out_dir(extract_dir: str) -> str:
+    return _safe_mkdir(str(Path(extract_dir) / "_shorts_exports"))
 
 
 def _segment_out_path(out_dir: str, seg: dict) -> str:
@@ -309,8 +344,17 @@ def _reset_gen_flags() -> None:
 
 
 def _get_resolution_wh() -> Tuple[int, int]:
-    res = st.session_state.get("ui_resolution", "1280x720")
-    return (1280, 720) if res == "1280x720" else (1920, 1080)
+    """
+    Returns (width,height) based on mode.
+    IMPORTANT: Vertical output is only used when user selects Shorts/TikTok/Reels mode.
+    """
+    mode = st.session_state.get("video_mode", "Long-form (16:9)")
+    if mode.startswith("Shorts"):
+        res = st.session_state.get("ui_resolution_916", "1080x1920")
+        return (720, 1280) if res == "720x1280" else (1080, 1920)
+    else:
+        res = st.session_state.get("ui_resolution_169", "1280x720")
+        return (1280, 720) if res == "1280x720" else (1920, 1080)
 
 
 def _scan_mp4s(out_dir: str) -> List[str]:
@@ -392,7 +436,10 @@ def _job_prefix() -> str:
     zip_name = Path(zip_path).name if zip_path else ""
     base = zip_name.replace(".zip", "").strip() if zip_name else "job"
     slug = vp.safe_slug(base, max_len=50)
-    return f"uappress/{slug}/{ts}/"
+    # include mode in prefix for clarity
+    mode = st.session_state.get("video_mode", "Long-form (16:9)")
+    mode_slug = "shorts" if mode.startswith("Shorts") else "longform"
+    return f"uappress/{slug}/{mode_slug}/{ts}/"
 
 
 def _object_exists(*, s3, bucket: str, object_key: str) -> bool:
@@ -416,6 +463,7 @@ def _upload_file_to_spaces(
     object_key: str,
     make_public: bool = True,
     skip_if_exists: bool = True,
+    content_type: str = "video/mp4",
 ) -> str:
     object_key = object_key.lstrip("/")
 
@@ -426,7 +474,7 @@ def _upload_file_to_spaces(
             st.session_state["spaces_uploaded_keys"].add(object_key)
             return _build_public_url(bucket=bucket, region=region, public_base=public_base, object_key=object_key)
 
-    extra = {"ContentType": "video/mp4"}
+    extra = {"ContentType": content_type}
     if make_public:
         extra["ACL"] = "public-read"
 
@@ -468,6 +516,8 @@ def _write_and_upload_manifest(
     urls = st.session_state.get("spaces_public_urls", [])
     manifest: Dict[str, object] = {
         "job_prefix": job_prefix,
+        "mode": st.session_state.get("video_mode", ""),
+        "resolution": f"{_get_resolution_wh()[0]}x{_get_resolution_wh()[1]}",
         "generated_count": len(mp4_paths),
         "generated_files": [Path(p).name for p in mp4_paths],
         "public_urls": urls,
@@ -656,6 +706,7 @@ def _generate_global_brand_clips(
                     object_key=object_key,
                     make_public=bool(make_public),
                     skip_if_exists=False,
+                    content_type="video/mp4",
                 )
                 if url not in st.session_state["spaces_public_urls"]:
                     st.session_state["spaces_public_urls"].append(url)
@@ -779,6 +830,7 @@ def generate_all_segments_sequential(
                         object_key=object_key,
                         make_public=bool(make_public),
                         skip_if_exists=True,
+                        content_type="video/mp4",
                     )
                     if url not in st.session_state["spaces_public_urls"]:
                         st.session_state["spaces_public_urls"].append(url)
@@ -837,6 +889,7 @@ def generate_all_segments_sequential(
                         object_key=object_key,
                         make_public=bool(make_public),
                         skip_if_exists=True,
+                        content_type="video/mp4",
                     )
                     if url not in st.session_state["spaces_public_urls"]:
                         st.session_state["spaces_public_urls"].append(url)
@@ -867,6 +920,75 @@ def generate_all_segments_sequential(
         progress.progress(min(1.0, i / n))
 
     _reset_gen_flags()
+
+
+# ===============================================================
+# SECTION 6B — BONUS: Shorts/TikTok/Reels Exporter (post-process)
+# ===============================================================
+
+def _ffmpeg_make_vertical_clip(
+    *,
+    src_mp4: str,
+    dst_mp4: str,
+    out_w: int = 1080,
+    out_h: int = 1920,
+    trim_seconds: int = 60,
+    keep_audio: bool = True,
+) -> str:
+    """
+    Converts ANY source mp4 into a 9:16 mp4 using center-crop, then scales to out_w x out_h.
+    Optionally trims to first N seconds (for Shorts/Reels workflows).
+    Uses vp.ffmpeg_exe() + vp.run_cmd() (no new dependencies).
+    """
+    src = Path(src_mp4)
+    dst = Path(dst_mp4)
+    if not src.exists():
+        raise FileNotFoundError(str(src))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    out_w = int(out_w)
+    out_h = int(out_h)
+    trim_seconds = int(trim_seconds or 0)
+
+    # Scale to target height then center-crop width for 9:16
+    # (This is the most robust "one-liner" for mixed inputs.)
+    vf = f"scale=-2:{out_h},crop={out_w}:{out_h}"
+
+    ff = vp.ffmpeg_exe()
+
+    cmd = [
+        ff,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+    ]
+
+    if trim_seconds > 0:
+        cmd += ["-t", str(trim_seconds)]
+
+    cmd += [
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+    if keep_audio:
+        cmd += ["-c:a", "aac", "-b:a", os.environ.get("UAPPRESS_AAC_BITRATE", "192k")]
+    else:
+        cmd += ["-an"]
+
+    cmd += ["-movflags", "+faststart", str(dst)]
+
+    vp.run_cmd(cmd)
+    return str(dst)
 
 
 # ===============================================================
@@ -992,7 +1114,7 @@ with colU3:
         "Spaces prefix (folder) — optional",
         value=st.session_state.get("spaces_last_prefix", ""),
         disabled=st.session_state["is_generating"],
-        help="Leave blank to auto-generate: uappress/<job>/<timestamp>/",
+        help="Leave blank to auto-generate: uappress/<job>/<mode>/<timestamp>/",
         key="prefix_override_value",
     )
 
@@ -1270,6 +1392,133 @@ else:
                 mime="video/mp4",
                 key=f"dl_{name}",
             )
+
+st.markdown("---")
+st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter")
+
+st.caption(
+    "This does **post-processing only**: it takes one of your generated MP4s and creates a 9:16 export "
+    "using a center-crop + scale. It does not change your main generation pipeline."
+)
+
+shorts_dir = _shorts_out_dir(extract_dir)
+src_choices = [""] + mp4_paths
+
+colS1, colS2, colS3 = st.columns([1, 1, 1])
+with colS1:
+    src_pick = st.selectbox(
+        "Source MP4",
+        options=src_choices,
+        index=0,
+        disabled=st.session_state["is_generating"],
+        key="shorts_src_choice",
+        help="Pick a generated MP4 to convert to 9:16.",
+    )
+with colS2:
+    trim_seconds = st.number_input(
+        "Trim to first N seconds (0 = no trim)",
+        min_value=0,
+        max_value=600,
+        value=int(st.session_state.get("shorts_trim_seconds", 60)),
+        step=5,
+        disabled=st.session_state["is_generating"],
+        key="shorts_trim_seconds",
+    )
+with colS3:
+    vertical_res = st.selectbox(
+        "Export resolution (9:16)",
+        options=["720x1280", "1080x1920"],
+        index=1,
+        disabled=st.session_state["is_generating"],
+        key="shorts_export_res",
+    )
+
+export_clicked = st.button(
+    "🎬 Create 9:16 Export",
+    disabled=st.session_state["is_generating"] or not bool(src_pick),
+    use_container_width=True,
+    key="make_vertical_export_btn",
+)
+
+if export_clicked and src_pick:
+    try:
+        out_w, out_h = (720, 1280) if vertical_res == "720x1280" else (1080, 1920)
+        src_p = Path(src_pick)
+        dst_name = src_p.stem + f"_9x16_{out_w}x{out_h}.mp4"
+        dst_path = str(Path(shorts_dir) / dst_name)
+
+        st.info("Creating 9:16 export via ffmpeg…")
+        _log(f"🎬 Bonus export: {src_p.name} -> {dst_name} (trim={int(trim_seconds)}s)")
+
+        _ffmpeg_make_vertical_clip(
+            src_mp4=str(src_p),
+            dst_mp4=dst_path,
+            out_w=out_w,
+            out_h=out_h,
+            trim_seconds=int(trim_seconds),
+            keep_audio=True,
+        )
+
+        st.success(f"Created: {dst_path}")
+        st.video(dst_path)
+
+        with open(dst_path, "rb") as f:
+            st.download_button(
+                label="⬇️ Download 9:16 MP4",
+                data=f,
+                file_name=Path(dst_path).name,
+                mime="video/mp4",
+                key=f"dl_bonus_{Path(dst_path).name}",
+            )
+
+    except Exception as e:
+        st.error(f"Bonus export failed: {type(e).__name__}: {e}")
+        _log(f"❌ Bonus export failed: {type(e).__name__}: {e}")
+
+# Optional auto-upload for bonus exports
+with st.expander("Auto-upload bonus exports to Spaces (optional)", expanded=False):
+    st.caption("This uploads files from `_shorts_exports/` to your Spaces prefix.")
+    bonus_upload = st.button(
+        "☁️ Upload ALL bonus exports now",
+        disabled=st.session_state["is_generating"],
+        use_container_width=True,
+        key="upload_bonus_exports_btn",
+    )
+    if bonus_upload:
+        try:
+            s3, bucket, region, public_base = _spaces_client_and_context()
+            job_prefix = (st.session_state.get("spaces_last_prefix", "") or _job_prefix()).strip()
+            if not job_prefix.endswith("/"):
+                job_prefix += "/"
+            bonus_prefix = job_prefix + "shorts_exports/"
+            _ulog(f"Bonus upload → {bonus_prefix}")
+
+            bonus_files = _scan_mp4s(shorts_dir)
+            if not bonus_files:
+                st.info("No bonus exports found yet.")
+            else:
+                for p in bonus_files:
+                    name = Path(p).name
+                    object_key = f"{bonus_prefix}{name}"
+                    url = _upload_file_to_spaces(
+                        s3=s3,
+                        bucket=bucket,
+                        region=region,
+                        public_base=public_base or "",
+                        local_path=p,
+                        object_key=object_key,
+                        make_public=True,
+                        skip_if_exists=False,
+                        content_type="video/mp4",
+                    )
+                    if url not in st.session_state["spaces_public_urls"]:
+                        st.session_state["spaces_public_urls"].append(url)
+                    _ulog(f"✅ bonus {name} -> {url}")
+
+                st.success(f"Uploaded {len(bonus_files)} bonus export(s).")
+        except Exception as e:
+            st.error(f"Bonus upload failed: {type(e).__name__}: {e}")
+            _ulog(f"❌ Bonus upload failed: {type(e).__name__}: {e}")
 
 st.markdown("---")
 st.subheader("🧾 Generation Log")
