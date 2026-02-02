@@ -633,76 +633,39 @@ def _generate_global_brand_clips(
 
 # SECTION 6 — Segment MP4 Generation (Sequential, Crash-Safe) + Auto-upload
 # ----------------------------
-def _render_segment_mp4_compat(
-    *,
-    pair: dict,
-    extract_dir: str,
-    out_path: str,
-    api_key: str,
-    fps: int,
-    width: int,
-    height: int,
-    zoom_strength: float,
-    max_scenes: int,
-    min_scene_seconds: int,
-    max_scene_seconds: int,
-) -> None:
+def _render_segment_mp4_compat(**kwargs) -> None:
     """
-    Compatibility wrapper:
-    Your app.py was calling vp.render_segment_mp4(), but your deployed video_pipeline.py
-    does not expose that symbol (AttributeError).
+    Compatibility shim:
+    - Your app.py expects video_pipeline.render_segment_mp4(...)
+    - But some versions of video_pipeline.py may expose a different function name.
 
-    This wrapper tries a few likely function names if they exist, otherwise raises a
-    clear error that tells you exactly what’s missing.
+    This tries a short list of likely names and calls the first one found.
+    If none are found, it raises a helpful error that lists candidate functions.
     """
-    candidates = [
-        "render_segment_mp4",
+    candidate_names = [
+        "render_segment_mp4",      # expected
         "render_segment_video",
         "render_segment",
-        "build_segment_mp4",
+        "render_mp4_segment",
         "make_segment_mp4",
-        "generate_segment_mp4",
+        "build_segment_mp4",
+        "create_segment_mp4",
     ]
 
-    fn = None
-    used_name = ""
-    for name in candidates:
-        if hasattr(vp, name) and callable(getattr(vp, name)):
-            fn = getattr(vp, name)
-            used_name = name
-            break
+    for name in candidate_names:
+        fn = getattr(vp, name, None)
+        if callable(fn):
+            return fn(**kwargs)
 
-    if fn is None:
-        # Show helpful diagnostics right in the Streamlit log
-        available = sorted([n for n in dir(vp) if "render" in n.lower() or "segment" in n.lower()])
-        raise AttributeError(
-            "video_pipeline is missing a segment render function. "
-            "app.py expects something like render_segment_mp4(). "
-            f"Tried: {', '.join(candidates)}. "
-            f"Found similar names: {available[:40]}"
-        )
-
-    # Call the discovered function.
-    # We pass keyword args that match the signature you were using.
-    # If the underlying function is older/different, it may throw TypeError (which is fine;
-    # that will surface and tell us exactly what signature it expects).
-    result = fn(
-        pair=pair,
-        extract_dir=extract_dir,
-        out_path=out_path,
-        api_key=str(api_key),
-        fps=int(fps),
-        width=int(width),
-        height=int(height),
-        zoom_strength=float(zoom_strength),
-        max_scenes=int(max_scenes),
-        min_scene_seconds=int(min_scene_seconds),
-        max_scene_seconds=int(max_scene_seconds),
+    # Nothing matched — raise a helpful error with hints
+    available = [n for n in dir(vp) if ("render" in n.lower() or "segment" in n.lower() or "mp4" in n.lower())]
+    raise AttributeError(
+        "video_pipeline has no supported segment render function.\n"
+        f"Tried: {candidate_names}\n"
+        f"Found related names in video_pipeline: {available}\n"
+        "Fix: either (A) add/restore render_segment_mp4 in video_pipeline.py, "
+        "or (B) update app.py to call the correct function name."
     )
-
-    # If the underlying function returns a path, we ignore it because out_path is authoritative.
-    # (But leaving this here avoids “unused variable” confusion during debugging.)
-    _ = result
 
 
 def generate_all_segments_sequential(
@@ -762,6 +725,7 @@ def generate_all_segments_sequential(
         seg_label = seg.get("label", seg_key)
         out_path = _segment_out_path(out_dir, seg)
 
+        # If already exists and overwrite is off, still upload it (optional) and continue
         if (not overwrite) and Path(out_path).exists():
             st.session_state["generated"][seg_key] = out_path
             status.info(f"Skipping generate (already exists): {seg_label}")
@@ -784,7 +748,8 @@ def generate_all_segments_sequential(
                     if url not in st.session_state["spaces_public_urls"]:
                         st.session_state["spaces_public_urls"].append(url)
                     _ulog(f"✅ (existing) {name} -> {url}")
-                    _write_and_upload_manifest(
+
+                    murl = _write_and_upload_manifest(
                         s3=s3,
                         bucket=bucket,
                         region=region,
@@ -793,6 +758,7 @@ def generate_all_segments_sequential(
                         make_public=bool(make_public),
                         out_dir=out_dir,
                     )
+                    _ulog(f"📄 manifest.json -> {murl}")
                 except Exception as e:
                     _ulog(f"❌ Upload failed for existing {name}: {type(e).__name__}: {e}")
 
@@ -804,7 +770,7 @@ def generate_all_segments_sequential(
 
         t0 = time.time()
         try:
-            # ✅ FIX: use a compatibility wrapper instead of calling a missing symbol
+            # ✅ FIX: call compatibility shim instead of vp.render_segment_mp4 directly
             _render_segment_mp4_compat(
                 pair=seg["pair"],
                 extract_dir=extract_dir,
