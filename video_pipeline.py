@@ -782,7 +782,7 @@ def _image_size_for_mode(width: int, height: int) -> str:
 
 
 
-def _make_placeholder_image(path: Path, width: int, height: int, *, title: str = "IMAGE GENERATION FAILED") -> None:
+def _make_scene_card_image(path: Path, width: int, height: int, headline='SCENE IMAGE (LOCAL FALLBACK)', body=str(prompt)[:900] if 'prompt' in locals() else '', footer='UAPpress') -> None:
     """
     Local fallback if OpenAI image generation fails.
 
@@ -830,6 +830,88 @@ def _make_placeholder_image(path: Path, width: int, height: int, *, title: str =
         draw.text((40, y), msg3, fill=(0, 0, 0), font=font_small)
     except Exception:
         pass
+
+    img.save(path, format="PNG")
+
+def _make_scene_card_image(
+    path: Path,
+    width: int,
+    height: int,
+    *,
+    headline: str,
+    body: str = "",
+    footer: str = "UAPpress",
+) -> None:
+    """Local, deterministic fallback 'scene card' image.
+
+    Prevents blank/black videos when OpenAI image generation is unavailable.
+    Output is documentary-styled and readable.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Minimal valid PNG fallback if Pillow isn't available.
+    if Image is None:
+        path.write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\nIDAT\x08\xd7c``\x00\x00\x00\x04\x00\x01"
+            b"\r\n\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        return
+
+    w = max(640, int(width))
+    h = max(360, int(height))
+
+    # Light paper background (not black)
+    img = Image.new("RGB", (w, h), color=(245, 245, 242))
+    draw = ImageDraw.Draw(img)
+
+    pad = 18
+    draw.rectangle([(pad, pad), (w - pad, h - pad)], outline=(30, 30, 30), width=4)
+
+    try:
+        font_h = ImageFont.truetype("DejaVuSans.ttf", 46)
+        font_b = ImageFont.truetype("DejaVuSans.ttf", 28)
+        font_f = ImageFont.truetype("DejaVuSans.ttf", 24)
+    except Exception:
+        font_h = ImageFont.load_default()
+        font_b = ImageFont.load_default()
+        font_f = ImageFont.load_default()
+
+    x = pad + 26
+    y = pad + 26
+    head = (headline or "").strip()
+    if len(head) > 90:
+        head = head[:87] + "..."
+    draw.text((x, y), head, fill=(10, 10, 10), font=font_h)
+
+    y_div = y + 72
+    draw.line([(x, y_div), (w - pad - 26, y_div)], fill=(60, 60, 60), width=2)
+
+    y_text = y_div + 24
+    body_txt = (body or "").strip()
+    if body_txt:
+        max_chars = 95
+        out_lines = []
+        for para in body_txt.splitlines():
+            para = para.strip()
+            if not para:
+                continue
+            while len(para) > max_chars:
+                cut = para.rfind(" ", 0, max_chars)
+                if cut == -1:
+                    cut = max_chars
+                out_lines.append(para[:cut].strip())
+                para = para[cut:].strip()
+            if para:
+                out_lines.append(para)
+
+        out_lines = out_lines[:10]
+        for ln in out_lines:
+            draw.text((x, y_text), ln, fill=(20, 20, 20), font=font_b)
+            y_text += 34
+
+    footer_txt = (footer or "").strip()
+    draw.text((x, h - pad - 42), footer_txt, fill=(80, 80, 80), font=font_f)
 
     img.save(path, format="PNG")
 
@@ -982,7 +1064,7 @@ def _generate_segment_images(
             data = _openai_generate_image_bytes(str(api_key), prompt, size)
             out.write_bytes(data)
         except Exception:
-            _make_placeholder_image(out, int(width), int(height))
+            _make_scene_card_image(out, int(width), int(height, headline='SCENE IMAGE (LOCAL FALLBACK)', body=str(prompt)[:900] if 'prompt' in locals() else '', footer='UAPpress'))
         images.append(out)
 
     return images
