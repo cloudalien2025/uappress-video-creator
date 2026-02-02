@@ -1,7 +1,7 @@
 # ============================
 # app.py — UAPpress Video Creator
 # Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).
-# + BONUS: Optional Shorts/TikTok/Reels vertical exports (only when selected)
+# + BONUS: Optional Shorts/TikTok/Reels vertical exports (UPLOAD-ONLY source MP4s)
 # ============================
 
 from __future__ import annotations
@@ -43,9 +43,9 @@ st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos
 
 DEFAULTS = {
     "api_key": "",                 # OpenAI key (session only)
-    "video_mode": "Long-form (16:9)",   # NEW: output mode selector
+    "video_mode": "Long-form (16:9)",   # output mode selector
     "ui_resolution_169": "1280x720",
-    "ui_resolution_916": "1080x1920",   # NEW: vertical default
+    "ui_resolution_916": "1080x1920",   # vertical default
     "zip_path": "",                # absolute path to uploaded zip on disk
     "zip_root": "",                # temp dir containing the saved zip (so we can clean it)
     "workdir": "",                 # temp working directory (created by extract_zip_to_temp)
@@ -94,6 +94,10 @@ if "shorts_trim_seconds" not in st.session_state:
 if "shorts_make_vertical" not in st.session_state:
     st.session_state["shorts_make_vertical"] = True
 
+# NEW: upload-only bonus source persistence
+if "bonus_uploaded_mp4s" not in st.session_state:
+    st.session_state["bonus_uploaded_mp4s"] = []  # list[str] (absolute paths)
+
 
 with st.sidebar:
     st.header("🔑 API Settings")
@@ -108,7 +112,7 @@ with st.sidebar:
     st.divider()
     st.header("🎞️ Video Settings")
 
-    # NEW: Mode selector (Shorts/Reels only show when selected)
+    # Mode selector (Shorts/Reels only show when selected)
     st.session_state["video_mode"] = st.selectbox(
         "Output mode",
         options=["Long-form (16:9)", "Shorts / TikTok / Reels (9:16)"],
@@ -161,6 +165,10 @@ def _reset_zip_state() -> None:
     st.session_state.extract_dir = ""
     st.session_state.segments = []
     st.session_state.last_error = ""
+
+    # Clear bonus uploads list (paths are job-scoped under extract_dir)
+    st.session_state["bonus_uploaded_mp4s"] = []
+    st.session_state["shorts_src_choice"] = ""
 
 
 def _save_uploaded_zip(uploaded_file) -> Tuple[str, str]:
@@ -316,6 +324,10 @@ def _brand_out_dir(extract_dir: str) -> str:
 
 def _shorts_out_dir(extract_dir: str) -> str:
     return _safe_mkdir(str(Path(extract_dir) / "_shorts_exports"))
+
+
+def _bonus_upload_dir(extract_dir: str) -> str:
+    return _safe_mkdir(str(Path(extract_dir) / "_bonus_uploads"))
 
 
 def _segment_out_path(out_dir: str, seg: dict) -> str:
@@ -924,6 +936,7 @@ def generate_all_segments_sequential(
 
 # ===============================================================
 # SECTION 6B — BONUS: Shorts/TikTok/Reels Exporter (post-process)
+# UPLOAD-ONLY SOURCE MP4s (no generated list to avoid disappearing options)
 # ===============================================================
 
 def _ffmpeg_make_vertical_clip(
@@ -951,7 +964,6 @@ def _ffmpeg_make_vertical_clip(
     trim_seconds = int(trim_seconds or 0)
 
     # Scale to target height then center-crop width for 9:16
-    # (This is the most robust "one-liner" for mixed inputs.)
     vf = f"scale=-2:{out_h},crop={out_w}:{out_h}"
 
     ff = vp.ffmpeg_exe()
@@ -1394,25 +1406,100 @@ else:
             )
 
 st.markdown("---")
-st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter")
+st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
 
 st.caption(
-    "This does **post-processing only**: it takes one of your generated MP4s and creates a 9:16 export "
-    "using a center-crop + scale. It does not change your main generation pipeline."
+    "This is **post-processing only**. Upload any MP4 below; it will be saved into `_bonus_uploads/` "
+    "for this job and will remain available across reruns. The source dropdown shows **uploads only**."
 )
 
 shorts_dir = _shorts_out_dir(extract_dir)
-src_choices = [""] + mp4_paths
+bonus_dir = _bonus_upload_dir(extract_dir)
+
+
+def _prune_missing_bonus_paths() -> None:
+    paths = st.session_state.get("bonus_uploaded_mp4s", []) or []
+    kept = [p for p in paths if p and Path(p).exists()]
+    st.session_state["bonus_uploaded_mp4s"] = kept
+
+
+def _save_bonus_upload(uploaded_file) -> Optional[str]:
+    """
+    Save an uploaded MP4 into extract_dir/_bonus_uploads with collision-safe naming.
+    Returns absolute path.
+    """
+    if uploaded_file is None:
+        return None
+
+    # Timestamp prefix prevents overwrite and makes ordering clear
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    original = (uploaded_file.name or "uploaded.mp4").strip()
+    stem = Path(original).stem
+    slug = vp.safe_slug(stem, max_len=60)
+    filename = f"{ts}_{slug}.mp4"
+    dst = Path(bonus_dir) / filename
+
+    with open(dst, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    return str(dst)
+
+
+# Uploader (allow multiple)
+uploaded_bonus = st.file_uploader(
+    "Upload MP4(s) to use as Bonus sources",
+    type=["mp4"],
+    accept_multiple_files=True,
+    disabled=st.session_state["is_generating"],
+    key="bonus_mp4_uploader",
+    help="Uploaded MP4s are saved into this job at: extract_dir/_bonus_uploads/",
+)
+
+if uploaded_bonus:
+    saved_any = 0
+    for uf in uploaded_bonus:
+        try:
+            saved_path = _save_bonus_upload(uf)
+            if saved_path:
+                # Add to session list (dedupe)
+                cur = st.session_state.get("bonus_uploaded_mp4s", []) or []
+                if saved_path not in cur:
+                    cur.append(saved_path)
+                    st.session_state["bonus_uploaded_mp4s"] = cur
+                saved_any += 1
+        except Exception as e:
+            st.error(f"Bonus upload failed for {getattr(uf, 'name', 'file')}: {type(e).__name__}: {e}")
+
+    if saved_any:
+        _log(f"📥 Bonus uploads: saved {saved_any} file(s) into _bonus_uploads/")
+        st.success(f"Saved {saved_any} MP4(s) into `_bonus_uploads/`.")
+
+# Build upload-only dropdown options (scan + session, then prune)
+_prune_missing_bonus_paths()
+bonus_files = _scan_mp4s(bonus_dir)
+
+# Merge scan results and session (scan-first gives stable ordering)
+session_paths = st.session_state.get("bonus_uploaded_mp4s", []) or []
+merged = []
+for p in bonus_files + session_paths:
+    if p and p not in merged and Path(p).exists():
+        merged.append(p)
+
+# Keep selection sticky: if current selection is missing, reset to blank
+src_choices = [""] + merged
+current_pick = st.session_state.get("shorts_src_choice", "") or ""
+if current_pick and current_pick not in src_choices:
+    st.session_state["shorts_src_choice"] = ""
 
 colS1, colS2, colS3 = st.columns([1, 1, 1])
 with colS1:
     src_pick = st.selectbox(
-        "Source MP4",
+        "Source MP4 (uploads only)",
         options=src_choices,
         index=0,
         disabled=st.session_state["is_generating"],
         key="shorts_src_choice",
-        help="Pick a generated MP4 to convert to 9:16.",
+        help="Pick an uploaded MP4 to convert to 9:16.",
     )
 with colS2:
     trim_seconds = st.number_input(
