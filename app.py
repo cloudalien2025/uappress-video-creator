@@ -1,34 +1,37 @@
-# ============================
-# PART 1/2 — Sidebar + ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
+# SECTION 1 — Imports + Page Setup
 # ============================
 # app.py — UAPpress Video Creator
-#
-# ✅ Sidebar exists (API key + resolution)
-# ✅ ZIP saved immediately to disk (path-only in session)
-# ✅ We read ZIP bytes ONLY when extracting (not stored in session)
-# ✅ NO hashing, NO manifest, NO ZIP bytes in session_state
-# ✅ Segments normalized for Part 3
-
+# ============================
 from __future__ import annotations
 
+import gc
+import json
 import os
 import shutil
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 import video_pipeline as vp
 
-# ----------------------------
-# Page setup
-# ----------------------------
+# OpenAI client for Sora brand clips
+from openai import OpenAI
+
+# boto3 (classic S3 API) — add to requirements.txt: boto3>=1.34.0
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+
+
 st.set_page_config(page_title="UAPpress — Video Creator", layout="wide")
 st.title("🛸 UAPpress — Video Creator")
 st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).")
 
-# ----------------------------
-# Safe session_state init
+
+# SECTION 2 — Safe session_state init + Sidebar
 # ----------------------------
 DEFAULTS = {
     "api_key": "",         # OpenAI key (session only)
@@ -43,16 +46,42 @@ for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ----------------------------
-# Sidebar (THIS is what you were missing)
-# ----------------------------
+# Part 2 state
+if "is_generating" not in st.session_state:
+    st.session_state["is_generating"] = False
+if "stop_requested" not in st.session_state:
+    st.session_state["stop_requested"] = False
+if "generated" not in st.session_state:
+    st.session_state["generated"] = {}  # seg_key -> mp4_path (strings only)
+if "gen_log" not in st.session_state:
+    st.session_state["gen_log"] = []    # list[str]
+
+# Spaces-related
+if "spaces_upload_log" not in st.session_state:
+    st.session_state["spaces_upload_log"] = []  # list[str]
+if "spaces_public_urls" not in st.session_state:
+    st.session_state["spaces_public_urls"] = []  # list[str]
+if "spaces_last_prefix" not in st.session_state:
+    st.session_state["spaces_last_prefix"] = ""  # str
+if "spaces_uploaded_keys" not in st.session_state:
+    st.session_state["spaces_uploaded_keys"] = set()  # set[str] (in-memory for this session)
+if "spaces_manifest_url" not in st.session_state:
+    st.session_state["spaces_manifest_url"] = ""  # str
+
+# Branding-related
+if "brand_intro_outro_paths" not in st.session_state:
+    st.session_state["brand_intro_outro_paths"] = {"intro": "", "outro": ""}  # local paths
+if "brand_public_urls" not in st.session_state:
+    st.session_state["brand_public_urls"] = []  # list[str]
+
+
 with st.sidebar:
     st.header("🔑 API Settings")
     api_key_input = st.text_input(
         "OpenAI API Key",
         type="password",
         value=st.session_state.get("api_key", ""),
-        help="Required for image generation (gpt-image-1). Stored only in this session.",
+        help="Required for image generation (gpt-image-1) + Sora. Stored only in this session.",
     )
     st.session_state["api_key"] = (api_key_input or "").strip()
 
@@ -65,8 +94,8 @@ with st.sidebar:
         help="Final segment MP4 resolution.",
     )
 
-# ----------------------------
-# Helpers
+
+# SECTION 3 — ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
 # ----------------------------
 def _reset_zip_state() -> None:
     try:
@@ -81,6 +110,7 @@ def _reset_zip_state() -> None:
     st.session_state.segments = []
     st.session_state.last_error = ""
 
+
 def _save_uploaded_zip(uploaded_file) -> str:
     """
     Save uploaded ZIP to disk immediately.
@@ -92,10 +122,10 @@ def _save_uploaded_zip(uploaded_file) -> str:
         f.write(uploaded_file.getbuffer())
     return zip_path
 
+
 def _normalize_segments(pairs: List[dict]) -> List[dict]:
     """
-    Convert vp.pair_segments output into a stable structure
-    expected by Part 3.
+    Convert vp.pair_segments output into a stable structure expected by generator.
     Enforces order: Intro → Chapters → Outro → Others
     """
     def label_of(p):
@@ -140,9 +170,7 @@ def _normalize_segments(pairs: List[dict]) -> List[dict]:
         })
     return segments
 
-# ----------------------------
-# 1) Upload ZIP
-# ----------------------------
+
 st.subheader("1) Upload ZIP from TTS Studio (scripts + audio)")
 
 uploaded = st.file_uploader(
@@ -157,9 +185,6 @@ with colA:
         _reset_zip_state()
         st.rerun()
 
-# ----------------------------
-# 2) Save ZIP → Extract → Detect segments
-# ----------------------------
 if uploaded is not None:
     try:
         _reset_zip_state()
@@ -167,7 +192,7 @@ if uploaded is not None:
         zip_path = _save_uploaded_zip(uploaded)
         st.session_state.zip_path = zip_path
 
-        # ✅ IMPORTANT FIX:
+        # ✅ IMPORTANT FIX (kept):
         # video_pipeline.extract_zip_to_temp expects ZIP BYTES (not a file path).
         # So read bytes from disk (without storing them in session_state).
         with open(zip_path, "rb") as f:
@@ -192,9 +217,6 @@ if uploaded is not None:
     except Exception as e:
         st.session_state.last_error = f"{type(e).__name__}: {e}"
 
-# ----------------------------
-# Status + Preview
-# ----------------------------
 if st.session_state.last_error:
     st.error(st.session_state.last_error)
 
@@ -206,76 +228,11 @@ if st.session_state.zip_path:
         for s in st.session_state.segments:
             st.write(f"{s['index']}. **{s['label']}** — {s['title'] or 'Untitled'}")
 
-st.caption("Next: Part 3 is the ONE **Generate Videos** button (sequential, crash-safe).")
-
-# ============================
-# PART 2/2 — Generate Segment MP4s (Sequential, Crash-Safe)
-# + AUTO Upload Each MP4 to DigitalOcean Spaces (no export button needed)
-# + (UPDATED) GLOBAL Sora Brand Intro/Outro (Radar/FLIR HUD vibe) + Auto-upload
-# File: app.py
-# Section: PART 2/2 (replace this whole block top-to-bottom)
-#
-# FIX INCLUDED (unchanged):
-# - Render directly to ".mp4" then auto-upload AFTER render completes
-#
-# UPDATED (Global Branding):
-# - Replaces per-episode branding UI with "GLOBAL brand assets" UI
-# - Adds minimal Sora controls: model tier, intro/outro seconds, and a creative brief textbox
-# - Removes "episode title" dependence (global intro/outro reused across episodes)
-# - Optional: auto-generate global brand clips after segments finish (off by default)
-# ============================
-
-import gc
-import os
-import json
-import time
-from datetime import datetime
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-
-import streamlit as st
-import video_pipeline as vp
-
-# OpenAI client for Sora brand clips
-from openai import OpenAI
-
-# boto3 (classic S3 API) — add to requirements.txt: boto3>=1.34.0
-import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
+st.caption("Next: Generate videos sequentially (crash-safe).")
 
 
+# SECTION 4 — Shared Helpers (Logging, Paths, Resolution, Spaces)
 # ----------------------------
-# Session state init (small only)
-# ----------------------------
-if "is_generating" not in st.session_state:
-    st.session_state["is_generating"] = False
-if "stop_requested" not in st.session_state:
-    st.session_state["stop_requested"] = False
-if "generated" not in st.session_state:
-    st.session_state["generated"] = {}  # seg_key -> mp4_path (strings only)
-if "gen_log" not in st.session_state:
-    st.session_state["gen_log"] = []    # list[str]
-
-# Spaces-related
-if "spaces_upload_log" not in st.session_state:
-    st.session_state["spaces_upload_log"] = []  # list[str]
-if "spaces_public_urls" not in st.session_state:
-    st.session_state["spaces_public_urls"] = []  # list[str]
-if "spaces_last_prefix" not in st.session_state:
-    st.session_state["spaces_last_prefix"] = ""  # str
-if "spaces_uploaded_keys" not in st.session_state:
-    st.session_state["spaces_uploaded_keys"] = set()  # set[str] (in-memory for this session)
-if "spaces_manifest_url" not in st.session_state:
-    st.session_state["spaces_manifest_url"] = ""  # str
-
-# Branding-related
-if "brand_intro_outro_paths" not in st.session_state:
-    st.session_state["brand_intro_outro_paths"] = {"intro": "", "outro": ""}  # local paths
-if "brand_public_urls" not in st.session_state:
-    st.session_state["brand_public_urls"] = []  # list[str]
-
-
 def _log(msg: str) -> None:
     st.session_state["gen_log"].append(msg)
 
@@ -294,18 +251,10 @@ def _default_out_dir(extract_dir: str) -> str:
 
 
 def _brand_out_dir(extract_dir: str) -> str:
-    # Global brand assets directory (still stored under extract_dir for convenience)
     return _safe_mkdir(str(Path(extract_dir) / "_brand_clips"))
 
 
 def _segment_out_path(out_dir: str, seg: dict) -> str:
-    """
-    Option A naming:
-      01_intro.mp4
-      02_chapter_01_some-title.mp4
-      99_outro.mp4
-    Uses seg['index'], seg['key'], and optional seg['title'] slug.
-    """
     idx = int(seg.get("index", 0) or 0)
     key = (seg.get("key") or f"segment_{idx:02d}").strip()
 
@@ -336,46 +285,32 @@ def _get_resolution_wh() -> Tuple[int, int]:
 
 
 def _scan_mp4s(out_dir: str) -> List[str]:
-    """
-    Robust scan: find MP4s in output directory (works even after session_state resets).
-    """
     p = Path(out_dir)
     if not p.exists():
         return []
-    files = sorted([str(x) for x in p.glob("*.mp4") if x.is_file()])
-    return files
+    return sorted([str(x) for x in p.glob("*.mp4") if x.is_file()])
 
 
 def _read_spaces_secret(key: str, default: str = "") -> str:
-    """
-    Read from st.secrets, with env var fallback.
-    Supports either:
-      st.secrets["do_spaces"][...]
-    or flat:
-      st.secrets["DO_SPACES_KEY"], etc.
-    """
-    # nested
     try:
         if "do_spaces" in st.secrets and key in st.secrets["do_spaces"]:
             return str(st.secrets["do_spaces"][key]).strip()
     except Exception:
         pass
 
-    # flat
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
     except Exception:
         pass
 
-    # env fallback (optional)
     env_map = {
         "key": "DO_SPACES_KEY",
         "secret": "DO_SPACES_SECRET",
         "region": "DO_SPACES_REGION",
         "bucket": "DO_SPACES_BUCKET",
         "public_base": "DO_SPACES_PUBLIC_BASE",
-        "endpoint": "DO_SPACES_ENDPOINT",  # optional override
+        "endpoint": "DO_SPACES_ENDPOINT",
     }
     env_name = env_map.get(key, "")
     if env_name:
@@ -385,9 +320,6 @@ def _read_spaces_secret(key: str, default: str = "") -> str:
 
 
 def _spaces_client_and_context():
-    """
-    Returns: (s3_client, bucket, region, public_base)
-    """
     key = _read_spaces_secret("key")
     secret = _read_spaces_secret("secret")
     region = _read_spaces_secret("region", "nyc3")
@@ -423,11 +355,6 @@ def _build_public_url(*, bucket: str, region: str, public_base: str, object_key:
 
 
 def _job_prefix() -> str:
-    """
-    Example prefix per job:
-      uappress/<job_slug>/<timestamp>/
-    job_slug derived from uploaded ZIP name when available; fallback "job".
-    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_path = st.session_state.get("zip_path", "") or ""
     zip_name = Path(zip_path).name if zip_path else ""
@@ -458,10 +385,6 @@ def _upload_file_to_spaces(
     make_public: bool = True,
     skip_if_exists: bool = True,
 ) -> str:
-    """
-    Upload local file to Spaces and return public URL.
-    Idempotent: optionally skip if object already exists.
-    """
     object_key = object_key.lstrip("/")
 
     if skip_if_exists:
@@ -509,10 +432,6 @@ def _write_and_upload_manifest(
     make_public: bool,
     out_dir: str,
 ) -> str:
-    """
-    Upload a manifest after each segment so you can resume/recover if Streamlit crashes.
-    Includes local filenames and any known public URLs.
-    """
     mp4_paths = _scan_mp4s(out_dir)
     urls = st.session_state.get("spaces_public_urls", [])
     manifest: Dict[str, object] = {
@@ -537,20 +456,43 @@ def _write_and_upload_manifest(
     return url
 
 
-# ----------------------------
-# GLOBAL Sora Brand Intro/Outro generator (optional)
+# SECTION 5 — GLOBAL Sora Brand Intro/Outro (Fix: params + content download compat)
 # ----------------------------
 def _can_do_branding() -> bool:
-    # We require these symbols to exist in video_pipeline.py
     return bool(getattr(vp, "BrandIntroOutroSpec", None)) and bool(getattr(vp, "generate_sora_brand_intro_outro", None))
 
 
 def _global_brand_filenames(brand_slug: str) -> Tuple[str, str]:
-    """
-    Consistent, global filenames (NOT per episode).
-    """
     brand_slug = vp.safe_slug(brand_slug or "brand", max_len=40)
     return (f"{brand_slug}_GLOBAL_INTRO.mp4", f"{brand_slug}_GLOBAL_OUTRO.mp4")
+
+
+class _VideosCompat:
+    def __init__(self, videos_obj):
+        self._v = videos_obj
+
+    def __getattr__(self, name: str):
+        return getattr(self._v, name)
+
+    def content(self, video_id: str, *args, **kwargs):
+        # FIX: Some OpenAI SDK versions expose download as videos.download_content(), not videos.content().
+        # This keeps older pipeline code (client.videos.content(video_id)) working without refactors.
+        if hasattr(self._v, "content"):
+            return self._v.content(video_id, *args, **kwargs)
+        if hasattr(self._v, "download_content"):
+            return self._v.download_content(video_id, *args, **kwargs)
+        if hasattr(self._v, "downloadContent"):
+            return self._v.downloadContent(video_id, *args, **kwargs)
+        raise AttributeError("client.videos has no content/download_content method")
+
+
+class _OpenAIClientCompat:
+    def __init__(self, client: OpenAI):
+        self._c = client
+        self.videos = _VideosCompat(client.videos)
+
+    def __getattr__(self, name: str):
+        return getattr(self._c, name)
 
 
 def _generate_global_brand_clips(
@@ -562,15 +504,12 @@ def _generate_global_brand_clips(
     cta_line: str,
     sponsor_line: str,
     aspect: str,
-    # Minimal Sora controls
     model_tier: str,          # "standard" or "pro"
-    intro_seconds: str,       # "4"|"8"|"12" (Sora-allowed)
-    outro_seconds: str,       # "4"|"8"|"12" (Sora-allowed)
-    creative_brief: str,      # must describe Radar/FLIR vibe; user-editable
-    # Optional reference image paths (kept but hidden in advanced)
+    intro_seconds: str,       # "4"|"8"|"12"
+    outro_seconds: str,       # "4"|"8"|"12"
+    creative_brief: str,
     intro_reference_image: str,
     outro_reference_image: str,
-    # Auto-upload knobs
     auto_upload: bool,
     make_public: bool,
     prefix_override: str,
@@ -580,25 +519,15 @@ def _generate_global_brand_clips(
         st.warning("Branding not available yet. Add Part 4/5 + Part 5/5 to video_pipeline.py first.")
         return
 
-    # Where to store global brand assets locally
     brand_dir = _brand_out_dir(extract_dir)
-
-    # Resolve model selection (you can change mapping later)
-    # IMPORTANT: This only sets the model we pass to the generator. The prompt itself lives in video_pipeline.py.
     model = "sora-2" if model_tier == "standard" else "sora-2-pro"
 
     spec_cls = getattr(vp, "BrandIntroOutroSpec")
     gen_fn = getattr(vp, "generate_sora_brand_intro_outro")
 
     sponsor = sponsor_line.strip() or None
-
-    # We do NOT want per-episode titles for global assets.
-    # We'll pass a placeholder; Part 4/5 should be updated later to ignore episode_title for GLOBAL mode.
     episode_title_placeholder = "UAPpress Episode"
 
-    # Feed the creative brief into fields we already have, without changing your pipeline yet:
-    # - visual_style gets the brief (primary control)
-    # - palette is left default (or can be embedded in the brief)
     spec = spec_cls(
         brand_name=brand_name.strip() or "UAPpress",
         channel_or_series=channel_or_series.strip() or "UAPpress Investigations",
@@ -607,7 +536,6 @@ def _generate_global_brand_clips(
         visual_style=creative_brief.strip(),
         palette="",
         logo_text=None,
-        # YouTube-friendly subtle music cues (still editable later inside video_pipeline prompts)
         intro_music_cue="subtle systems hum, low synth bed, minimal, tense but restrained",
         outro_music_cue="subtle systems hum, low synth bed, minimal, calm resolve",
         cta_line=cta_line.strip() or "Subscribe for more investigations.",
@@ -618,35 +546,44 @@ def _generate_global_brand_clips(
     st.info("Generating GLOBAL Sora brand intro/outro…")
     _log("🎬 Generating GLOBAL Sora brand intro/outro…")
 
-    client = OpenAI(api_key=str(api_key))
+    raw_client = OpenAI(api_key=str(api_key))
+    client = _OpenAIClientCompat(raw_client)  # FIX: ensures client.videos.content(video_id) works if pipeline calls it.
 
     intro_ref = intro_reference_image.strip() or None
     outro_ref = outro_reference_image.strip() or None
 
-    # Generate both clips
-    intro_path, outro_path = gen_fn(
-        client,
-        spec,
-        brand_dir,
-        model=model,
-        # NOTE: generate_sora_brand_intro_outro currently takes a single seconds arg for both.
-        # To support separate intro/outro seconds, Part 4/5 will be adjusted next.
-        seconds=intro_seconds,
-        intro_reference_image=intro_ref,
-        outro_reference_image=outro_ref,
-    )
+    # FIX: Caller now uses intro_seconds/outro_seconds (not seconds=) to match updated generator signature.
+    #      Includes a tiny fallback for older generator versions to avoid breaking Streamlit Cloud deploys.
+    try:
+        intro_path, outro_path = gen_fn(
+            client,
+            spec,
+            brand_dir,
+            model=model,
+            intro_seconds=int(intro_seconds),
+            outro_seconds=int(outro_seconds),
+            intro_reference_image=intro_ref,
+            outro_reference_image=outro_ref,
+        )
+    except TypeError:
+        intro_path, outro_path = gen_fn(
+            client,
+            spec,
+            brand_dir,
+            model=model,
+            seconds=int(intro_seconds),
+            intro_reference_image=intro_ref,
+            outro_reference_image=outro_ref,
+        )
 
-    # Rename to GLOBAL filenames so they are stable across episodes
     intro_name, outro_name = _global_brand_filenames(brand_name)
     intro_final = str(Path(brand_dir) / intro_name)
     outro_final = str(Path(brand_dir) / outro_name)
 
-    # Move/overwrite to stable filenames
     try:
         Path(intro_path).replace(intro_final)
         Path(outro_path).replace(outro_final)
     except Exception:
-        # If replace fails on some FS, fallback to copy-bytes
         Path(intro_final).write_bytes(Path(intro_path).read_bytes())
         Path(outro_final).write_bytes(Path(outro_path).read_bytes())
 
@@ -654,14 +591,10 @@ def _generate_global_brand_clips(
     _log(f"✅ GLOBAL Brand intro: {intro_final}")
     _log(f"✅ GLOBAL Brand outro: {outro_final}")
 
-    # Auto-upload global brand clips if enabled
     if auto_upload:
         try:
             s3, bucket, region, public_base = _spaces_client_and_context()
 
-            # Global assets should go to a stable prefix, NOT per-job timestamp.
-            # If user overrides prefix, we respect it; otherwise use a predictable location:
-            #   uappress/brand_assets/<brand_slug>/
             if (prefix_override or "").strip():
                 base_prefix = (prefix_override or "").strip()
             else:
@@ -685,7 +618,7 @@ def _generate_global_brand_clips(
                     local_path=str(p),
                     object_key=object_key,
                     make_public=bool(make_public),
-                    skip_if_exists=False,  # for brand assets, we want updates to overwrite intentfully
+                    skip_if_exists=False,
                 )
                 if url not in st.session_state["spaces_public_urls"]:
                     st.session_state["spaces_public_urls"].append(url)
@@ -698,6 +631,8 @@ def _generate_global_brand_clips(
             st.warning("Global brand clips generated locally, but upload failed. See Upload log.")
 
 
+# SECTION 6 — Segment MP4 Generation (Sequential, Crash-Safe) + Auto-upload
+# ----------------------------
 def generate_all_segments_sequential(
     *,
     segments: list,
@@ -712,7 +647,6 @@ def generate_all_segments_sequential(
     min_scene_seconds: int,
     max_scene_seconds: int,
     api_key: str,
-    # Auto-upload knobs
     auto_upload: bool,
     make_public: bool,
     prefix_override: str,
@@ -730,7 +664,6 @@ def generate_all_segments_sequential(
         _reset_gen_flags()
         return
 
-    # Init Spaces once (if auto-upload enabled)
     s3 = bucket = region = public_base = None
     job_prefix = ""
 
@@ -757,7 +690,6 @@ def generate_all_segments_sequential(
         seg_label = seg.get("label", seg_key)
         out_path = _segment_out_path(out_dir, seg)
 
-        # If already exists, skip render; optionally still auto-upload (idempotent)
         if (not overwrite) and Path(out_path).exists():
             st.session_state["generated"][seg_key] = out_path
             status.info(f"Skipping generate (already exists): {seg_label}")
@@ -864,8 +796,7 @@ def generate_all_segments_sequential(
     _reset_gen_flags()
 
 
-# ----------------------------
-# UI
+# SECTION 7 — UI (Generate + Branding + Results + Previews + Logs)
 # ----------------------------
 st.subheader("🎬 Generate Segment MP4s")
 
@@ -912,7 +843,6 @@ with colC:
         disabled=st.session_state["is_generating"],
     )
 
-# Scene timing controls
 colD, colE, colF = st.columns([1, 1, 1])
 with colD:
     max_scenes = st.number_input(
@@ -942,7 +872,6 @@ with colF:
         disabled=st.session_state["is_generating"],
     )
 
-# Auto-upload controls
 st.markdown("---")
 st.subheader("☁️ DigitalOcean Spaces (Auto-upload)")
 
@@ -968,14 +897,12 @@ with colU3:
         help="Leave blank to auto-generate: uappress/<job>/<timestamp>/",
     )
 
-# GLOBAL Branding UI (does NOT affect segment generation unless you opt in)
 st.markdown("---")
 st.subheader("🛰️ Global Brand Intro/Outro (Sora) — Radar/FLIR HUD")
 
 if not _can_do_branding():
     st.caption("Brand helpers not detected in video_pipeline.py (add Part 4/5 + Part 5/5 there).")
 
-# Action row
 colB1, colB2 = st.columns([1, 1])
 with colB1:
     gen_global_after = st.checkbox(
@@ -992,7 +919,6 @@ with colB2:
         help="Creates or updates your GLOBAL brand bumpers (reused across all episodes).",
     )
 
-# Brand identity
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
     brand_name = st.text_input("Brand name", value="UAPpress", disabled=st.session_state["is_generating"])
@@ -1001,7 +927,6 @@ with c2:
 with c3:
     aspect = st.selectbox("Aspect", options=["landscape", "portrait"], index=0, disabled=st.session_state["is_generating"])
 
-# Minimal Sora controls
 c4, c5, c6 = st.columns([1, 1, 1])
 with c4:
     model_tier = st.selectbox(
@@ -1015,14 +940,14 @@ with c5:
     intro_seconds = st.selectbox(
         "Intro seconds",
         options=["4", "8", "12"],
-        index=1,  # 8 default
+        index=1,
         disabled=st.session_state["is_generating"],
     )
 with c6:
     outro_seconds = st.selectbox(
         "Outro seconds",
         options=["4", "8", "12"],
-        index=1,  # 8 default
+        index=1,
         disabled=st.session_state["is_generating"],
     )
 
@@ -1073,7 +998,6 @@ with st.expander("Advanced (optional)", expanded=False):
         help="Local path on the server (Streamlit). Leave blank if unused.",
     )
 
-# Buttons: generate segments
 col1, col2 = st.columns([1, 1])
 with col1:
     generate_clicked = st.button(
@@ -1090,7 +1014,6 @@ with col2:
         use_container_width=True,
     )
 
-# GLOBAL brand-only generation
 if gen_global_now:
     _generate_global_brand_clips(
         api_key=api_key,
@@ -1111,7 +1034,6 @@ if gen_global_now:
         prefix_override=str(prefix_override or ""),
     )
 
-# Segment generation (+ optional global brand-after)
 if generate_clicked:
     _log("Starting sequential generation…")
     generate_all_segments_sequential(
@@ -1152,10 +1074,6 @@ if generate_clicked:
             prefix_override=str(prefix_override or ""),
         )
 
-
-# ----------------------------
-# Live outputs (URLs + Manifest)
-# ----------------------------
 st.markdown("---")
 st.subheader("✅ Upload Results")
 
@@ -1175,10 +1093,6 @@ if st.session_state.get("spaces_upload_log"):
     with st.expander("Upload log"):
         st.code("\n".join(st.session_state["spaces_upload_log"][-300:]))
 
-
-# ----------------------------
-# Brand clip local preview (optional)
-# ----------------------------
 st.markdown("---")
 st.subheader("🛰️ Global Brand Clips (Local Preview)")
 
@@ -1202,10 +1116,6 @@ else:
                 key=f"dl_brand_{name}",
             )
 
-
-# ----------------------------
-# Output previews + per-file downloads (named files)
-# ----------------------------
 st.markdown("---")
 st.subheader("🎞️ Generated MP4s (Local Preview)")
 
@@ -1229,14 +1139,9 @@ else:
                 key=f"dl_{name}",
             )
 
-
-# ----------------------------
-# Log
-# ----------------------------
 st.markdown("---")
 st.subheader("🧾 Generation Log")
 if st.session_state.get("gen_log"):
     st.code("\n".join(st.session_state["gen_log"][-200:]))
 else:
     st.caption("Log will appear here.")
-
