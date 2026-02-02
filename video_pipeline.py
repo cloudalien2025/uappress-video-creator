@@ -1148,3 +1148,119 @@ def finalize_video_output(
         force_regen_brand=force_regen_brand,
     )
     # ✅ FIX: removed unreachable duplicate return that made troubleshooting confusing.
+
+# SECTION 18 — Segment MP4 Renderer (Minimal, crash-safe)
+# -------------------------------------------------------
+# This fixes: AttributeError: module 'video_pipeline' has no attribute 'render_segment_mp4'
+#
+# Current behavior:
+# - Creates a simple black video at (width x height) and duration ~= narration duration (+ pad)
+# - Muxes narration audio onto it using mux_audio() (which avoids cutting narration)
+#
+# Later you can upgrade this to your full scene/image pipeline, but this unblocks the app
+# and allows Intro/Chapters/Outro MP4s + DO Spaces upload to work end-to-end.
+
+def _make_placeholder_video(
+    *,
+    out_path: str,
+    width: int,
+    height: int,
+    fps: int,
+    seconds: float,
+) -> str:
+    ff = ffmpeg_exe()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    # Guardrails
+    seconds = float(seconds or 0)
+    if seconds <= 0:
+        seconds = 5.0
+
+    # color source -> h264 mp4, faststart for web
+    run_cmd(
+        [
+            ff,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={int(width)}x{int(height)}:r={int(fps)}",
+            "-t",
+            f"{seconds:.3f}",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+    )
+    return out_path
+
+
+def render_segment_mp4(
+    *,
+    pair: Dict,
+    extract_dir: str,
+    out_path: str,
+    api_key: str,
+    fps: int,
+    width: int,
+    height: int,
+    zoom_strength: float,
+    max_scenes: int,
+    min_scene_seconds: int,
+    max_scene_seconds: int,
+) -> str:
+    """
+    Minimal working renderer to unblock the Streamlit app.
+
+    Expected `pair` keys (from pair_segments):
+      - pair["audio_path"]
+      - pair["script_path"]  (optional for this minimal renderer)
+
+    Produces:
+      - out_path (mp4) with narration muxed
+    """
+
+    audio_path = str(pair.get("audio_path") or "").strip()
+    if not audio_path:
+        raise ValueError("render_segment_mp4: pair is missing audio_path")
+
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"render_segment_mp4: missing audio_path: {audio_path}")
+
+    # Determine duration from narration audio
+    dur = get_media_duration_seconds(audio_path)
+    # Add a small pad so the video is never microscopically shorter than audio
+    # (mux_audio already pads audio too, but this keeps timelines stable)
+    dur_padded = max(3.0, float(dur) + 2.0)
+
+    # Build temp silent video
+    tmp_dir = os.path.join(str(extract_dir or "."), "_tmp_video")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_video = os.path.join(tmp_dir, f"tmp_{safe_slug(os.path.basename(out_path))}.mp4")
+
+    _make_placeholder_video(
+        out_path=tmp_video,
+        width=int(width),
+        height=int(height),
+        fps=int(fps),
+        seconds=dur_padded,
+    )
+
+    # Mux narration audio onto it (no narration cutoffs)
+    mux_audio(tmp_video, audio_path, out_path)
+
+    # Cleanup best-effort
+    try:
+        os.remove(tmp_video)
+    except Exception:
+        pass
+
+    return out_path
+
