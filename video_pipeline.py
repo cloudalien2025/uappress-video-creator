@@ -781,27 +781,57 @@ def _image_size_for_mode(width: int, height: int) -> str:
     return _DEFAULT_IMAGE_SIZE_169
 
 
-def _make_placeholder_image(path: Path, width: int, height: int) -> None:
+
+def _make_placeholder_image(path: Path, width: int, height: int, *, title: str = "IMAGE GENERATION FAILED") -> None:
     """
     Local fallback if OpenAI image generation fails.
-    Creates a plain image (no text overlays).
-    NOTE: slightly brighter than near-black so you can immediately see it's a placeholder.
+
+    IMPORTANT:
+    - Must NOT look like a 'black screen' video.
+    - Must be obviously a placeholder, so failures are diagnosable at a glance.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Minimal valid PNG fallback if Pillow isn't available.
     if Image is None:
-        # Minimal valid PNG (1x1) fallback
         path.write_bytes(
             b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
             b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\nIDAT\x08\xd7c``\x00\x00\x00\x04\x00\x01"
-            b"\x0d\n\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+            b"\r\n\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
         )
         return
 
-    w = max(64, int(width))
-    h = max(64, int(height))
-    img = Image.new("RGB", (w, h), color=(40, 40, 40))
-    img.save(path, format="PNG")
+    w = max(320, int(width))
+    h = max(240, int(height))
 
+    # Bright neutral background (avoid dark/black)
+    img = Image.new("RGB", (w, h), color=(235, 235, 235))
+
+    try:
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([(8, 8), (w - 8, h - 8)], outline=(180, 0, 0), width=6)
+
+        msg1 = title.strip()[:80]
+        msg2 = "OpenAI image generation failed — check model / key / quota."
+        msg3 = "Placeholder frame (not a render bug)."
+
+        try:
+            font_big = ImageFont.truetype("DejaVuSans.ttf", 44)
+            font_small = ImageFont.truetype("DejaVuSans.ttf", 28)
+        except Exception:
+            font_big = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+
+        y = 70
+        draw.text((40, y), msg1, fill=(140, 0, 0), font=font_big)
+        y += 70
+        draw.text((40, y), msg2, fill=(0, 0, 0), font=font_small)
+        y += 45
+        draw.text((40, y), msg3, fill=(0, 0, 0), font=font_small)
+    except Exception:
+        pass
+
+    img.save(path, format="PNG")
 
 def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     """
@@ -812,12 +842,30 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         raise RuntimeError("OpenAI SDK not available in this environment.")
     client = OpenAI(api_key=str(api_key))
 
-    resp = client.images.generate(
-        model=_DEFAULT_IMAGE_MODEL,
-        prompt=prompt,
-        size=size,
-        response_format="b64_json",
-    )
+    models_to_try = [
+        _DEFAULT_IMAGE_MODEL,
+        os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK_1", "dall-e-3"),
+        os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK_2", "dall-e-2"),
+    ]
+
+    last_err = None
+    resp = None
+    for mname in models_to_try:
+        try:
+            resp = client.images.generate(
+                model=mname,
+                prompt=prompt,
+                size=size,
+                response_format="b64_json",
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if resp is None and last_err is not None:
+        raise last_err
 
     data0 = None
     try:
