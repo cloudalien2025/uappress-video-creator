@@ -37,6 +37,62 @@ st.title("🛸 UAPpress — Video Creator")
 st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).")
 
 
+# ----------------------------
+# Cache / Temp Maintenance
+# ----------------------------
+if "CACHE_BUSTER" not in st.session_state:
+    st.session_state["CACHE_BUSTER"] = int(time.time())
+
+
+# ----------------------------
+# Sidebar: Maintenance
+# ----------------------------
+with st.sidebar.expander("🧹 Maintenance", expanded=False):
+    st.caption("Use this if you changed code/models and Streamlit keeps reusing old cached images or segments.")
+    if st.button("Clear cache & temp files (reboot-safe)", use_container_width=True):
+        # Clear Streamlit caches
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        try:
+            st.cache_resource.clear()
+        except Exception:
+            pass
+
+        # Nuke known temp/cache directories
+        tmp_dirs = [
+            Path("/tmp/uappress_image_cache"),
+            Path("/tmp/uappress_vc"),
+        ]
+        # Also try to remove any extracted folder from current session
+        for k in ("extract_dir", "extracted_dir", "zip_extract_dir"):
+            p = st.session_state.get(k)
+            if p:
+                tmp_dirs.append(Path(str(p)))
+
+        for d in tmp_dirs:
+            try:
+                if d.exists():
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+
+        # Force cache bust for any cached functions that accept this token
+        st.session_state["CACHE_BUSTER"] = int(time.time())
+
+        # Reset a few common state keys so the UI re-detects ZIP contents cleanly
+        for k in list(st.session_state.keys()):
+            if k.startswith("detected_") or k.startswith("segments_") or k in ("segments", "pairs", "mp3_files", "script_files"):
+                try:
+                    del st.session_state[k]
+                except Exception:
+                    pass
+
+        st.success("Cache cleared. Now refresh the page and re-upload the ZIP.")
+        st.stop()
+
+
 # ===============================================================
 # SECTION 2 — Safe session_state init + Sidebar
 # ===============================================================
