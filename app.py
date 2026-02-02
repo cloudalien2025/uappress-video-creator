@@ -1130,6 +1130,26 @@ with colU3:
         key="prefix_override_value",
     )
 
+# --- Controls (Generate / Stop) ---
+col1, col2 = st.columns([1, 1])
+with col1:
+    generate_clicked = st.button(
+        "🚀 Generate Videos",
+        type="primary",
+        disabled=st.session_state["is_generating"] or (len(segments) == 0),
+        use_container_width=True,
+        key="generate_videos_btn",
+    )
+with col2:
+    st.button(
+        "🛑 Stop after current segment",
+        disabled=not st.session_state["is_generating"],
+        on_click=_request_stop,
+        use_container_width=True,
+        key="stop_after_segment_btn",
+    )
+
+
 st.markdown("---")
 st.subheader("🛰️ Global Brand Intro/Outro (Sora) — Radar/FLIR HUD")
 
@@ -1257,23 +1277,6 @@ with st.expander("Advanced (optional)", expanded=False):
         key="outro_reference_image_value",
     )
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    generate_clicked = st.button(
-        "🚀 Generate Videos",
-        type="primary",
-        disabled=st.session_state["is_generating"] or (len(segments) == 0),
-        use_container_width=True,
-        key="generate_videos_btn",
-    )
-with col2:
-    st.button(
-        "🛑 Stop after current segment",
-        disabled=not st.session_state["is_generating"],
-        on_click=_request_stop,
-        use_container_width=True,
-        key="stop_after_segment_btn",
-    )
 
 if gen_global_now:
     _generate_global_brand_clips(
