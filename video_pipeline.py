@@ -71,9 +71,11 @@ except Exception:
     OpenAI = None  # type: ignore
 
 try:
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
 except Exception:
     Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageFont = None  # type: ignore
 
 
 # ----------------------------
@@ -782,57 +784,6 @@ def _image_size_for_mode(width: int, height: int) -> str:
 
 
 
-def _make_scene_card_image(path: Path, width: int, height: int, headline='SCENE IMAGE (LOCAL FALLBACK)', body=str(prompt)[:900] if 'prompt' in locals() else '', footer='UAPpress') -> None:
-    """
-    Local fallback if OpenAI image generation fails.
-
-    IMPORTANT:
-    - Must NOT look like a 'black screen' video.
-    - Must be obviously a placeholder, so failures are diagnosable at a glance.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Minimal valid PNG fallback if Pillow isn't available.
-    if Image is None:
-        path.write_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\nIDAT\x08\xd7c``\x00\x00\x00\x04\x00\x01"
-            b"\r\n\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        return
-
-    w = max(320, int(width))
-    h = max(240, int(height))
-
-    # Bright neutral background (avoid dark/black)
-    img = Image.new("RGB", (w, h), color=(235, 235, 235))
-
-    try:
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([(8, 8), (w - 8, h - 8)], outline=(180, 0, 0), width=6)
-
-        msg1 = title.strip()[:80]
-        msg2 = "OpenAI image generation failed — check model / key / quota."
-        msg3 = "Placeholder frame (not a render bug)."
-
-        try:
-            font_big = ImageFont.truetype("DejaVuSans.ttf", 44)
-            font_small = ImageFont.truetype("DejaVuSans.ttf", 28)
-        except Exception:
-            font_big = ImageFont.load_default()
-            font_small = ImageFont.load_default()
-
-        y = 70
-        draw.text((40, y), msg1, fill=(140, 0, 0), font=font_big)
-        y += 70
-        draw.text((40, y), msg2, fill=(0, 0, 0), font=font_small)
-        y += 45
-        draw.text((40, y), msg3, fill=(0, 0, 0), font=font_small)
-    except Exception:
-        pass
-
-    img.save(path, format="PNG")
-
 def _make_scene_card_image(
     path: Path,
     width: int,
@@ -851,11 +802,35 @@ def _make_scene_card_image(
 
     # Minimal valid PNG fallback if Pillow isn't available.
     if Image is None:
-        path.write_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\nIDAT\x08\xd7c``\x00\x00\x00\x04\x00\x01"
-            b"\r\n\x2d\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
+        # Write a simple binary PPM (P6) so ffmpeg can still read a full-size, non-black image
+        # without requiring Pillow. (Avoids 'black screen' symptom when image gen fails.)
+        w = max(640, int(width))
+        h = max(360, int(height))
+        bg = (245, 245, 242)  # light paper
+        border = (30, 30, 30)
+
+        header = f"P6\n{w} {h}\n255\n".encode("ascii")
+        pixels = bytearray()
+
+        # Simple border box + solid background
+        border_thick = max(6, min(18, int(min(w, h) * 0.02)))
+        for y in range(h):
+            for x in range(w):
+                if (
+                    x < border_thick
+                    or x >= w - border_thick
+                    or y < border_thick
+                    or y >= h - border_thick
+                ):
+                    pixels.extend(border)
+                else:
+                    pixels.extend(bg)
+
+        # Ensure extension is .ppm for clarity
+        if path.suffix.lower() != ".ppm":
+            path = path.with_suffix(".ppm")
+
+        path.write_bytes(header + bytes(pixels))
         return
 
     w = max(640, int(width))
@@ -1043,7 +1018,7 @@ def _generate_segment_images(
     img_dir = _segment_image_dir(extract_dir, pair)
     size = _image_size_for_mode(int(width), int(height))
 
-    existing = sorted([p for p in img_dir.glob("scene_*.png") if p.is_file()])
+    existing = sorted([p for p in img_dir.glob("scene_*.*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".ppm")])
     if existing:
         return existing[: max(1, int(max_scenes))]
 
@@ -1064,7 +1039,10 @@ def _generate_segment_images(
             data = _openai_generate_image_bytes(str(api_key), prompt, size)
             out.write_bytes(data)
         except Exception:
-            _make_scene_card_image(out, int(width), int(height, headline='SCENE IMAGE (LOCAL FALLBACK)', body=str(prompt)[:900] if 'prompt' in locals() else '', footer='UAPpress'))
+            _make_scene_card_image(out, int(width), int(height), headline='SCENE IMAGE (LOCAL FALLBACK)', body=str(prompt)[:900], footer='UAPpress')
+            # If Pillow isn't installed, the fallback may write a .ppm instead of .png
+            if not out.exists() and out.with_suffix('.ppm').exists():
+                out = out.with_suffix('.ppm')
         images.append(out)
 
     return images
