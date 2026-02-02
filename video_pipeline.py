@@ -1,13 +1,8 @@
-# ============================
-# PART 1/5 — Core Setup, Cache, ffmpeg Helpers, ZIP Discovery, Pairing
-# ============================
-# video_pipeline.py (Tier 1 optimized) — Shared helpers for UAPpress video apps
+# SECTION 1 — Module Imports (single source of truth)
+# video_pipeline.py — Shared helpers for UAPpress video apps
 #
-# ✅ Cache dir is read dynamically (Streamlit sets env after import sometimes)
-# ✅ Cache pruning to prevent Streamlit disk bloat
-# ✅ No “shake” (hard disabled — zoom-only handled later)
-# ✅ Pairing supports Intro / Chapters / Outro
-# ✅ PATCH: extract_zip_to_temp now accepts ZIP PATH (str) OR ZIP BYTES (bytes) safely
+# NOTE: Consolidated imports here to avoid duplicate mid-file imports.
+# This is a readability-only change (no behavior change).
 
 from __future__ import annotations
 
@@ -17,19 +12,19 @@ import re
 import json
 import time
 import zipfile
-import base64
 import tempfile
 import subprocess
 import hashlib
-from typing import Dict, List, Optional, Tuple, Set, Union
+import shlex
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Set, Union, Any
 
 import imageio_ffmpeg
 from openai import OpenAI
 
 
-# ----------------------------
-# Cache (Tier 1 optimized)
-# ----------------------------
+# SECTION 2 — Cache Management (Tier 1 optimized)
 def _get_cache_dir() -> str:
     # DO NOT freeze cache dir at import time
     return os.environ.get("UAPPRESS_CACHE_DIR", ".uappress_cache")
@@ -115,16 +110,12 @@ def _prune_cache(cache_dir: str) -> None:
         return
 
 
-# ----------------------------
-# Extensions / discovery
-# ----------------------------
+# SECTION 3 — Extensions / Discovery
 SCRIPT_EXTS = {".txt", ".md", ".json"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".mpeg", ".mpga", ".ogg", ".webm", ".flac"}
 
 
-# ----------------------------
-# OS / ffmpeg helpers
-# ----------------------------
+# SECTION 4 — OS / ffmpeg Helpers
 def ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -175,9 +166,7 @@ def get_media_duration_seconds(path: str) -> float:
     return hh * 3600 + mm * 60 + ss
 
 
-# ----------------------------
-# ZIP + file discovery
-# ----------------------------
+# SECTION 5 — ZIP Extraction + File Discovery
 def extract_zip_to_temp(zip_input: Union[str, bytes, bytearray]) -> Tuple[str, str]:
     """
     Returns (workdir, extract_dir)
@@ -236,9 +225,7 @@ def read_script_file(path: str) -> str:
             return f.read().strip()
 
 
-# ----------------------------
-# Pairing helpers (Intro / Chapter N / Outro)
-# ----------------------------
+# SECTION 6 — Segment Pairing Helpers (Intro / Chapters / Outro)
 def _is_intro_name(name: str) -> bool:
     b = os.path.splitext(os.path.basename(name))[0].lower()
     return b.startswith("intro") or b == "intro" or " intro" in b or "_intro" in b or "-intro" in b
@@ -372,11 +359,8 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict]:
     pairs.sort(key=sort_key)
     return pairs
 
-# ============================
-# PART 2/5 — Scene Planning (Text → JSON)
-#   (NO Whisper / NO SRT — CapCut handles captions)
-# ============================
 
+# SECTION 7 — Scene Planning (Text → JSON) (NO Whisper / NO SRT)
 SCENE_PLANNER_SYSTEM = (
     "You convert a documentary narration segment into a list of short visual scenes for AI generation. "
     "Return STRICT JSON only: a list of objects with keys: scene, seconds, prompt. "
@@ -384,6 +368,7 @@ SCENE_PLANNER_SYSTEM = (
     "Avoid brand names, copyrighted characters, celebrity likeness, and explicit violence/gore. "
     "Keep prompts concise (1–3 sentences)."
 )
+
 
 def _extract_json_list(text: str) -> str:
     t = (text or "").strip()
@@ -396,6 +381,7 @@ def _extract_json_list(text: str) -> str:
     if i != -1 and j != -1 and j > i:
         return t[i : j + 1]
     return t
+
 
 def plan_scenes(
     client: OpenAI,
@@ -463,15 +449,14 @@ def plan_scenes(
         raise RuntimeError("Scene planner returned no usable prompts.")
     return out
 
+
 def write_text(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text or "")
 
-# ============================
-# PART 3/5 — Segment Assembly (Scene → Clips → Concat → Audio)
-# ============================
 
+# SECTION 8 — Video Concatenation (clips → segment)
 def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
     """
     Concatenate MP4 clips using ffmpeg concat demuxer with stream copy.
@@ -496,16 +481,28 @@ def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
             tf.write(f"file '{safe_p}'\n")
 
     try:
-        run_cmd([
-            ff, "-y",
-            "-hide_banner", "-loglevel", "error",
-            "-fflags", "+genpts",
-            "-f", "concat", "-safe", "0",
-            "-i", list_path,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            out_path,
-        ])
+        run_cmd(
+            [
+                ff,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-fflags",
+                "+genpts",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                list_path,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                out_path,
+            ]
+        )
     finally:
         try:
             os.remove(list_path)
@@ -515,6 +512,7 @@ def concat_mp4s(mp4_paths: List[str], out_path: str) -> str:
     return out_path
 
 
+# SECTION 9 — Audio Muxing (no narration cutoffs)
 def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     """
     Mux narration audio onto video WITHOUT cutting narration.
@@ -534,22 +532,35 @@ def mux_audio(video_path: str, audio_path: str, out_path: str) -> str:
     ff = ffmpeg_exe()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    run_cmd([
-        ff, "-y",
-        "-hide_banner", "-loglevel", "error",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
-        # Small pad to guard against timestamp rounding; does NOT chop audio.
-        "-af", "apad=pad_dur=2",
-        "-movflags", "+faststart",
-        out_path,
-    ])
+    run_cmd(
+        [
+            ff,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
+            # Small pad to guard against timestamp rounding; does NOT chop audio.
+            "-af",
+            "apad=pad_dur=2",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+    )
     return out_path
 
 
+# SECTION 10 — Scene Duration Allocation (prevents audio cutoffs)
 def _allocate_scene_seconds(
     total_seconds: int,
     n_scenes: int,
@@ -629,52 +640,23 @@ def _allocate_scene_seconds(
 
     return secs
 
-# ============================
-# PART 4/5 — Sora Brand Intro/Outro Generators (ADD-ON)
-# File: video_pipeline.py
-# ============================
-# Purpose:
-# - Adds Sora-powered *brand* intro/outro clip generation helpers.
-# - Designed to be drop-in: does NOT change other pipeline behavior.
-#
-# Requires:
-# - openai>=1.x (python SDK)
-# - An OPENAI_API_KEY in env (or however you already initialize OpenAI())
-#
-# Notes:
-# - Sora Video API is asynchronous: create job -> poll status -> download MP4 content.
-# - Models: "sora-2" (faster) or "sora-2-pro" (higher quality).
-# - seconds: "4", "8", or "12"
-# - size: "720x1280", "1280x720", "1024x1792", "1792x1024"
 
-import os
-import re
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, Union
-
-# ----------------------------
-# Config (safe defaults)
-# ----------------------------
+# SECTION 11 — Sora Brand Intro/Outro (Config)
 SORA_DEFAULT_MODEL = os.getenv("SORA_MODEL", "sora-2-pro")
-SORA_DEFAULT_SECONDS = os.getenv("SORA_SECONDS", "8")          # allowed: "4","8","12"
-SORA_DEFAULT_SIZE = os.getenv("SORA_SIZE", "1280x720")         # allowed: see header
+SORA_DEFAULT_SECONDS = os.getenv("SORA_SECONDS", "8")  # allowed: "4","8","12"
+SORA_DEFAULT_SIZE = os.getenv("SORA_SIZE", "1280x720")  # allowed: see app docs
 SORA_POLL_INTERVAL_S = float(os.getenv("SORA_POLL_INTERVAL_S", "2.5"))
 SORA_POLL_TIMEOUT_S = float(os.getenv("SORA_POLL_TIMEOUT_S", "900"))  # 15 min
 
 
-# ----------------------------
-# Data model
-# ----------------------------
+# SECTION 12 — Sora Brand Intro/Outro (Data Model)
 @dataclass(frozen=True)
 class BrandIntroOutroSpec:
-    brand_name: str                       # e.g., "UAPpress"
-    channel_or_series: str                # e.g., "UAPpress Investigations"
-    tagline: str                          # optional; not required for global bumpers
-    episode_title: str                    # kept for backward compatibility; ignored when global=True
+    brand_name: str
+    channel_or_series: str
+    tagline: str
+    episode_title: str  # kept for backward compatibility; ignored when global_mode=True
     visual_style: str = (
-        # Default tuned for UAPpress Radar/FLIR HUD vibe (serious, repeatable, not cheesy)
         "Radar/FLIR surveillance aesthetic, serious investigative tone. "
         "Monochrome/low-saturation, subtle scanlines, HUD overlays, gridlines, "
         "bearing ticks, altitude/velocity readouts, minimal telemetry numbers, "
@@ -683,20 +665,16 @@ class BrandIntroOutroSpec:
         "Clean premium typography, stable and readable."
     )
     palette: str = "deep charcoal, soft white, muted amber accents"
-    logo_text: Optional[str] = None       # if you don't have a logo asset, use text
+    logo_text: Optional[str] = None
     intro_music_cue: str = "subtle systems hum, low synth bed, minimal, tense but restrained"
     outro_music_cue: str = "subtle systems hum, low synth bed, minimal, calm resolve"
     cta_line: str = "Subscribe for more investigations."
-    sponsor_line: Optional[str] = None    # sponsor line in the OUTRO
-    aspect: str = "landscape"             # "landscape" or "portrait"
-
-    # NEW: global brand assets (reused every episode)
-    global_mode: bool = True              # if True, DO NOT include episode title in intro
+    sponsor_line: Optional[str] = None
+    aspect: str = "landscape"  # "landscape" or "portrait"
+    global_mode: bool = True   # if True, DO NOT include episode title in intro
 
 
-# ----------------------------
-# Prompt builders (brand-safe, consistent)
-# ----------------------------
+# SECTION 13 — Sora Prompt Builders
 def _sanitize_filename(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
@@ -709,13 +687,11 @@ def _normalize_seconds(v: Optional[Union[str, int]]) -> str:
         return str(SORA_DEFAULT_SECONDS)
     s = str(v).strip()
     if s not in ("4", "8", "12"):
-        # fail safe → default
         return str(SORA_DEFAULT_SECONDS)
     return s
 
 
 def _resolve_size(spec: BrandIntroOutroSpec, explicit_size: Optional[str] = None) -> str:
-    # Keep it simple: landscape default 1280x720; portrait default 720x1280
     if explicit_size:
         return explicit_size
     if spec.aspect.lower().startswith("p"):
@@ -724,10 +700,6 @@ def _resolve_size(spec: BrandIntroOutroSpec, explicit_size: Optional[str] = None
 
 
 def build_sora_brand_intro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) -> str:
-    """
-    GLOBAL INTRO (default): no episode title (podcast/JRE-style consistency).
-    If spec.global_mode is False, will include episode title briefly.
-    """
     logo_text = spec.logo_text or spec.brand_name
 
     lines = [
@@ -747,7 +719,6 @@ def build_sora_brand_intro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) ->
     ]
 
     if not spec.global_mode:
-        # backward-compatible: episode-specific intros
         ep = (spec.episode_title or "").strip()
         if ep:
             lines.append(f"3) Episode title (briefly): '{ep}'")
@@ -762,7 +733,7 @@ def build_sora_brand_intro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) ->
         f"- Add synced audio that matches: {spec.intro_music_cue}.",
         "- No voiceover.",
         "",
-        "Deliver a polished broadcast-ready intro bumper."
+        "Deliver a polished broadcast-ready intro bumper.",
     ]
     return "\n".join(lines)
 
@@ -798,14 +769,12 @@ def build_sora_brand_outro_prompt(spec: BrandIntroOutroSpec, *, seconds: str) ->
         f"- Add synced audio that matches: {spec.outro_music_cue}.",
         "- No voiceover.",
         "",
-        "Deliver a polished broadcast-ready outro bumper."
+        "Deliver a polished broadcast-ready outro bumper.",
     ]
     return "\n".join(lines)
 
 
-# ----------------------------
-# Sora job helpers (create -> poll -> download MP4)
-# ----------------------------
+# SECTION 14 — Sora Job Lifecycle (create → poll → download)
 def _sora_create_video_job(
     client,
     prompt: str,
@@ -822,8 +791,6 @@ def _sora_create_video_job(
         "size": (size or SORA_DEFAULT_SIZE),
     }
 
-    # Optional image reference guide (if your pipeline already has a brand frame / logo image)
-    # NOTE: The API expects a file object; the OpenAI SDK accepts a file handle.
     if input_reference_path:
         with open(input_reference_path, "rb") as f:
             kwargs["input_reference"] = f
@@ -834,14 +801,10 @@ def _sora_create_video_job(
 
 def _sora_poll_until_done(client, video_id: str) -> Any:
     deadline = time.time() + SORA_POLL_TIMEOUT_S
-    last_status = None
 
     while time.time() < deadline:
         job = client.videos.retrieve(video_id)
         status = getattr(job, "status", None) or (job.get("status") if isinstance(job, dict) else None)
-
-        if status != last_status:
-            last_status = status
 
         if status in ("completed", "succeeded"):
             return job
@@ -854,10 +817,30 @@ def _sora_poll_until_done(client, video_id: str) -> Any:
 
 
 def _sora_download_mp4(client, video_id: str, out_path: Path) -> Path:
-    # Per API docs: GET /videos/{video_id}/content returns the MP4 bytes
-    content = client.videos.content(video_id)
-
+    """
+    ✅ FIX (required):
+    The OpenAI Python SDK has had variants where `client.videos.content(video_id)` is absent.
+    We try the known method names in order for compatibility on Streamlit Cloud.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Try common SDK shapes without assuming one exact method.
+    content = None
+    videos = getattr(client, "videos", None)
+
+    if videos is not None:
+        for meth_name in ("content", "download_content", "retrieve_content"):
+            meth = getattr(videos, meth_name, None)
+            if callable(meth):
+                try:
+                    content = meth(video_id)
+                    break
+                except AttributeError:
+                    # Inline fix note: method exists on object in some SDKs but may raise; try next.
+                    continue
+
+    if content is None:
+        raise AttributeError("OpenAI SDK client.videos has no supported content download method")
 
     # SDK may return bytes, a stream, or a response-like object depending on version.
     if isinstance(content, (bytes, bytearray)):
@@ -874,16 +857,14 @@ def _sora_download_mp4(client, video_id: str, out_path: Path) -> Path:
         out_path.write_bytes(raw)
         return out_path
 
-    raise TypeError("Unexpected return type from client.videos.content(video_id)")
+    raise TypeError("Unexpected return type from Sora content download method")
 
 
-# ----------------------------
-# Public API: generate brand intro/outro clips
-# ----------------------------
+# SECTION 15 — Public API: Generate Sora Brand Intro/Outro Clips
 def generate_sora_brand_intro_outro(
     client,
     spec: BrandIntroOutroSpec,
-    output_dir: str | Path,
+    output_dir: Union[str, Path],
     *,
     model: Optional[str] = None,
     # Backward-compatible single seconds/size:
@@ -967,38 +948,12 @@ def generate_sora_brand_intro_outro(
 
     return intro_path, outro_path
 
-# ============================
-# PART 5/5 — Final Assembly + Optional Sora Brand Intro/Outro Injection
-# File: video_pipeline.py
-# ============================
-# Purpose:
-# - Adds OPTIONAL step to prepend/append Sora-generated *GLOBAL* brand intro/outro clips.
-# - GLOBAL brand clips are reused across episodes (JRE-style consistency).
-# - Caches/reuses brand clips if already exist locally unless force_regen_brand=True.
-#
-# IMPORTANT:
-# - Does NOT change other pipeline behavior unless you call finalize_video_output().
-# - Concat uses ffmpeg concat demuxer (fast, no re-encode when compatible).
 
-import os
-import re
-import shlex
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import Optional, Tuple, Union
-
-
-# ----------------------------
-# Settings / toggles
-# ----------------------------
+# SECTION 16 — Final Assembly + Optional Sora GLOBAL Intro/Outro Injection
 ENABLE_SORA_BRAND_CLIPS = os.getenv("ENABLE_SORA_BRAND_CLIPS", "0").strip() == "1"
 SORA_BRAND_ASSETS_SUBDIR = os.getenv("SORA_BRAND_ASSETS_SUBDIR", "brand_assets")  # stable folder inside output_dir
 
 
-# ----------------------------
-# Small utility: run ffmpeg
-# ----------------------------
 def _run_cmd(cmd: Union[str, list]) -> None:
     p = subprocess.run(
         cmd if isinstance(cmd, list) else shlex.split(cmd),
@@ -1014,10 +969,6 @@ def _ffmpeg_concat_videos_demuxer(
     video_paths: Tuple[Path, ...],
     out_path: Path,
 ) -> Path:
-    """
-    Concatenate MP4 files using concat demuxer (stream copy).
-    Fast and avoids re-encoding when inputs are compatible.
-    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as td:
@@ -1043,17 +994,11 @@ def _sanitize_filename_local(s: str) -> str:
 
 
 def _global_brand_filenames(brand_name: str) -> Tuple[str, str]:
-    """
-    Stable filenames for GLOBAL bumpers.
-    """
     slug = _sanitize_filename_local(brand_name)
     return (f"{slug}_GLOBAL_INTRO.mp4", f"{slug}_GLOBAL_OUTRO.mp4")
 
 
 def _get_brand_assets_dir(output_dir: Union[str, Path]) -> Path:
-    """
-    Stable local directory for brand assets (NOT tied to per-ZIP extract_dir).
-    """
     return Path(output_dir) / SORA_BRAND_ASSETS_SUBDIR
 
 
@@ -1061,7 +1006,7 @@ def _maybe_generate_or_reuse_global_brand_clips(
     client,
     *,
     output_dir: Union[str, Path],
-    brand_spec,  # BrandIntroOutroSpec
+    brand_spec,
     model: Optional[str] = None,
     intro_seconds: Optional[Union[str, int]] = None,
     outro_seconds: Optional[Union[str, int]] = None,
@@ -1072,10 +1017,6 @@ def _maybe_generate_or_reuse_global_brand_clips(
     outro_reference_image: Optional[str] = None,
     force_regen: bool = False,
 ) -> Tuple[Path, Path]:
-    """
-    Returns (intro_path, outro_path) for GLOBAL bumpers.
-    Generates them only if missing or force_regen=True.
-    """
     brand_dir = _get_brand_assets_dir(output_dir)
     brand_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1086,8 +1027,7 @@ def _maybe_generate_or_reuse_global_brand_clips(
     if (not force_regen) and intro_path.exists() and outro_path.exists():
         return intro_path, outro_path
 
-    # Uses Part 4/5 API (already in this file)
-    intro_tmp, outro_tmp = generate_sora_brand_intro_outro(  # noqa: F821
+    intro_tmp, outro_tmp = generate_sora_brand_intro_outro(
         client,
         brand_spec,
         brand_dir,
@@ -1121,7 +1061,7 @@ def _maybe_add_sora_brand_intro_outro(
     main_video_path: Union[str, Path],
     output_dir: Union[str, Path],
     final_basename: str,
-    brand_spec,  # BrandIntroOutroSpec
+    brand_spec,
     enable: bool,
     model: Optional[str] = None,
     intro_seconds: Optional[Union[str, int]] = None,
@@ -1155,24 +1095,18 @@ def _maybe_add_sora_brand_intro_outro(
     )
 
     out_path = output_dir / f"{final_basename}.mp4"
-
-    _ffmpeg_concat_videos_demuxer(
-        (intro_path, main_video_path, outro_path),
-        out_path,
-    )
+    _ffmpeg_concat_videos_demuxer((intro_path, main_video_path, outro_path), out_path)
     return out_path
 
 
-# ----------------------------
-# Public hook: finalize output
-# ----------------------------
+# SECTION 17 — Public Hook: finalize_video_output()
 def finalize_video_output(
     client,
     *,
     main_video_path: Union[str, Path],
     output_dir: Union[str, Path],
     final_name: str,
-    brand_spec=None,  # BrandIntroOutroSpec | None
+    brand_spec=None,
     enable_brand_clips: Optional[bool] = None,
     model: Optional[str] = None,
     intro_seconds: Optional[Union[str, int]] = None,
@@ -1213,22 +1147,4 @@ def finalize_video_output(
         outro_reference_image=outro_reference_image,
         force_regen_brand=force_regen_brand,
     )
-
-
-    return _maybe_add_sora_brand_intro_outro(
-        client,
-        main_video_path=main_video_path,
-        output_dir=output_dir,
-        final_basename=final_name,
-        brand_spec=brand_spec,
-        enable=True,
-        model=model,
-        intro_seconds=intro_seconds,
-        outro_seconds=outro_seconds,
-        size=size,
-        intro_size=intro_size,
-        outro_size=outro_size,
-        intro_reference_image=intro_reference_image,
-        outro_reference_image=outro_reference_image,
-        force_regen_brand=force_regen_brand,
-    )
+    # ✅ FIX: removed unreachable duplicate return that made troubleshooting confusing.
