@@ -1161,6 +1161,10 @@ def finalize_video_output(
 # ✅ Streamlit Cloud stability:
 # - Caches images + clips on disk so reruns don't regenerate
 # - Uses x264 preset ultrafast to reduce CPU spikes
+#
+# ✅ FIX (SyntaxError):
+# - f-strings cannot contain backslashes inside `{...}` expressions.
+#   We compute the escaped path BEFORE writing the concat file.
 
 import base64
 
@@ -1352,10 +1356,12 @@ def _concat_scene_clips(*, clip_paths: List[str], out_path: str) -> str:
     outp.parent.mkdir(parents=True, exist_ok=True)
 
     list_path = str(outp.with_suffix(".concat.txt"))
+
+    # IMPORTANT: escape single quotes for concat demuxer safely WITHOUT backslashes in f-string expressions
     with open(list_path, "w", encoding="utf-8") as f:
         for p in clip_paths:
-            # concat format requires: file '...'
-            f.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
+            safe_p = str(p).replace("'", "'\\''")  # concat demuxer escaping
+            f.write("file '{}'\n".format(safe_p))
 
     try:
         run_cmd(
@@ -1512,5 +1518,6 @@ def render_segment_mp4(
         pass
 
     return out_path
+
 
 
