@@ -49,6 +49,24 @@ if "CACHE_BUSTER" not in st.session_state:
 # ----------------------------
 with st.sidebar.expander("🧹 Maintenance", expanded=False):
     st.caption("Use this if you changed code/models and Streamlit keeps reusing old cached images or segments.")
+
+# Quick diagnostic: verify Images API works with the current key
+if st.button("Test OpenAI image generation", use_container_width=True):
+    key = (st.session_state.get("api_key") or "").strip()
+    if not key:
+        st.error("No API key set in sidebar.")
+        st.stop()
+    try:
+        test_bytes = vp._openai_generate_image_bytes(
+            key,
+            "A cinematic 1940s desert military airfield, archival photograph style",
+            "1024x1024",
+        )
+        st.success(f"✅ Images API OK — received {len(test_bytes):,} bytes.")
+        st.image(test_bytes, caption="OpenAI test image (1024x1024)")
+    except Exception as e:
+        st.error(f"❌ Images API failed: {e!r}")
+    st.stop()
     if st.button("Clear cache & temp files (reboot-safe)", use_container_width=True):
         # Clear Streamlit caches
         try:
