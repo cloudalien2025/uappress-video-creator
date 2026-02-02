@@ -893,10 +893,19 @@ def _make_scene_card_image(
 def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     """
     Generate a single image via OpenAI Images API.
-    Returns raw image bytes (PNG/JPG), or raises.
+
+    Streamlit Cloud reliability rules:
+    - Always pass api_key explicitly to the OpenAI client.
+    - Do NOT pass response_format; default b64_json output avoids SDK/version mismatches.
+    - Retry a couple times per model to ride out transient failures.
     """
     if OpenAI is None:
         raise RuntimeError("OpenAI SDK not available in this environment.")
+
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise RuntimeError("Missing OpenAI API key (api_key is empty).")
+
     client = OpenAI(api_key=str(api_key))
 
     models_to_try = [
@@ -905,24 +914,38 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK_2", "dall-e-2"),
     ]
 
-    last_err = None
+    last_err: Exception | None = None
     resp = None
+
     for mname in models_to_try:
-        try:
-            resp = client.images.generate(
-                model=mname,
-                prompt=prompt,
-                size=size,
-                response_format="b64_json",
-            )
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
+        if not mname:
             continue
 
-    if resp is None and last_err is not None:
-        raise last_err
+        for attempt in range(2):
+            try:
+                resp = client.images.generate(
+                    model=mname,
+                    prompt=prompt,
+                    size=size,
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                try:
+                    import time as _time
+                    _time.sleep(0.5 + attempt * 0.5)
+                except Exception:
+                    pass
+                continue
+
+        if resp is not None and last_err is None:
+            break
+
+    if resp is None:
+        raise RuntimeError(
+            f"OpenAI image generation failed for models {models_to_try}. Last error: {last_err!r}"
+        ) from last_err
 
     data0 = None
     try:
@@ -950,8 +973,8 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
 
     if url:
         raise RuntimeError("Image API returned URL-only output; URL fetch not supported in this pipeline.")
-    raise RuntimeError("Image API returned neither b64_json nor url.")
 
+    raise RuntimeError("Image API response missing b64_json and url.")
 
 def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[str]:
     """
