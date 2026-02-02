@@ -1551,33 +1551,30 @@ if uploaded_bonus:
         _log(f"📥 Bonus uploads: saved {saved_any} file(s) into _bonus_uploads/")
         st.success(f"Saved {saved_any} MP4(s) into `_bonus_uploads/`.")
 
-# Build upload-only dropdown options (scan + session, then prune)
-_prune_missing_bonus_paths()
-bonus_files = _scan_mp4s(bonus_dir)
 
-# Merge scan results and session (scan-first gives stable ordering)
-session_paths = st.session_state.get("bonus_uploaded_mp4s", []) or []
-merged = []
-for p in bonus_files + session_paths:
-    if p and p not in merged and Path(p).exists():
-        merged.append(p)
-
-# Keep selection sticky: if current selection is missing, reset to blank
-src_choices = [""] + merged
-current_pick = st.session_state.get("shorts_src_choice", "") or ""
-if current_pick and current_pick not in src_choices:
-    st.session_state["shorts_src_choice"] = ""
+# Build upload-only dropdown options (scan _bonus_uploads on every rerun; no caching).
+bonus_dir.mkdir(parents=True, exist_ok=True)
+bonus_names = sorted([p.name for p in bonus_dir.glob("*.mp4")])
 
 colS1, colS2, colS3 = st.columns([1, 1, 1])
+
 with colS1:
-    src_pick = st.selectbox(
-        "Source MP4 (uploads only)",
-        options=src_choices,
-        index=0,
-        disabled=st.session_state["is_generating"],
-        key="shorts_src_choice",
-        help="Pick an uploaded MP4 to convert to 9:16.",
-    )
+    if bonus_names:
+        # Dynamic key forces Streamlit to re-init when uploads change (fixes "dead" dropdown).
+        _bonus_key = f"shorts_src_choice_{len(bonus_names)}"
+        src_name = st.selectbox(
+            "Source MP4 (uploads only)",
+            options=bonus_names,
+            index=0,
+            disabled=st.session_state["is_generating"],
+            key=_bonus_key,
+            help="Pick an uploaded MP4 to convert to 9:16.",
+        )
+        src_pick = str(bonus_dir / src_name)
+    else:
+        st.info("Upload an MP4 above to enable selection.")
+        src_pick = ""
+
 with colS2:
     trim_seconds = st.number_input(
         "Trim to first N seconds (0 = no trim)",
