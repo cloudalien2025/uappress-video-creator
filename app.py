@@ -1,7 +1,8 @@
-# SECTION 1 — Imports + Page Setup
 # ============================
 # app.py — UAPpress Video Creator
+# Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).
 # ============================
+
 from __future__ import annotations
 
 import gc
@@ -15,38 +16,46 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
+
 import video_pipeline as vp
 
-# OpenAI client for Sora brand clips
+# OpenAI client (used for Sora brand clips; image generation happens inside video_pipeline.render_segment_mp4)
 from openai import OpenAI
 
-# boto3 (classic S3 API) — add to requirements.txt: boto3>=1.34.0
+# DigitalOcean Spaces (S3-compatible)
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 
+# ----------------------------
+# Page setup
+# ----------------------------
 st.set_page_config(page_title="UAPpress — Video Creator", layout="wide")
 st.title("🛸 UAPpress — Video Creator")
 st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).")
 
 
+# ===============================================================
 # SECTION 2 — Safe session_state init + Sidebar
-# ----------------------------
+# ===============================================================
+
 DEFAULTS = {
-    "api_key": "",         # OpenAI key (session only)
+    "api_key": "",                 # OpenAI key (session only)
     "ui_resolution": "1280x720",
-    "zip_path": "",        # path to uploaded zip on disk
-    "workdir": "",         # temp working directory
-    "extract_dir": "",     # extracted zip folder
-    "segments": [],        # normalized segment list
+    "zip_path": "",                # absolute path to uploaded zip on disk
+    "zip_root": "",                # temp dir containing the saved zip (so we can clean it)
+    "workdir": "",                 # temp working directory (created by extract_zip_to_temp)
+    "extract_dir": "",             # extracted zip folder
+    "segments": [],                # normalized segment list
     "last_error": "",
 }
+
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Part 2 state
+# Generation state
 if "is_generating" not in st.session_state:
     st.session_state["is_generating"] = False
 if "stop_requested" not in st.session_state:
@@ -64,7 +73,7 @@ if "spaces_public_urls" not in st.session_state:
 if "spaces_last_prefix" not in st.session_state:
     st.session_state["spaces_last_prefix"] = ""  # str
 if "spaces_uploaded_keys" not in st.session_state:
-    st.session_state["spaces_uploaded_keys"] = set()  # set[str] (in-memory for this session)
+    st.session_state["spaces_uploaded_keys"] = set()  # set[str] (session-only)
 if "spaces_manifest_url" not in st.session_state:
     st.session_state["spaces_manifest_url"] = ""  # str
 
@@ -95,32 +104,47 @@ with st.sidebar:
     )
 
 
+# ===============================================================
 # SECTION 3 — ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
-# ----------------------------
+# ===============================================================
+
 def _reset_zip_state() -> None:
+    # Clean extract workdir
     try:
         if st.session_state.workdir and os.path.isdir(st.session_state.workdir):
             shutil.rmtree(st.session_state.workdir, ignore_errors=True)
     except Exception:
         pass
 
+    # Clean uploaded zip root (separate temp dir)
+    try:
+        if st.session_state.zip_root and os.path.isdir(st.session_state.zip_root):
+            shutil.rmtree(st.session_state.zip_root, ignore_errors=True)
+    except Exception:
+        pass
+
     st.session_state.zip_path = ""
+    st.session_state.zip_root = ""
     st.session_state.workdir = ""
     st.session_state.extract_dir = ""
     st.session_state.segments = []
     st.session_state.last_error = ""
 
+    # Do not wipe generation logs by default (helps debugging)
+    # st.session_state["gen_log"] = []
+    # st.session_state["generated"] = {}
 
-def _save_uploaded_zip(uploaded_file) -> str:
+
+def _save_uploaded_zip(uploaded_file) -> Tuple[str, str]:
     """
     Save uploaded ZIP to disk immediately.
-    Returns absolute file path.
+    Returns (zip_root_dir, absolute_zip_path).
     """
     root = tempfile.mkdtemp(prefix="uappress_zip_")
     zip_path = os.path.join(root, "tts_studio_upload.zip")
     with open(zip_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
-    return zip_path
+    return root, zip_path
 
 
 def _normalize_segments(pairs: List[dict]) -> List[dict]:
@@ -161,13 +185,15 @@ def _normalize_segments(pairs: List[dict]) -> List[dict]:
         else:
             key = f"segment_{i:02d}"
 
-        segments.append({
-            "index": i,
-            "key": key,
-            "label": label.title(),
-            "title": title,
-            "pair": p,  # original pipeline pair (audio + script paths)
-        })
+        segments.append(
+            {
+                "index": i,
+                "key": key,
+                "label": label.title(),
+                "title": title,
+                "pair": p,  # original pipeline pair (audio + script paths)
+            }
+        )
     return segments
 
 
@@ -185,16 +211,17 @@ with colA:
         _reset_zip_state()
         st.rerun()
 
+# If a new upload arrives, reset state and extract
 if uploaded is not None:
     try:
         _reset_zip_state()
 
-        zip_path = _save_uploaded_zip(uploaded)
+        zip_root, zip_path = _save_uploaded_zip(uploaded)
+        st.session_state.zip_root = zip_root
         st.session_state.zip_path = zip_path
 
-        # ✅ IMPORTANT FIX (kept):
-        # video_pipeline.extract_zip_to_temp expects ZIP BYTES (not a file path).
-        # So read bytes from disk (without storing them in session_state).
+        # extract_zip_to_temp in video_pipeline accepts bytes or path.
+        # Keep bytes mode here (works even if you later move zip_path).
         with open(zip_path, "rb") as f:
             zip_bytes = f.read()
 
@@ -231,8 +258,10 @@ if st.session_state.zip_path:
 st.caption("Next: Generate videos sequentially (crash-safe).")
 
 
+# ===============================================================
 # SECTION 4 — Shared Helpers (Logging, Paths, Resolution, Spaces)
-# ----------------------------
+# ===============================================================
+
 def _log(msg: str) -> None:
     st.session_state["gen_log"].append(msg)
 
@@ -292,18 +321,21 @@ def _scan_mp4s(out_dir: str) -> List[str]:
 
 
 def _read_spaces_secret(key: str, default: str = "") -> str:
+    # st.secrets first
     try:
         if "do_spaces" in st.secrets and key in st.secrets["do_spaces"]:
             return str(st.secrets["do_spaces"][key]).strip()
     except Exception:
         pass
 
+    # flat secrets fallback
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
     except Exception:
         pass
 
+    # env fallback
     env_map = {
         "key": "DO_SPACES_KEY",
         "secret": "DO_SPACES_SECRET",
@@ -456,8 +488,10 @@ def _write_and_upload_manifest(
     return url
 
 
-# SECTION 5 — GLOBAL Sora Brand Intro/Outro (Fix: params + content download compat)
-# ----------------------------
+# ===============================================================
+# SECTION 5 — GLOBAL Sora Brand Intro/Outro (compat-safe)
+# ===============================================================
+
 def _can_do_branding() -> bool:
     return bool(getattr(vp, "BrandIntroOutroSpec", None)) and bool(getattr(vp, "generate_sora_brand_intro_outro", None))
 
@@ -468,6 +502,10 @@ def _global_brand_filenames(brand_slug: str) -> Tuple[str, str]:
 
 
 class _VideosCompat:
+    """
+    Some OpenAI SDK builds expose the download as videos.download_content() not videos.content().
+    This wrapper preserves a stable .content(video_id) call for older pipeline code paths.
+    """
     def __init__(self, videos_obj):
         self._v = videos_obj
 
@@ -475,8 +513,6 @@ class _VideosCompat:
         return getattr(self._v, name)
 
     def content(self, video_id: str, *args, **kwargs):
-        # FIX: Some OpenAI SDK versions expose download as videos.download_content(), not videos.content().
-        # This keeps older pipeline code (client.videos.content(video_id)) working without refactors.
         if hasattr(self._v, "content"):
             return self._v.content(video_id, *args, **kwargs)
         if hasattr(self._v, "download_content"):
@@ -516,7 +552,7 @@ def _generate_global_brand_clips(
 ) -> None:
     if not _can_do_branding():
         _log("⚠️ Branding not available: missing BrandIntroOutroSpec/generate_sora_brand_intro_outro in video_pipeline.py")
-        st.warning("Branding not available yet. Add Part 4/5 + Part 5/5 to video_pipeline.py first.")
+        st.warning("Branding not available yet. Ensure BrandIntroOutroSpec + generate_sora_brand_intro_outro exist in video_pipeline.py.")
         return
 
     brand_dir = _brand_out_dir(extract_dir)
@@ -541,19 +577,20 @@ def _generate_global_brand_clips(
         cta_line=cta_line.strip() or "Subscribe for more investigations.",
         sponsor_line=sponsor,
         aspect=(aspect or "landscape").strip(),
+        global_mode=True,
     )
 
     st.info("Generating GLOBAL Sora brand intro/outro…")
     _log("🎬 Generating GLOBAL Sora brand intro/outro…")
 
     raw_client = OpenAI(api_key=str(api_key))
-    client = _OpenAIClientCompat(raw_client)  # FIX: ensures client.videos.content(video_id) works if pipeline calls it.
+    client = _OpenAIClientCompat(raw_client)
 
     intro_ref = intro_reference_image.strip() or None
     outro_ref = outro_reference_image.strip() or None
 
-    # FIX: Caller now uses intro_seconds/outro_seconds (not seconds=) to match updated generator signature.
-    #      Includes a tiny fallback for older generator versions to avoid breaking Streamlit Cloud deploys.
+    # Preferred: intro_seconds/outro_seconds (new)
+    # Fallback: seconds (older)
     try:
         intro_path, outro_path = gen_fn(
             client,
@@ -631,16 +668,15 @@ def _generate_global_brand_clips(
             st.warning("Global brand clips generated locally, but upload failed. See Upload log.")
 
 
+# ===============================================================
 # SECTION 6 — Segment MP4 Generation (Sequential, Crash-Safe) + Auto-upload
-# ----------------------------
+# ===============================================================
+
 def _render_segment_mp4_compat(**kwargs) -> None:
     """
     Compatibility shim:
-    - Your app.py expects video_pipeline.render_segment_mp4(...)
-    - But some versions of video_pipeline.py may expose a different function name.
-
-    This tries a short list of likely names and calls the first one found.
-    If none are found, it raises a helpful error that lists candidate functions.
+    - app.py expects video_pipeline.render_segment_mp4(...)
+    - If pipeline exposes a different function name, try common candidates.
     """
     candidate_names = [
         "render_segment_mp4",      # expected
@@ -657,7 +693,6 @@ def _render_segment_mp4_compat(**kwargs) -> None:
         if callable(fn):
             return fn(**kwargs)
 
-    # Nothing matched — raise a helpful error with hints
     available = [n for n in dir(vp) if ("render" in n.lower() or "segment" in n.lower() or "mp4" in n.lower())]
     raise AttributeError(
         "video_pipeline has no supported segment render function.\n"
@@ -770,7 +805,6 @@ def generate_all_segments_sequential(
 
         t0 = time.time()
         try:
-            # ✅ FIX: call compatibility shim instead of vp.render_segment_mp4 directly
             _render_segment_mp4_compat(
                 pair=seg["pair"],
                 extract_dir=extract_dir,
@@ -834,8 +868,11 @@ def generate_all_segments_sequential(
 
     _reset_gen_flags()
 
+
+# ===============================================================
 # SECTION 7 — UI (Generate + Branding + Results + Previews + Logs)
-# ----------------------------
+# ===============================================================
+
 st.subheader("🎬 Generate Segment MP4s")
 
 extract_dir = st.session_state.get("extract_dir", "")
@@ -856,16 +893,11 @@ st.caption(f"Segments will be saved to: {out_dir}")
 w, h = _get_resolution_wh()
 
 # --- Crash-safe defaults for dependent sliders (Min/Max scene seconds) ---
-# Streamlit persists widget values across reruns. If Min increases above a previously saved Max,
-# the Max slider can crash because its stored value is now < min_value.
-#
-# ✅ FIX (also removes Streamlit warning):
-# If you set st.session_state["min_scene_seconds"] and use key="min_scene_seconds",
-# DO NOT pass value=... into the slider. Same for max_scene_seconds.
 if "min_scene_seconds" not in st.session_state:
     st.session_state["min_scene_seconds"] = 20
 if "max_scene_seconds" not in st.session_state:
     st.session_state["max_scene_seconds"] = 40
+
 
 def _clamp_max_scene_seconds() -> None:
     """Ensure max_scene_seconds is never below min_scene_seconds (prevents Streamlit crash)."""
@@ -873,6 +905,7 @@ def _clamp_max_scene_seconds() -> None:
     mx = int(st.session_state.get("max_scene_seconds", 40))
     if mx < mn:
         st.session_state["max_scene_seconds"] = mn
+
 
 colA, colB, colC = st.columns([1, 1, 1])
 with colA:
@@ -915,7 +948,6 @@ with colD:
         key="max_scenes_value",
     )
 with colE:
-    # ✅ Key + on_change clamp ensures changing Min can't invalidate saved Max
     min_scene_seconds = st.slider(
         "Min seconds per scene",
         min_value=5,
@@ -926,7 +958,6 @@ with colE:
         on_change=_clamp_max_scene_seconds,
     )
 with colF:
-    # Ensure max is valid before rendering the max slider
     _clamp_max_scene_seconds()
     max_scene_seconds = st.slider(
         "Max seconds per scene",
@@ -969,7 +1000,7 @@ st.markdown("---")
 st.subheader("🛰️ Global Brand Intro/Outro (Sora) — Radar/FLIR HUD")
 
 if not _can_do_branding():
-    st.caption("Brand helpers not detected in video_pipeline.py (add Part 4/5 + Part 5/5 there).")
+    st.caption("Brand helpers not detected in video_pipeline.py (BrandIntroOutroSpec + generate_sora_brand_intro_outro).")
 
 colB1, colB2 = st.columns([1, 1])
 with colB1:
@@ -1246,5 +1277,3 @@ if st.session_state.get("gen_log"):
     st.code("\n".join(st.session_state["gen_log"][-200:]))
 else:
     st.caption("Log will appear here.")
-
-
