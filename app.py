@@ -855,12 +855,28 @@ st.caption(f"Segments will be saved to: {out_dir}")
 
 w, h = _get_resolution_wh()
 
+# --- Crash-safe defaults for dependent sliders (Min/Max scene seconds) ---
+# Streamlit persists widget values across reruns. If Min increases above a previously saved Max,
+# the Max slider can crash because its stored value is now < min_value.
+if "min_scene_seconds" not in st.session_state:
+    st.session_state["min_scene_seconds"] = 20
+if "max_scene_seconds" not in st.session_state:
+    st.session_state["max_scene_seconds"] = 40
+
+def _clamp_max_scene_seconds() -> None:
+    """Ensure max_scene_seconds is never below min_scene_seconds (prevents Streamlit crash)."""
+    mn = int(st.session_state.get("min_scene_seconds", 20))
+    mx = int(st.session_state.get("max_scene_seconds", 40))
+    if mx < mn:
+        st.session_state["max_scene_seconds"] = mn
+
 colA, colB, colC = st.columns([1, 1, 1])
 with colA:
     overwrite = st.checkbox(
         "Overwrite existing MP4s",
         value=False,
         disabled=st.session_state["is_generating"],
+        key="overwrite_mp4s",
     )
 with colB:
     fps = st.number_input(
@@ -870,6 +886,7 @@ with colB:
         value=30,
         step=1,
         disabled=st.session_state["is_generating"],
+        key="fps_value",
     )
 with colC:
     zoom_strength = st.slider(
@@ -879,6 +896,7 @@ with colC:
         value=1.06,
         step=0.01,
         disabled=st.session_state["is_generating"],
+        key="zoom_strength_value",
     )
 
 colD, colE, colF = st.columns([1, 1, 1])
@@ -890,24 +908,31 @@ with colD:
         value=9,
         step=1,
         disabled=st.session_state["is_generating"],
+        key="max_scenes_value",
     )
 with colE:
+    # ✅ Key + on_change clamp ensures changing Min can't invalidate saved Max
     min_scene_seconds = st.slider(
         "Min seconds per scene",
         min_value=5,
         max_value=60,
-        value=20,
+        value=int(st.session_state.get("min_scene_seconds", 20)),
         step=1,
         disabled=st.session_state["is_generating"],
+        key="min_scene_seconds",
+        on_change=_clamp_max_scene_seconds,
     )
 with colF:
+    # ✅ Use session_state value (already clamped) and set slider bounds accordingly
+    _clamp_max_scene_seconds()
     max_scene_seconds = st.slider(
         "Max seconds per scene",
-        min_value=int(min_scene_seconds),
+        min_value=int(st.session_state["min_scene_seconds"]),
         max_value=120,
-        value=40,
+        value=int(st.session_state.get("max_scene_seconds", max(40, int(st.session_state["min_scene_seconds"])))),
         step=1,
         disabled=st.session_state["is_generating"],
+        key="max_scene_seconds",
     )
 
 st.markdown("---")
@@ -920,12 +945,14 @@ with colU1:
         value=True,
         disabled=st.session_state["is_generating"],
         help="Uploads immediately after each segment finishes. No export button required.",
+        key="auto_upload_value",
     )
 with colU2:
     make_public = st.checkbox(
         "Make uploaded files public (ACL: public-read)",
         value=True,
         disabled=st.session_state["is_generating"],
+        key="make_public_value",
     )
 with colU3:
     prefix_override = st.text_input(
@@ -933,6 +960,7 @@ with colU3:
         value=st.session_state.get("spaces_last_prefix", ""),
         disabled=st.session_state["is_generating"],
         help="Leave blank to auto-generate: uappress/<job>/<timestamp>/",
+        key="prefix_override_value",
     )
 
 st.markdown("---")
@@ -948,6 +976,7 @@ with colB1:
         value=False,
         disabled=st.session_state["is_generating"],
         help="Off by default. Generates 2 reusable brand MP4s (GLOBAL_INTRO/OUTRO).",
+        key="gen_global_after_value",
     )
 with colB2:
     gen_global_now = st.button(
@@ -955,15 +984,16 @@ with colB2:
         disabled=st.session_state["is_generating"],
         use_container_width=True,
         help="Creates or updates your GLOBAL brand bumpers (reused across all episodes).",
+        key="gen_global_now_btn",
     )
 
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
-    brand_name = st.text_input("Brand name", value="UAPpress", disabled=st.session_state["is_generating"])
+    brand_name = st.text_input("Brand name", value="UAPpress", disabled=st.session_state["is_generating"], key="brand_name_value")
 with c2:
-    channel_or_series = st.text_input("Channel / series", value="UAPpress Investigations", disabled=st.session_state["is_generating"])
+    channel_or_series = st.text_input("Channel / series", value="UAPpress Investigations", disabled=st.session_state["is_generating"], key="channel_series_value")
 with c3:
-    aspect = st.selectbox("Aspect", options=["landscape", "portrait"], index=0, disabled=st.session_state["is_generating"])
+    aspect = st.selectbox("Aspect", options=["landscape", "portrait"], index=0, disabled=st.session_state["is_generating"], key="aspect_value")
 
 c4, c5, c6 = st.columns([1, 1, 1])
 with c4:
@@ -973,6 +1003,7 @@ with c4:
         index=0,
         disabled=st.session_state["is_generating"],
         help="Pro = higher quality typography/consistency (recommended for one-time global assets).",
+        key="model_tier_value",
     )
 with c5:
     intro_seconds = st.selectbox(
@@ -980,6 +1011,7 @@ with c5:
         options=["4", "8", "12"],
         index=1,
         disabled=st.session_state["is_generating"],
+        key="intro_seconds_value",
     )
 with c6:
     outro_seconds = st.selectbox(
@@ -987,12 +1019,14 @@ with c6:
         options=["4", "8", "12"],
         index=1,
         disabled=st.session_state["is_generating"],
+        key="outro_seconds_value",
     )
 
 cta_line = st.text_input(
     "CTA line (outro)",
     value="Subscribe for more investigations.",
     disabled=st.session_state["is_generating"],
+    key="cta_line_value",
 )
 
 sponsor_line = st.text_input(
@@ -1000,6 +1034,7 @@ sponsor_line = st.text_input(
     value="",
     disabled=st.session_state["is_generating"],
     help="Example: Sponsored by OPA Nutrition",
+    key="sponsor_line_value",
 )
 
 default_brief = (
@@ -1020,6 +1055,7 @@ creative_brief = st.text_area(
     height=150,
     disabled=st.session_state["is_generating"],
     help="This is the main control for the look/feel. Pre-filled for Radar/FLIR HUD vibe.",
+    key="creative_brief_value",
 )
 
 with st.expander("Advanced (optional)", expanded=False):
@@ -1028,12 +1064,14 @@ with st.expander("Advanced (optional)", expanded=False):
         value="",
         disabled=st.session_state["is_generating"],
         help="Local path on the server (Streamlit). Leave blank if unused.",
+        key="intro_reference_image_value",
     )
     outro_reference_image = st.text_input(
         "Outro reference image path (optional)",
         value="",
         disabled=st.session_state["is_generating"],
         help="Local path on the server (Streamlit). Leave blank if unused.",
+        key="outro_reference_image_value",
     )
 
 col1, col2 = st.columns([1, 1])
@@ -1043,6 +1081,7 @@ with col1:
         type="primary",
         disabled=st.session_state["is_generating"] or (len(segments) == 0),
         use_container_width=True,
+        key="generate_videos_btn",
     )
 with col2:
     st.button(
@@ -1050,6 +1089,7 @@ with col2:
         disabled=not st.session_state["is_generating"],
         on_click=_request_stop,
         use_container_width=True,
+        key="stop_after_segment_btn",
     )
 
 if gen_global_now:
@@ -1084,8 +1124,8 @@ if generate_clicked:
         width=int(w),
         height=int(h),
         max_scenes=int(max_scenes),
-        min_scene_seconds=int(min_scene_seconds),
-        max_scene_seconds=int(max_scene_seconds),
+        min_scene_seconds=int(st.session_state["min_scene_seconds"]),
+        max_scene_seconds=int(st.session_state["max_scene_seconds"]),
         api_key=api_key,
         auto_upload=bool(auto_upload),
         make_public=bool(make_public),
@@ -1120,7 +1160,7 @@ manifest_url = st.session_state.get("spaces_manifest_url", "")
 
 if urls:
     st.success(f"Uploaded **{len(urls)}** file(s) to Spaces:")
-    st.text_area("Public URLs (copy/paste)", value="\n".join(urls), height=180)
+    st.text_area("Public URLs (copy/paste)", value="\n".join(urls), height=180, key="public_urls_textarea")
 else:
     st.caption("No uploaded URLs yet (generate a segment with auto-upload enabled).")
 
@@ -1183,3 +1223,4 @@ if st.session_state.get("gen_log"):
     st.code("\n".join(st.session_state["gen_log"][-200:]))
 else:
     st.caption("Log will appear here.")
+
