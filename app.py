@@ -339,7 +339,7 @@ if st.session_state.zip_path:
         for s in st.session_state.segments:
             st.write(f"{s['index']}. **{s['label']}** — {s['title'] or 'Untitled'}")
 
-st.caption("Next: Generate videos sequentially (crash-safe).", disabled=(not (zip_ready and api_ready)))
+st.caption("Next: Generate videos sequentially (crash-safe).")
 
 
 # ===============================================================
