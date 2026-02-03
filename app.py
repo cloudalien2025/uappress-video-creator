@@ -21,11 +21,13 @@ from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 
-import video_pipeline as vp
+try:
+    import video_pipeline as vp
+except Exception as e:
+    st.error(f"Failed to import video_pipeline.py: {e}")
+    st.stop()
 
 
-# Back-compat: older builds referenced this private helper name
-_generate_all_segments_sequential = getattr(vp, "generate_all_segments_sequential", None) or getattr(vp, "_generate_all_segments_sequential", None)
 
 
 # DigitalOcean Spaces (S3-compatible)
