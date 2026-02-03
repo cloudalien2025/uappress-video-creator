@@ -656,9 +656,11 @@ def generate_all_segments_sequential(
     auto_upload: bool,
     make_public: bool,
     prefix_override: str,
-) -> None:
+) -> list[str]:
     st.session_state["is_generating"] = True
     st.session_state["stop_requested"] = False
+    outputs: list[str] = []
+
 
     progress = st.progress(0.0)
     status = st.empty()
@@ -678,7 +680,6 @@ def generate_all_segments_sequential(
             s3, bucket, region, public_base = _spaces_client_and_context()
             job_prefix = (prefix_override or "").strip() or _job_prefix()
             if not job_prefix.endswith("/"):
-    outputs: List[str] = []
                 job_prefix += "/"
             st.session_state["spaces_last_prefix"] = job_prefix
             _ulog(f"Auto-upload enabled → Bucket: {bucket} | Region: {region}")
@@ -700,6 +701,7 @@ def generate_all_segments_sequential(
         # If already exists and overwrite is off, still upload it (optional) and continue
         if (not overwrite) and Path(out_path).exists():
             st.session_state["generated"][seg_key] = out_path
+            outputs.append(out_path)
             status.info(f"Skipping generate (already exists): {seg_label}")
             detail.caption(f"Output: {out_path}")
 
@@ -758,6 +760,7 @@ def generate_all_segments_sequential(
             )
 
             st.session_state["generated"][seg_key] = out_path
+            outputs.append(out_path)
             dt = time.time() - t0
             _log(f"✅ Generated {seg_label} in {dt:.1f}s")
 
