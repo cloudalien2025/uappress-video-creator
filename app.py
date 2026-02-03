@@ -872,6 +872,86 @@ def _ffmpeg_make_vertical_clip(
 
 # ===============================================================
 # SECTION 7 — UI (Generate + Branding + Results + Previews + Logs)
+
+# ----------------------------
+# Cinematic / Visual-first Shorts — Sora Prompt Studio (Shorts mode only)
+# ----------------------------
+if video_mode.startswith("Shorts"):
+    st.header("🎬 Cinematic / Visual-first Shorts — Sora Prompt Studio")
+    st.caption("Build a clean, brand-consistent prompt for Sora. Paste the result into Sora. This does not generate video inside the app.")
+
+    colA, colB, colC = st.columns([1, 1, 1])
+    with colA:
+        sora_len_label = st.selectbox(
+            "Length preset",
+            ["7s (Ultra-hook)", "12s (Narrative beat)", "18s (Mini-story)"],
+            index=1,
+            key="sora_len_preset",
+        )
+    with colB:
+        sora_look = st.selectbox(
+            "Look",
+            ["Cinematic realism", "Archival reenactment"],
+            index=0,
+            key="sora_look",
+        )
+    with colC:
+        sora_camera = st.selectbox(
+            "Camera motion",
+            ["Slow drift (stable)", "Handheld subtle", "Orbit / parallax"],
+            index=0,
+            key="sora_camera",
+        )
+
+    sora_beat = st.text_area(
+        "Short beat (what happens on-screen)",
+        height=130,
+        key="sora_short_beat",
+        placeholder="Example: Night in Suffolk. A small patrol of U.S. Air Force security police moves through pine trees, red lights in the distance, fog hanging low, measured and restrained.",
+    )
+
+    sora_constraints = st.text_area(
+        "Constraints / notes (optional)",
+        height=90,
+        key="sora_constraints",
+        placeholder="Example: No gore, no monsters, no cheesy sci‑fi, no exaggerated UFO shapes, no logos. Minimal readable HUD overlays only.",
+    )
+
+    if st.button("Build Sora prompt", type="primary", key="build_sora_prompt_btn"):
+        seconds = int(sora_len_label.split("s")[0])
+        mode = "cinematic_realism" if sora_look == "Cinematic realism" else "archival_reenactment"
+        base_prompt = (sora_beat or "").strip()
+        if sora_camera:
+            base_prompt += f"\nCamera: {sora_camera}."
+        if sora_constraints and sora_constraints.strip():
+            base_prompt += f"\nConstraints: {sora_constraints.strip()}"
+        if not base_prompt.strip():
+            st.warning("Add at least a short beat to generate a Sora prompt.")
+        else:
+            final_prompt = vp.build_sora_prompt(
+                base_prompt,
+                mode=mode,
+                length_s=seconds,
+                aspect="9:16",
+                fps=30,
+            )
+            st.session_state["sora_prompt_built"] = final_prompt
+
+    if st.session_state.get("sora_prompt_built"):
+        st.text_area(
+            "Final Sora prompt (copy/paste)",
+            value=st.session_state["sora_prompt_built"],
+            height=260,
+            key="sora_prompt_out",
+        )
+        st.download_button(
+            "Download prompt (.txt)",
+            data=st.session_state["sora_prompt_built"].encode("utf-8"),
+            file_name="uappress_sora_short_prompt.txt",
+            mime="text/plain",
+        )
+
+    st.divider()
 # ===============================================================
 
 st.subheader("🎬 Generate Segment MP4s")
@@ -1017,286 +1097,216 @@ with col2:
     )
 
 
-# --- Run generation when clicked ---
-if generate_clicked:
-    # Clear previous run logs (keep upload logs)
-    st.session_state["gen_log"] = []
-    st.session_state["last_error"] = ""
-
-    generate_all_segments_sequential(
-        segments=segments,
-        extract_dir=extract_dir,
-        out_dir=out_dir,
-        overwrite=bool(overwrite),
-        zoom_strength=float(zoom_strength),
-        fps=int(fps),
-        width=int(w),
-        height=int(h),
-        max_scenes=int(max_scenes),
-        min_scene_seconds=int(min_scene_seconds),
-        max_scene_seconds=int(max_scene_seconds),
-        api_key=str(api_key),
-        auto_upload=bool(auto_upload),
-        make_public=bool(make_public),
-        prefix_override=str(prefix_override or ""),
-    )
-    st.rerun()
 
 
 
 
+    with tabs[1]:
+        st.markdown("---")
+        st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
 
-
-
-st.markdown("---")
-
-
-st.markdown("---")
-st.subheader("✅ Generated MP4s")
-
-mp4s = _scan_mp4s(out_dir)
-if not mp4s:
-    st.caption("No MP4s generated yet.")
-else:
-    st.caption(f"Found {len(mp4s)} MP4(s) in the output folder.")
-    with st.expander("Show generated files + previews", expanded=False):
-        for p in mp4s:
-            name = Path(p).name
-            st.write(f"**{name}**")
-            st.video(p)
-            with open(p, "rb") as f:
-                st.download_button(
-                    label=f"⬇️ Download {name}",
-                    data=f,
-                    file_name=name,
-                    mime="video/mp4",
-                    key=f"dl_seg_{name}",
-                )
-
-st.markdown("---")
-st.subheader("☁️ Spaces Upload Log & Links")
-
-if st.session_state.get("spaces_manifest_url"):
-    st.write(f"**Manifest:** {st.session_state['spaces_manifest_url']}")
-
-urls = st.session_state.get("spaces_public_urls", []) or []
-if urls:
-    st.write("**Uploaded files:**")
-    for u in urls[-50:]:
-        st.write(u)
-else:
-    st.caption("No uploads yet (or auto-upload disabled).")
-
-with st.expander("Spaces upload log", expanded=False):
-    if st.session_state.get("spaces_upload_log"):
-        st.code("\n".join(st.session_state["spaces_upload_log"][-300:]))
-    else:
-        st.caption("Upload log will appear here.")
-
-st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
-
-st.caption(
-    "This is **post-processing only**. Upload any MP4 below; it will be saved into `_bonus_uploads/` "
-    "for this job and will remain available across reruns. The source dropdown shows **uploads only**."
-)
-
-shorts_dir = _shorts_out_dir(extract_dir)
-bonus_dir = _bonus_upload_dir(extract_dir)
-
-
-def _prune_missing_bonus_paths() -> None:
-    paths = st.session_state.get("bonus_uploaded_mp4s", []) or []
-    kept = [p for p in paths if p and Path(p).exists()]
-    st.session_state["bonus_uploaded_mp4s"] = kept
-
-
-def _save_bonus_upload(uploaded_file) -> Optional[str]:
-    """
-    Save an uploaded MP4 into extract_dir/_bonus_uploads with collision-safe naming.
-    Returns absolute path.
-    """
-    if uploaded_file is None:
-        return None
-
-    # Timestamp prefix prevents overwrite and makes ordering clear
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    original = (uploaded_file.name or "uploaded.mp4").strip()
-    stem = Path(original).stem
-    slug = vp.safe_slug(stem, max_len=60)
-    filename = f"{ts}_{slug}.mp4"
-    dst = Path(bonus_dir) / filename
-
-    with open(dst, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
-    return str(dst)
-
-
-# Uploader (allow multiple)
-uploaded_bonus = st.file_uploader(
-    "Upload MP4(s) to use as Bonus sources",
-    type=["mp4"],
-    accept_multiple_files=True,
-    disabled=st.session_state["is_generating"],
-    key="bonus_mp4_uploader",
-    help="Uploaded MP4s are saved into this job at: extract_dir/_bonus_uploads/",
-)
-
-if uploaded_bonus:
-    saved_any = 0
-    for uf in uploaded_bonus:
-        try:
-            saved_path = _save_bonus_upload(uf)
-            if saved_path:
-                # Add to session list (dedupe)
-                cur = st.session_state.get("bonus_uploaded_mp4s", []) or []
-                if saved_path not in cur:
-                    cur.append(saved_path)
-                    st.session_state["bonus_uploaded_mp4s"] = cur
-                saved_any += 1
-        except Exception as e:
-            st.error(f"Bonus upload failed for {getattr(uf, 'name', 'file')}: {type(e).__name__}: {e}")
-
-    if saved_any:
-        _log(f"📥 Bonus uploads: saved {saved_any} file(s) into _bonus_uploads/")
-        st.success(f"Saved {saved_any} MP4(s) into `_bonus_uploads/`.")
-
-# Build upload-only dropdown options (scan + session, then prune)
-_prune_missing_bonus_paths()
-bonus_files = _scan_mp4s(bonus_dir)
-
-# Merge scan results and session (scan-first gives stable ordering)
-session_paths = st.session_state.get("bonus_uploaded_mp4s", []) or []
-merged = []
-for p in bonus_files + session_paths:
-    if p and p not in merged and Path(p).exists():
-        merged.append(p)
-
-# Keep selection sticky: if current selection is missing, reset to blank
-src_choices = [""] + merged
-current_pick = st.session_state.get("shorts_src_choice", "") or ""
-if current_pick and current_pick not in src_choices:
-    st.session_state["shorts_src_choice"] = ""
-
-colS1, colS2, colS3 = st.columns([1, 1, 1])
-with colS1:
-    src_pick = st.selectbox(
-        "Source MP4 (uploads only)",
-        options=src_choices,
-        index=0,
-        disabled=st.session_state["is_generating"],
-        key="shorts_src_choice",
-        help="Pick an uploaded MP4 to convert to 9:16.",
-    )
-with colS2:
-    trim_seconds = st.number_input(
-        "Trim to first N seconds (0 = no trim)",
-        min_value=0,
-        max_value=600,
-        value=int(st.session_state.get("shorts_trim_seconds", 60)),
-        step=5,
-        disabled=st.session_state["is_generating"],
-        key="shorts_trim_seconds",
-    )
-with colS3:
-    vertical_res = st.selectbox(
-        "Export resolution (9:16)",
-        options=["720x1280", "1080x1920"],
-        index=1,
-        disabled=st.session_state["is_generating"],
-        key="shorts_export_res",
-    )
-
-export_clicked = st.button(
-    "🎬 Create 9:16 Export",
-    disabled=st.session_state["is_generating"] or not bool(src_pick),
-    use_container_width=True,
-    key="make_vertical_export_btn",
-)
-
-if export_clicked and src_pick:
-    try:
-        out_w, out_h = (720, 1280) if vertical_res == "720x1280" else (1080, 1920)
-        src_p = Path(src_pick)
-        dst_name = src_p.stem + f"_9x16_{out_w}x{out_h}.mp4"
-        dst_path = str(Path(shorts_dir) / dst_name)
-
-        st.info("Creating 9:16 export via ffmpeg…")
-        _log(f"🎬 Bonus export: {src_p.name} -> {dst_name} (trim={int(trim_seconds)}s)")
-
-        _ffmpeg_make_vertical_clip(
-            src_mp4=str(src_p),
-            dst_mp4=dst_path,
-            out_w=out_w,
-            out_h=out_h,
-            trim_seconds=int(trim_seconds),
-            keep_audio=True,
+        st.caption(
+            "This is **post-processing only**. Upload any MP4 below; it will be saved into `_bonus_uploads/` "
+            "for this job and will remain available across reruns. The source dropdown shows **uploads only**."
         )
 
-        st.success(f"Created: {dst_path}")
-        st.video(dst_path)
+        shorts_dir = _shorts_out_dir(extract_dir)
+        bonus_dir = _bonus_upload_dir(extract_dir)
 
-        with open(dst_path, "rb") as f:
-            st.download_button(
-                label="⬇️ Download 9:16 MP4",
-                data=f,
-                file_name=Path(dst_path).name,
-                mime="video/mp4",
-                key=f"dl_bonus_{Path(dst_path).name}",
+
+        def _prune_missing_bonus_paths() -> None:
+            paths = st.session_state.get("bonus_uploaded_mp4s", []) or []
+            kept = [p for p in paths if p and Path(p).exists()]
+            st.session_state["bonus_uploaded_mp4s"] = kept
+
+
+        def _save_bonus_upload(uploaded_file) -> Optional[str]:
+            """
+            Save an uploaded MP4 into extract_dir/_bonus_uploads with collision-safe naming.
+            Returns absolute path.
+            """
+            if uploaded_file is None:
+                return None
+
+            # Timestamp prefix prevents overwrite and makes ordering clear
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            original = (uploaded_file.name or "uploaded.mp4").strip()
+            stem = Path(original).stem
+            slug = vp.safe_slug(stem, max_len=60)
+            filename = f"{ts}_{slug}.mp4"
+            dst = Path(bonus_dir) / filename
+
+            with open(dst, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            return str(dst)
+
+
+        # Uploader (allow multiple)
+        uploaded_bonus = st.file_uploader(
+            "Upload MP4(s) to use as Bonus sources",
+            type=["mp4"],
+            accept_multiple_files=True,
+            disabled=st.session_state["is_generating"],
+            key="bonus_mp4_uploader",
+            help="Uploaded MP4s are saved into this job at: extract_dir/_bonus_uploads/",
+        )
+
+        if uploaded_bonus:
+            saved_any = 0
+            for uf in uploaded_bonus:
+                try:
+                    saved_path = _save_bonus_upload(uf)
+                    if saved_path:
+                        # Add to session list (dedupe)
+                        cur = st.session_state.get("bonus_uploaded_mp4s", []) or []
+                        if saved_path not in cur:
+                            cur.append(saved_path)
+                            st.session_state["bonus_uploaded_mp4s"] = cur
+                        saved_any += 1
+                except Exception as e:
+                    st.error(f"Bonus upload failed for {getattr(uf, 'name', 'file')}: {type(e).__name__}: {e}")
+
+            if saved_any:
+                _log(f"📥 Bonus uploads: saved {saved_any} file(s) into _bonus_uploads/")
+                st.success(f"Saved {saved_any} MP4(s) into `_bonus_uploads/`.")
+
+        # Build upload-only dropdown options (scan + session, then prune)
+        _prune_missing_bonus_paths()
+        bonus_files = _scan_mp4s(bonus_dir)
+
+        # Merge scan results and session (scan-first gives stable ordering)
+        session_paths = st.session_state.get("bonus_uploaded_mp4s", []) or []
+        merged = []
+        for p in bonus_files + session_paths:
+            if p and p not in merged and Path(p).exists():
+                merged.append(p)
+
+        # Keep selection sticky: if current selection is missing, reset to blank
+        src_choices = [""] + merged
+        current_pick = st.session_state.get("shorts_src_choice", "") or ""
+        if current_pick and current_pick not in src_choices:
+            st.session_state["shorts_src_choice"] = ""
+
+        colS1, colS2, colS3 = st.columns([1, 1, 1])
+        with colS1:
+            src_pick = st.selectbox(
+                "Source MP4 (uploads only)",
+                options=src_choices,
+                index=0,
+                disabled=st.session_state["is_generating"],
+                key="shorts_src_choice",
+                help="Pick an uploaded MP4 to convert to 9:16.",
+            )
+        with colS2:
+            trim_seconds = st.number_input(
+                "Trim to first N seconds (0 = no trim)",
+                min_value=0,
+                max_value=600,
+                value=int(st.session_state.get("shorts_trim_seconds", 60)),
+                step=5,
+                disabled=st.session_state["is_generating"],
+                key="shorts_trim_seconds",
+            )
+        with colS3:
+            vertical_res = st.selectbox(
+                "Export resolution (9:16)",
+                options=["720x1280", "1080x1920"],
+                index=1,
+                disabled=st.session_state["is_generating"],
+                key="shorts_export_res",
             )
 
-    except Exception as e:
-        st.error(f"Bonus export failed: {type(e).__name__}: {e}")
-        _log(f"❌ Bonus export failed: {type(e).__name__}: {e}")
+        export_clicked = st.button(
+            "🎬 Create 9:16 Export",
+            disabled=st.session_state["is_generating"] or not bool(src_pick),
+            use_container_width=True,
+            key="make_vertical_export_btn",
+        )
 
-# Optional auto-upload for bonus exports
-with st.expander("Auto-upload bonus exports to Spaces (optional)", expanded=False):
-    st.caption("This uploads files from `_shorts_exports/` to your Spaces prefix.")
-    bonus_upload = st.button(
-        "☁️ Upload ALL bonus exports now",
-        disabled=st.session_state["is_generating"],
-        use_container_width=True,
-        key="upload_bonus_exports_btn",
-    )
-    if bonus_upload:
-        try:
-            s3, bucket, region, public_base = _spaces_client_and_context()
-            job_prefix = (st.session_state.get("spaces_last_prefix", "") or _job_prefix()).strip()
-            if not job_prefix.endswith("/"):
-                job_prefix += "/"
-            bonus_prefix = job_prefix + "shorts_exports/"
-            _ulog(f"Bonus upload → {bonus_prefix}")
+        if export_clicked and src_pick:
+            try:
+                out_w, out_h = (720, 1280) if vertical_res == "720x1280" else (1080, 1920)
+                src_p = Path(src_pick)
+                dst_name = src_p.stem + f"_9x16_{out_w}x{out_h}.mp4"
+                dst_path = str(Path(shorts_dir) / dst_name)
 
-            bonus_files = _scan_mp4s(shorts_dir)
-            if not bonus_files:
-                st.info("No bonus exports found yet.")
-            else:
-                for p in bonus_files:
-                    name = Path(p).name
-                    object_key = f"{bonus_prefix}{name}"
-                    url = _upload_file_to_spaces(
-                        s3=s3,
-                        bucket=bucket,
-                        region=region,
-                        public_base=public_base or "",
-                        local_path=p,
-                        object_key=object_key,
-                        make_public=True,
-                        skip_if_exists=False,
-                        content_type="video/mp4",
+                st.info("Creating 9:16 export via ffmpeg…")
+                _log(f"🎬 Bonus export: {src_p.name} -> {dst_name} (trim={int(trim_seconds)}s)")
+
+                _ffmpeg_make_vertical_clip(
+                    src_mp4=str(src_p),
+                    dst_mp4=dst_path,
+                    out_w=out_w,
+                    out_h=out_h,
+                    trim_seconds=int(trim_seconds),
+                    keep_audio=True,
+                )
+
+                st.success(f"Created: {dst_path}")
+                st.video(dst_path)
+
+                with open(dst_path, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Download 9:16 MP4",
+                        data=f,
+                        file_name=Path(dst_path).name,
+                        mime="video/mp4",
+                        key=f"dl_bonus_{Path(dst_path).name}",
                     )
-                    if url not in st.session_state["spaces_public_urls"]:
-                        st.session_state["spaces_public_urls"].append(url)
-                    _ulog(f"✅ bonus {name} -> {url}")
 
-                st.success(f"Uploaded {len(bonus_files)} bonus export(s).")
-        except Exception as e:
-            st.error(f"Bonus upload failed: {type(e).__name__}: {e}")
-            _ulog(f"❌ Bonus upload failed: {type(e).__name__}: {e}")
+            except Exception as e:
+                st.error(f"Bonus export failed: {type(e).__name__}: {e}")
+                _log(f"❌ Bonus export failed: {type(e).__name__}: {e}")
 
-st.markdown("---")
-st.subheader("🧾 Generation Log")
-if st.session_state.get("gen_log"):
-    st.code("\n".join(st.session_state["gen_log"][-200:]))
-else:
-    st.caption("Log will appear here.")
+        # Optional auto-upload for bonus exports
+        with st.expander("Auto-upload bonus exports to Spaces (optional)", expanded=False):
+            st.caption("This uploads files from `_shorts_exports/` to your Spaces prefix.")
+            bonus_upload = st.button(
+                "☁️ Upload ALL bonus exports now",
+                disabled=st.session_state["is_generating"],
+                use_container_width=True,
+                key="upload_bonus_exports_btn",
+            )
+            if bonus_upload:
+                try:
+                    s3, bucket, region, public_base = _spaces_client_and_context()
+                    job_prefix = (st.session_state.get("spaces_last_prefix", "") or _job_prefix()).strip()
+                    if not job_prefix.endswith("/"):
+                        job_prefix += "/"
+                    bonus_prefix = job_prefix + "shorts_exports/"
+                    _ulog(f"Bonus upload → {bonus_prefix}")
+
+                    bonus_files = _scan_mp4s(shorts_dir)
+                    if not bonus_files:
+                        st.info("No bonus exports found yet.")
+                    else:
+                        for p in bonus_files:
+                            name = Path(p).name
+                            object_key = f"{bonus_prefix}{name}"
+                            url = _upload_file_to_spaces(
+                                s3=s3,
+                                bucket=bucket,
+                                region=region,
+                                public_base=public_base or "",
+                                local_path=p,
+                                object_key=object_key,
+                                make_public=True,
+                                skip_if_exists=False,
+                                content_type="video/mp4",
+                            )
+                            if url not in st.session_state["spaces_public_urls"]:
+                                st.session_state["spaces_public_urls"].append(url)
+                            _ulog(f"✅ bonus {name} -> {url}")
+
+                        st.success(f"Uploaded {len(bonus_files)} bonus export(s).")
+                except Exception as e:
+                    st.error(f"Bonus upload failed: {type(e).__name__}: {e}")
+                    _ulog(f"❌ Bonus upload failed: {type(e).__name__}: {e}")
+
+        st.markdown("---")
+        st.subheader("🧾 Generation Log")
+        if st.session_state.get("gen_log"):
+            st.code("\n".join(st.session_state["gen_log"][-200:]))
+        else:
+            st.caption("Log will appear here.")
