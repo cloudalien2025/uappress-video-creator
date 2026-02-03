@@ -876,6 +876,7 @@ def _ffmpeg_make_vertical_clip(
 # ----------------------------
 # Cinematic / Visual-first Shorts — Sora Prompt Studio (Shorts mode only)
 # ----------------------------
+video_mode = st.session_state.get("video_mode", "Long-form (16:9)")  # sidebar selectbox key
 if video_mode.startswith("Shorts"):
     st.header("🎬 Cinematic / Visual-first Shorts — Sora Prompt Studio")
     st.caption("Build a clean, brand-consistent prompt for Sora. Paste the result into Sora. This does not generate video inside the app.")
