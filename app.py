@@ -1136,7 +1136,7 @@ if generate_clicked:
                 api_key=api_key,
                 auto_upload=auto_upload,
                 make_public=make_public,
-                prefix_override=spaces_prefix,
+                prefix_override=prefix_override,
             )
             st.session_state["render_results"] = results or []
         finally:
