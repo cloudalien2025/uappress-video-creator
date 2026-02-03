@@ -1092,3 +1092,6 @@ def build_sora_prompt(
     return "\n".join(parts).strip()
 
 # (Sora short generation via API not implemented here; this module only builds prompts/jobs.)
+
+# Back-compat alias for older app.py calls
+_generate_all_segments_sequential = generate_all_segments_sequential
