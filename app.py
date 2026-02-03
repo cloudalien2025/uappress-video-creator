@@ -678,6 +678,7 @@ def generate_all_segments_sequential(
             s3, bucket, region, public_base = _spaces_client_and_context()
             job_prefix = (prefix_override or "").strip() or _job_prefix()
             if not job_prefix.endswith("/"):
+    outputs: List[str] = []
                 job_prefix += "/"
             st.session_state["spaces_last_prefix"] = job_prefix
             _ulog(f"Auto-upload enabled → Bucket: {bucket} | Region: {region}")
@@ -806,6 +807,7 @@ def generate_all_segments_sequential(
 
     _reset_gen_flags()
 
+    return outputs
 
 # ===============================================================
 # SECTION 6B — BONUS: Shorts/TikTok/Reels Exporter (post-process)
@@ -1124,7 +1126,8 @@ if generate_clicked:
             zoom_strength = float(st.session_state.get("zoom_strength_value", 1.06))
             results = generate_all_segments_sequential(
                 extract_dir=extract_dir,
-                out_dir=out_dir,
+                        segments=segments,
+out_dir=out_dir,
                 overwrite=overwrite,
                 zoom_strength=zoom_strength,
                 fps=fps,
