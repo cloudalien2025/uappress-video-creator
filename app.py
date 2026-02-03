@@ -24,6 +24,10 @@ import streamlit as st
 import video_pipeline as vp
 
 
+# Back-compat: older builds referenced this private helper name
+_generate_all_segments_sequential = getattr(video_pipeline, "generate_all_segments_sequential", None) or getattr(video_pipeline, "_generate_all_segments_sequential", None)
+
+
 # DigitalOcean Spaces (S3-compatible)
 import boto3
 from botocore.client import Config
@@ -1105,32 +1109,42 @@ with col2:
 # Run generation when the button is clicked.
 # Streamlit reruns top-to-bottom; the click-run is the right moment to execute.
 if generate_clicked:
-    # Clear any prior stop request and mark as running.
-    st.session_state["stop_requested"] = False
-    st.session_state["is_generating"] = True
-    try:
-        _generate_all_segments_sequential(
-            segments=segments,
-            output_dir=output_dir,
-            overwrite=overwrite_mp4s,
-            fps=fps,
-            zoom_strength=zoom_strength,
-            max_scenes=max_scenes_per_segment,
-            min_sec=min_sec_per_scene,
-            max_sec=max_sec_per_scene,
-            do_upload=auto_upload_mp4s,
-            do_make_public=make_public_acl,
-            spaces_prefix=spaces_prefix,
-        )
-    finally:
-        st.session_state["is_generating"] = False
+    if not zip_ready:
+        st.warning("Upload/extract a ZIP first.")
+    elif not api_ready:
+        st.warning("Enter your OpenAI API key in the sidebar first.")
+    elif not segments:
+        st.warning("No segments detected in the extracted ZIP.")
+    else:
+        st.session_state["stop_requested"] = False
+        st.session_state["is_generating"] = True
+        try:
+            results = generate_all_segments_sequential(
+                extract_dir=extract_dir,
+                out_dir=out_dir,
+                overwrite=overwrite,
+                zoom_strength=zoom_strength,
+                fps=fps,
+                width=resolution[0],
+                height=resolution[1],
+                max_scenes=max_scenes,
+                min_scene_seconds=min_scene_seconds,
+                max_scene_seconds=max_scene_seconds,
+                api_key=api_key,
+                auto_upload=auto_upload,
+                make_public=make_public,
+                prefix_override=spaces_prefix,
+            )
+            st.session_state["render_results"] = results or []
+        finally:
+            st.session_state["is_generating"] = False
 
 
 
 
 
 
-    st.markdown("---")
+st.markdown("---")
 st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
 
 st.caption(
