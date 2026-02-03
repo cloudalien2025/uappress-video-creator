@@ -998,6 +998,7 @@ def build_sora_prompt(
     camera: str = "mid-body height camera, slight steady zoom",
     movement: str = "smooth, exaggerated, cute game-like motion",
     constraints: str = "No text, no logos, no realism, no scary elements.",
+    **_ignored,
 ) -> str:
     """
     Backward-compatible Sora prompt builder.
@@ -1034,20 +1035,11 @@ def build_sora_prompt(
         resolved = "A short, engaging scene that matches the narration without any on-screen text."
 
     prompt = (
-        f"Animate {character} in a {style}.
-
-"
-        f"Scene:
-{resolved}
-
-"
-        f"Environment: {environment}.
-"
-        f"Motion: {movement}.
-"
-        f"Camera: {camera}.
-
-"
+        f"Animate {character} in a {style}.\n\n"
+        f"Scene:\n{resolved}\n\n"
+        f"Environment: {environment}.\n"
+        f"Motion: {movement}.\n"
+        f"Camera: {camera}.\n\n"
         f"{constraints}"
     )
     return prompt
