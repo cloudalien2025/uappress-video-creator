@@ -1570,7 +1570,7 @@ with colS1:
             key=_bonus_key,
             help="Pick an uploaded MP4 to convert to 9:16.",
         )
-        src_pick = str(bonus_dir / src_name)
+        src_pick = str(Path(bonus_dir) / src_name)
     else:
         st.info("Upload an MP4 above to enable selection.")
         src_pick = ""
