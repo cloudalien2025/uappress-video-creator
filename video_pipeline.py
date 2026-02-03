@@ -87,6 +87,10 @@ _END_BUFFER_MAX = 0.75
 _DEFAULT_END_BUFFER = 0.65
 
 _DEFAULT_FPS = 30
+# ZIP parsing defaults
+_SCRIPT_EXTS = {".txt", ".md"}
+_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
+
 
 # Image generation defaults (override via env if desired)
 # IMPORTANT: gpt-image-1 supports sizes like 1024x1024, 1536x1024, 1024x1536.
