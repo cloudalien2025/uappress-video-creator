@@ -10,7 +10,7 @@
 
 import streamlit as st
 
- import video_pipeline as vp
+import video_pipeline as vp
 
     st.set_page_config(page_title="UAPpress Video Creator", layout="wide")
 
