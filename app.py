@@ -25,7 +25,7 @@ import video_pipeline as vp
 
 
 # Back-compat: older builds referenced this private helper name
-_generate_all_segments_sequential = getattr(video_pipeline, "generate_all_segments_sequential", None) or getattr(video_pipeline, "_generate_all_segments_sequential", None)
+_generate_all_segments_sequential = getattr(vp, "generate_all_segments_sequential", None) or getattr(vp, "_generate_all_segments_sequential", None)
 
 
 # DigitalOcean Spaces (S3-compatible)
