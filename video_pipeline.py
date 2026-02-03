@@ -43,8 +43,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -52,6 +54,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
+from dataclasses import dataclass
 from hashlib import sha1
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -90,11 +93,6 @@ _DEFAULT_FPS = 30
 _DEFAULT_IMAGE_MODEL = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1")
 _DEFAULT_IMAGE_SIZE_169 = os.environ.get("UAPPRESS_IMAGE_SIZE_169", "1536x1024")
 _DEFAULT_IMAGE_SIZE_916 = os.environ.get("UAPPRESS_IMAGE_SIZE_916", "1024x1536")
-
-
-# File discovery extensions (used by find_files)
-_SCRIPT_EXTS = {".txt", ".md", ".markdown", ".json"}
-_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 
 # Cache version knob (bump if you ever want to invalidate all cached images)
 _IMAGE_CACHE_ROOT = os.environ.get("UAPPRESS_IMAGE_CACHE_ROOT", "_image_cache_v2")
@@ -926,3 +924,167 @@ def render_segment_mp4(
         except Exception:
             pass
 
+################################################################################
+# Sora Shorts Prompt Helpers (added for UAPpress Shorts pipeline)
+################################################################################
+from dataclasses import dataclass
+from typing import Literal, Optional, Dict, Any
+
+@dataclass(frozen=True)
+class SoraStyle:
+    mode: Literal["cinematic_realism", "archival_reenactment"]
+    camera_rules: str
+    lighting_rules: str
+    grain_rules: str
+    realism_constraints: str
+
+def build_sora_house_style(mode: str = "cinematic_realism") -> SoraStyle:
+    """Return a consistent 'house style' bundle for Sora prompts."""
+    m = (mode or "cinematic_realism").strip().lower()
+    if m in ("archival", "archival_reenactment", "archival reenactment", "archival-reenactment"):
+        return SoraStyle(
+            mode="archival_reenactment",
+            camera_rules=(
+                "Tripod or slow dolly only, no handheld shake. "
+                "Lens: 35–50mm equivalent, modest depth of field. "
+                "No fast pans, no whip-zooms, no drone shots."
+            ),
+            lighting_rules=(
+                "Period-accurate practical lighting, sodium-vapor or tungsten feel, "
+                "limited dynamic range, softer contrast, restrained highlights."
+            ),
+            grain_rules=(
+                "Visible film grain, mild gate weave, slight vignetting, "
+                "subtle halation, minor dust/scratch artifacts."
+            ),
+            realism_constraints=(
+                "Documentary reenactment vibe, grounded staging, "
+                "no sci-fi glow, no fantasy aesthetics, no modern UI overlays."
+            ),
+        )
+    # default cinematic realism
+    return SoraStyle(
+        mode="cinematic_realism",
+        camera_rules=(
+            "Slow cinematic movement only: gentle push-in, slow lateral slide, "
+            "or locked-off composition. No sudden zooms or shakes. "
+            "Lens: 28–50mm equivalent, tasteful depth of field."
+        ),
+        lighting_rules=(
+            "Moody, believable lighting. Practical sources (street lamps, headlights, "
+            "hangar lights). Controlled contrast, no blown highlights."
+        ),
+        grain_rules=(
+            "Subtle grain, light texture, clean but not glossy. "
+            "No heavy stylization, no cartoon look."
+        ),
+        realism_constraints=(
+            "Cinematic realism, restrained color palette, "
+            "no text, no logos, no subtitles, no watermarks."
+        ),
+    )
+
+def build_sora_prompt(
+    base_prompt: str,
+    *,
+    mode: str = "cinematic_realism",
+    length_s: int = 12,
+    aspect: str = "9:16",
+    fps: int = 30,
+) -> str:
+    """Combine user prompt + house style into a single Sora-ready prompt."""
+    style = build_sora_house_style(mode)
+    base = (base_prompt or "").strip()
+    if not base:
+        base = "Serious investigative UAP documentary scene, grounded realism."
+    return (
+        f"{base}\n\n"
+        f"FORMAT: {length_s}s, {aspect}, {fps}fps.\n"
+        f"HOUSE STYLE ({style.mode}):\n"
+        f"- Camera: {style.camera_rules}\n"
+        f"- Lighting: {style.lighting_rules}\n"
+        f"- Texture: {style.grain_rules}\n"
+        f"- Constraints: {style.realism_constraints}\n"
+        f"NEGATIVES: text, logos, subtitles, watermarks, cartoon/anime, oversaturated, shaky cam, jump cuts."
+    )
+
+def prepare_sora_short_job(
+    prompt_text: str,
+    *,
+    preset: str = "12s",
+    mode: str = "cinematic_realism",
+    aspect: str = "9:16",
+    fps: int = 30,
+) -> Dict[str, Any]:
+    """Return a structured payload the app can store/log for a Sora short."""
+    preset_map = {"7s": 7, "12s": 12, "18s": 18}
+    length_s = preset_map.get((preset or "12s").strip().lower(), 12)
+    full_prompt = build_sora_prompt(prompt_text, mode=mode, length_s=length_s, aspect=aspect, fps=fps)
+    return {
+        "preset": preset,
+        "mode": mode,
+        "aspect": aspect,
+        "fps": fps,
+        "length_s": length_s,
+        "prompt": full_prompt,
+    }
+
+from dataclasses import dataclass, asdict
+
+
+def build_sora_prompt(
+    *,
+    user_prompt: str,
+    style_mode: str,
+    camera_rule: str,
+    lighting_rule: str,
+    grain_rule: str,
+    target_seconds: int,
+    aspect_note: str = "Native vertical 9:16",
+) -> str:
+    """Assemble a brand-consistent Sora prompt (prompt-first, no ambiguity)."""
+
+    base_rules = [
+        "Vertical video, 9:16 composition, designed for YouTube Shorts.",
+        f"Duration: ~{int(target_seconds)} seconds.",
+        f"Camera motion: {camera_rule}.",
+        f"Lighting: {lighting_rule}.",
+        f"Texture / realism: {grain_rule}.",
+        "Serious investigative documentary tone. Credibility-first. No fantasy look.",
+        "No on-screen text, no subtitles, no logos, no UI, no watermarks.",
+        "No dialogue or lip-synced speaking. Ambient motion only.",
+    ]
+
+    if aspect_note and "safe" in aspect_note.lower():
+        base_rules.append("Keep subject centered with safe margins for mobile UI overlays.")
+
+    if style_mode.lower().startswith("archival"):
+        style_header = [
+            "ARCHIVAL REENACTMENT STYLE:",
+            "Photoreal reenactment with period authenticity.",
+            "Film stock look: subtle flicker, gate weave, dust, scratches, vignette as appropriate.",
+            "Era-appropriate color science, slightly muted, documentary archival feel.",
+        ]
+    else:
+        style_header = [
+            "CINEMATIC REALISM STYLE:",
+            "Modern documentary-grade photorealism.",
+            "Natural color science, restrained contrast, cinematic but believable.",
+            "Shallow depth-of-field only when appropriate, no glamor look.",
+        ]
+
+    # User prompt goes last so it remains the creative anchor.
+    user_prompt = (user_prompt or "").strip()
+
+    parts = []
+    parts.extend(style_header)
+    parts.append("")
+    parts.append("HOUSE RULES:")
+    parts.extend([f"- {r}" for r in base_rules])
+    parts.append("")
+    parts.append("SCENE DESCRIPTION:")
+    parts.append(user_prompt if user_prompt else "(No user prompt provided.)")
+
+    return "\n".join(parts).strip()
+
+# (Sora short generation via API not implemented here; this module only builds prompts/jobs.)
