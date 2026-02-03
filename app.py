@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import tempfile
+import zipfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -46,29 +47,10 @@ if "CACHE_BUSTER" not in st.session_state:
 
 # ----------------------------
 # Sidebar: Maintenance
-# ----------------------------
-with st.sidebar.expander("🧹 Maintenance", expanded=False):
+with st.sidebar.expander("🧹 Maintenance"):
     st.caption("Use this if you changed code/models and Streamlit keeps reusing old cached images or segments.")
 
-# Quick diagnostic: verify Images API works with the current key
-if st.button("Test OpenAI image generation", use_container_width=True):
-    key = (st.session_state.get("api_key") or "").strip()
-    if not key:
-        st.error("No API key set in sidebar.")
-        st.stop()
-    try:
-        test_bytes = vp._openai_generate_image_bytes(
-            key,
-            "A cinematic 1940s desert military airfield, archival photograph style",
-            "1024x1024",
-        )
-        st.success(f"✅ Images API OK — received {len(test_bytes):,} bytes.")
-        st.image(test_bytes, caption="OpenAI test image (1024x1024)")
-    except Exception as e:
-        st.error(f"❌ Images API failed: {e!r}")
-    st.stop()
-    if st.button("Clear cache & temp files (reboot-safe)", use_container_width=True):
-        # Clear Streamlit caches
+    if st.button("🧹 Clear app caches + temp", use_container_width=True, key="btn_clear_cache"):
         try:
             st.cache_data.clear()
         except Exception:
@@ -77,37 +59,20 @@ if st.button("Test OpenAI image generation", use_container_width=True):
             st.cache_resource.clear()
         except Exception:
             pass
-
-        # Nuke known temp/cache directories
-        tmp_dirs = [
-            Path("/tmp/uappress_image_cache"),
-            Path("/tmp/uappress_vc"),
-        ]
-        # Also try to remove any extracted folder from current session
-        for k in ("extract_dir", "extracted_dir", "zip_extract_dir"):
-            p = st.session_state.get(k)
-            if p:
-                tmp_dirs.append(Path(str(p)))
-
-        for d in tmp_dirs:
+        # Clear temp working folders we create in this app
+        for d in ["_work", "_runs", "_segments", "_bonus_uploads"]:
             try:
-                if d.exists():
-                    shutil.rmtree(d, ignore_errors=True)
+                p = Path(d)
+                if p.exists() and p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
             except Exception:
                 pass
-
-        # Force cache bust for any cached functions that accept this token
-        st.session_state["CACHE_BUSTER"] = int(time.time())
-
-        # Reset a few common state keys so the UI re-detects ZIP contents cleanly
-        for k in list(st.session_state.keys()):
-            if k.startswith("detected_") or k.startswith("segments_") or k in ("segments", "pairs", "mp3_files", "script_files"):
-                try:
-                    del st.session_state[k]
-                except Exception:
-                    pass
-
-        st.success("Cache cleared. Now refresh the page and re-upload the ZIP.")
+        # Reset per-run session state keys
+        for k in ["zip_bytes", "workdir", "extract_dir", "segments", "segment_meta", "last_run_id"]:
+            st.session_state.pop(k, None)
+        st.success("Cleared Streamlit caches + temp folders. Rerunning…")
+        time.sleep(0.4)
+        st.rerun()
         st.stop()
 
 
@@ -215,6 +180,21 @@ with st.sidebar:
 
 
 # ===============================================================
+def extract_zip_to_temp(zip_bytes: bytes) -> tuple[str, str]:
+    """Extract an uploaded ZIP into a fresh temp folder and return (workdir, extract_dir)."""
+    workdir = Path(tempfile.mkdtemp(prefix="uappress_vc_"))
+    extract_dir = workdir / "_extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for member in zf.infolist():
+            name = member.filename
+            # Zip-slip guard
+            target = (extract_dir / name).resolve()
+            if not str(target).startswith(str(extract_dir.resolve())):
+                continue
+            zf.extract(member, extract_dir)
+    return str(workdir), str(extract_dir)
+
 # SECTION 3 — ZIP Upload + Extraction + Segment Detection (PATH-ONLY)
 # ===============================================================
 
@@ -335,7 +315,7 @@ if uploaded is not None:
         with open(zip_path, "rb") as f:
             zip_bytes = f.read()
 
-        workdir, extract_dir = vp.extract_zip_to_temp(zip_bytes)
+        workdir, extract_dir = extract_zip_to_temp(zip_bytes)
 
         scripts, audios = vp.find_files(extract_dir)
         if not scripts:
@@ -1618,10 +1598,10 @@ if st.session_state.get("video_mode", "Long-form (16:9)").startswith("Shorts"):
             "When you’re ready, we can add an **actual** Sora job runner — but keeping this prompt studio separate prevents regressions in your MP4 pipeline."
         )
 
-    with tabs[1]:
-     st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
+with tabs[1]:
+    st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
 
-     st.caption(
+    st.caption(
         "This is **post-processing only**. Upload any MP4 below; it will be saved into `_bonus_uploads/` "
         "for this job and will remain available across reruns. The source dropdown shows **uploads only**."
     )
