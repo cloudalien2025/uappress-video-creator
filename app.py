@@ -339,7 +339,7 @@ if st.session_state.zip_path:
         for s in st.session_state.segments:
             st.write(f"{s['index']}. **{s['label']}** — {s['title'] or 'Untitled'}")
 
-st.caption("Next: Generate videos sequentially (crash-safe).")
+st.caption("Next: Generate videos sequentially (crash-safe).", disabled=(not (zip_ready and api_ready)))
 
 
 # ===============================================================
@@ -957,20 +957,25 @@ if video_mode.startswith("Shorts"):
 
 st.subheader("🎬 Generate Segment MP4s")
 
+
 extract_dir = st.session_state.get("extract_dir", "")
 segments = st.session_state.get("segments", [])
-
-if not extract_dir or not Path(extract_dir).exists():
-    st.warning("Upload/extract a ZIP first.")
-    st.stop()
+zip_ready = bool(extract_dir) and Path(extract_dir).exists()
 
 api_key = st.session_state.get("api_key", "").strip()
-if not api_key:
-    st.warning("Enter your OpenAI API key in the sidebar to generate videos.")
-    st.stop()
+api_ready = bool(api_key)
 
-out_dir = _default_out_dir(extract_dir)
-st.caption(f"Segments will be saved to: {out_dir}")
+if not zip_ready:
+    st.warning("Upload/extract a ZIP to generate MP4 segments. (The UI is fully available without it.)")
+if not api_ready:
+    st.warning("Enter your OpenAI API key in the sidebar to generate videos.")
+
+if zip_ready:
+    out_dir = _default_out_dir(extract_dir)
+    st.caption(f"Segments will be saved to: {out_dir}")
+else:
+    out_dir = ""
+    st.caption("Segments will be saved after you upload a ZIP.")
 
 w, h = _get_resolution_wh()
 
