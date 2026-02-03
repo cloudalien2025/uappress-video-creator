@@ -1619,9 +1619,9 @@ if st.session_state.get("video_mode", "Long-form (16:9)").startswith("Shorts"):
         )
 
     with tabs[1]:
-    st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
+     st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
 
-    st.caption(
+     st.caption(
         "This is **post-processing only**. Upload any MP4 below; it will be saved into `_bonus_uploads/` "
         "for this job and will remain available across reruns. The source dropdown shows **uploads only**."
     )
