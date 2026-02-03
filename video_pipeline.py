@@ -989,28 +989,69 @@ def build_sora_house_style(mode: str = "cinematic_realism") -> SoraStyle:
     )
 
 def build_sora_prompt(
-    base_prompt: str,
+    segment=None,
     *,
-    mode: str = "cinematic_realism",
-    length_s: int = 12,
-    aspect: str = "9:16",
-    fps: int = 30,
+    scene_text: str | None = None,
+    character: str = "the character",
+    style: str = "Roblox-style 3D animation",
+    environment: str = "bright, colorful Roblox-style environments with clean lighting",
+    camera: str = "mid-body height camera, slight steady zoom",
+    movement: str = "smooth, exaggerated, cute game-like motion",
+    constraints: str = "No text, no logos, no realism, no scary elements.",
 ) -> str:
-    """Combine user prompt + house style into a single Sora-ready prompt."""
-    style = build_sora_house_style(mode)
-    base = (base_prompt or "").strip()
-    if not base:
-        base = "Serious investigative UAP documentary scene, grounded realism."
-    return (
-        f"{base}\n\n"
-        f"FORMAT: {length_s}s, {aspect}, {fps}fps.\n"
-        f"HOUSE STYLE ({style.mode}):\n"
-        f"- Camera: {style.camera_rules}\n"
-        f"- Lighting: {style.lighting_rules}\n"
-        f"- Texture: {style.grain_rules}\n"
-        f"- Constraints: {style.realism_constraints}\n"
-        f"NEGATIVES: text, logos, subtitles, watermarks, cartoon/anime, oversaturated, shaky cam, jump cuts."
+    """
+    Backward-compatible Sora prompt builder.
+
+    Supports BOTH call styles:
+      1) build_sora_prompt(segment_obj)
+      2) build_sora_prompt(scene_text="...", character="...", ...)
+
+    segment may be:
+      - a dict with keys like 'visual_prompt', 'scene_prompt', 'prompt', 'text'
+      - an object with similarly-named attributes
+    """
+    # Resolve scene text
+    resolved = (scene_text or "").strip()
+
+    if not resolved and segment is not None:
+        # dict-style
+        if isinstance(segment, dict):
+            for k in ("visual_prompt", "scene_prompt", "prompt", "text", "narration", "script"):
+                v = segment.get(k)
+                if isinstance(v, str) and v.strip():
+                    resolved = v.strip()
+                    break
+        else:
+            # object-style
+            for k in ("visual_prompt", "scene_prompt", "prompt", "text", "narration", "script"):
+                v = getattr(segment, k, None)
+                if isinstance(v, str) and v.strip():
+                    resolved = v.strip()
+                    break
+
+    # If still empty, provide a safe generic fallback
+    if not resolved:
+        resolved = "A short, engaging scene that matches the narration without any on-screen text."
+
+    prompt = (
+        f"Animate {character} in a {style}.
+
+"
+        f"Scene:
+{resolved}
+
+"
+        f"Environment: {environment}.
+"
+        f"Motion: {movement}.
+"
+        f"Camera: {camera}.
+
+"
+        f"{constraints}"
     )
+    return prompt
+
 
 def prepare_sora_short_job(
     prompt_text: str,
@@ -1035,67 +1076,6 @@ def prepare_sora_short_job(
 
 from dataclasses import dataclass, asdict
 
-
-def build_sora_prompt(
-    *,
-    user_prompt: str,
-    style_mode: str,
-    camera_rule: str,
-    lighting_rule: str,
-    grain_rule: str,
-    target_seconds: int,
-    aspect_note: str = "Native vertical 9:16",
-) -> str:
-    """Assemble a brand-consistent Sora prompt (prompt-first, no ambiguity)."""
-
-    base_rules = [
-        "Vertical video, 9:16 composition, designed for YouTube Shorts.",
-        f"Duration: ~{int(target_seconds)} seconds.",
-        f"Camera motion: {camera_rule}.",
-        f"Lighting: {lighting_rule}.",
-        f"Texture / realism: {grain_rule}.",
-        "Serious investigative documentary tone. Credibility-first. No fantasy look.",
-        "No on-screen text, no subtitles, no logos, no UI, no watermarks.",
-        "No dialogue or lip-synced speaking. Ambient motion only.",
-    ]
-
-    if aspect_note and "safe" in aspect_note.lower():
-        base_rules.append("Keep subject centered with safe margins for mobile UI overlays.")
-
-    if style_mode.lower().startswith("archival"):
-        style_header = [
-            "ARCHIVAL REENACTMENT STYLE:",
-            "Photoreal reenactment with period authenticity.",
-            "Film stock look: subtle flicker, gate weave, dust, scratches, vignette as appropriate.",
-            "Era-appropriate color science, slightly muted, documentary archival feel.",
-        ]
-    else:
-        style_header = [
-            "CINEMATIC REALISM STYLE:",
-            "Modern documentary-grade photorealism.",
-            "Natural color science, restrained contrast, cinematic but believable.",
-            "Shallow depth-of-field only when appropriate, no glamor look.",
-        ]
-
-    # User prompt goes last so it remains the creative anchor.
-    user_prompt = (user_prompt or "").strip()
-
-    parts = []
-    parts.extend(style_header)
-    parts.append("")
-    parts.append("HOUSE RULES:")
-    parts.extend([f"- {r}" for r in base_rules])
-    parts.append("")
-    parts.append("SCENE DESCRIPTION:")
-    parts.append(user_prompt if user_prompt else "(No user prompt provided.)")
-
-    return "\n".join(parts).strip()
-
-# (Sora short generation via API not implemented here; this module only builds prompts/jobs.)
-
-# ----------------------------
-# Optional helper: sequential generation (pure, no Streamlit dependency)
-# ----------------------------
 
 def generate_all_segments_sequential(
     *,
