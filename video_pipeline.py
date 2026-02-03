@@ -1093,5 +1093,67 @@ def build_sora_prompt(
 
 # (Sora short generation via API not implemented here; this module only builds prompts/jobs.)
 
+# ----------------------------
+# Optional helper: sequential generation (pure, no Streamlit dependency)
+# ----------------------------
+
+def generate_all_segments_sequential(
+    *,
+    segments: List[Dict[str, Any]],
+    extract_dir: str,
+    out_dir: str,
+    overwrite: bool,
+    api_key: str,
+    fps: int,
+    width: int,
+    height: int,
+    zoom_strength: float,
+    max_scenes: int,
+    min_scene_seconds: int,
+    max_scene_seconds: int,
+) -> List[str]:
+    """Generate MP4s for all segments sequentially.
+
+    This exists mainly for backward-compat with older app.py versions that may call it.
+    The current Streamlit app typically orchestrates the loop itself.
+
+    Returns a list of output MP4 paths.
+    """
+    out_dir_p = Path(out_dir)
+    out_dir_p.mkdir(parents=True, exist_ok=True)
+
+    outputs: List[str] = []
+    for i, pair in enumerate(segments or [], start=1):
+        # Respect an explicit out_path if caller provided one in the pair dict
+        explicit = str(pair.get("out_path") or "").strip()
+        if explicit:
+            out_path_p = Path(explicit)
+            out_path_p.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            base = str(pair.get("key") or pair.get("label") or segment_label(pair) or f"segment_{i:02d}")
+            slug = safe_slug(base, max_len=80) or f"segment_{i:02d}"
+            out_path_p = out_dir_p / f"{i:02d}_{slug}.mp4"
+
+        if out_path_p.exists() and (not bool(overwrite)):
+            outputs.append(str(out_path_p))
+            continue
+
+        render_segment_mp4(
+            pair=pair,
+            extract_dir=str(extract_dir),
+            out_path=str(out_path_p),
+            api_key=str(api_key),
+            fps=int(fps),
+            width=int(width),
+            height=int(height),
+            zoom_strength=float(zoom_strength),
+            max_scenes=int(max_scenes),
+            min_scene_seconds=int(min_scene_seconds),
+            max_scene_seconds=int(max_scene_seconds),
+        )
+        outputs.append(str(out_path_p))
+
+    return outputs
+
 # Back-compat alias for older app.py calls
 _generate_all_segments_sequential = generate_all_segments_sequential
