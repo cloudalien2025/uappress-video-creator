@@ -1102,6 +1102,29 @@ with col2:
         key="stop_after_segment_btn",
     )
 
+# Run generation when the button is clicked.
+# Streamlit reruns top-to-bottom; the click-run is the right moment to execute.
+if generate_clicked:
+    # Clear any prior stop request and mark as running.
+    st.session_state["stop_requested"] = False
+    st.session_state["is_generating"] = True
+    try:
+        _generate_all_segments_sequential(
+            segments=segments,
+            output_dir=output_dir,
+            overwrite=overwrite_mp4s,
+            fps=fps,
+            zoom_strength=zoom_strength,
+            max_scenes=max_scenes_per_segment,
+            min_sec=min_sec_per_scene,
+            max_sec=max_sec_per_scene,
+            do_upload=auto_upload_mp4s,
+            do_make_public=make_public_acl,
+            spaces_prefix=spaces_prefix,
+        )
+    finally:
+        st.session_state["is_generating"] = False
+
 
 
 
