@@ -1121,14 +1121,15 @@ if generate_clicked:
         st.session_state["stop_requested"] = False
         st.session_state["is_generating"] = True
         try:
+            zoom_strength = float(st.session_state.get("zoom_strength_value", 1.06))
             results = generate_all_segments_sequential(
                 extract_dir=extract_dir,
                 out_dir=out_dir,
                 overwrite=overwrite,
                 zoom_strength=zoom_strength,
                 fps=fps,
-                width=resolution[0],
-                height=resolution[1],
+                width=w,
+                height=h,
                 max_scenes=max_scenes,
                 min_scene_seconds=min_scene_seconds,
                 max_scene_seconds=max_scene_seconds,
