@@ -237,6 +237,28 @@ def _save_uploaded_zip(uploaded_file) -> Tuple[str, str]:
     return root, zip_path
 
 
+
+def _safe_script_filename(p: dict) -> str:
+    """Return a short script filename for UI display.
+
+    IMPORTANT: This must never read the script contents.
+    It only returns the basename of the script path (or the provided script_file).
+    """
+    try:
+        sf = str(p.get("script_file") or "").strip()
+        if sf:
+            return Path(sf).name
+    except Exception:
+        pass
+    try:
+        sp = str(p.get("script_path") or "").strip()
+        if sp:
+            return Path(sp).name
+    except Exception:
+        pass
+    return ""
+
+
 def _normalize_segments(pairs: List[dict]) -> List[dict]:
     """
     Convert vp.pair_segments output into a stable structure expected by generator.
@@ -281,7 +303,7 @@ def _normalize_segments(pairs: List[dict]) -> List[dict]:
                 "key": key,
                 "label": label.title(),
                 "title": title,
-                "script_file": _safe_script_filename(p),
+                "script_file": Path(p.get("script_path","")).name if p.get("script_path") else "",
                 "pair": p,  # original pipeline pair (audio + script paths)
             }
         )
@@ -429,6 +451,26 @@ def _scan_mp4s(out_dir: str) -> List[str]:
     if not p.exists():
         return []
     return sorted([str(x) for x in p.glob("*.mp4") if x.is_file()])
+
+
+def _is_valid_mp4(path: str, min_bytes: int = 50_000) -> Tuple[bool, str]:
+    """Basic integrity gate for uploads (prevents uploading empty/invalid artifacts)."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            return False, "missing"
+        if p.stat().st_size < int(min_bytes):
+            return False, f"too_small<{min_bytes}B"
+        # Duration check (cloud-safe: vp.ffprobe_duration_seconds falls back to ffmpeg parsing)
+        try:
+            dur = float(vp.ffprobe_duration_seconds(p))  # type: ignore[attr-defined]
+        except Exception:
+            dur = 0.0
+        if dur <= 0.05:
+            return False, "zero_duration"
+        return True, f"ok_dur={dur:.2f}s"
+    except Exception as e:
+        return False, f"error:{type(e).__name__}"
 
 
 def _read_spaces_secret(key: str, default: str = "") -> str:
@@ -671,7 +713,7 @@ def generate_all_segments_sequential(
     if n == 0:
         status.error("No segments detected.")
         _reset_gen_flags()
-        return
+        return []
 
     s3 = bucket = region = public_base = None
     job_prefix = ""
@@ -710,31 +752,37 @@ def generate_all_segments_sequential(
                 name = Path(out_path).name
                 object_key = f"{job_prefix}{name}"
                 try:
-                    url = _upload_file_to_spaces(
-                        s3=s3,
-                        bucket=bucket,
-                        region=region,
-                        public_base=public_base or "",
-                        local_path=out_path,
-                        object_key=object_key,
-                        make_public=bool(make_public),
-                        skip_if_exists=True,
-                        content_type="video/mp4",
-                    )
-                    if url not in st.session_state["spaces_public_urls"]:
-                        st.session_state["spaces_public_urls"].append(url)
-                    _ulog(f"✅ (existing) {name} -> {url}")
+                    ok, why = _is_valid_mp4(out_path)
+                    if not ok:
+                        _ulog(f"⛔ Skipping upload (invalid MP4: {why}): {name}")
+                    else:
+                        url = _upload_file_to_spaces(
+                            s3=s3,
+                            bucket=bucket,
+                            region=region,
+                            public_base=public_base or "",
+                            local_path=out_path,
+                            object_key=object_key,
+                            make_public=bool(make_public),
+                            skip_if_exists=True,
+                            content_type="video/mp4",
+                        )
+                    if ok:
+                        if url not in st.session_state["spaces_public_urls"]:
+                            st.session_state["spaces_public_urls"].append(url)
+                        _ulog(f"✅ (existing) {name} -> {url}")
 
-                    murl = _write_and_upload_manifest(
-                        s3=s3,
-                        bucket=bucket,
-                        region=region,
-                        public_base=public_base or "",
-                        job_prefix=job_prefix,
-                        make_public=bool(make_public),
-                        out_dir=out_dir,
-                    )
-                    _ulog(f"📄 manifest.json -> {murl}")
+                    if ok:
+                        murl = _write_and_upload_manifest(
+                            s3=s3,
+                            bucket=bucket,
+                            region=region,
+                            public_base=public_base or "",
+                            job_prefix=job_prefix,
+                            make_public=bool(make_public),
+                            out_dir=out_dir,
+                        )
+                        _ulog(f"📄 manifest.json -> {murl}")
                 except Exception as e:
                     _ulog(f"❌ Upload failed for existing {name}: {type(e).__name__}: {e}")
 
@@ -770,31 +818,37 @@ def generate_all_segments_sequential(
                 object_key = f"{job_prefix}{name}"
                 status.info(f"Uploading to Spaces: {name}")
                 try:
-                    url = _upload_file_to_spaces(
-                        s3=s3,
-                        bucket=bucket,
-                        region=region,
-                        public_base=public_base or "",
-                        local_path=out_path,
-                        object_key=object_key,
-                        make_public=bool(make_public),
-                        skip_if_exists=True,
-                        content_type="video/mp4",
-                    )
-                    if url not in st.session_state["spaces_public_urls"]:
-                        st.session_state["spaces_public_urls"].append(url)
-                    _ulog(f"✅ {name} -> {url}")
+                    ok, why = _is_valid_mp4(out_path)
+                    if not ok:
+                        _ulog(f"⛔ Skipping upload (invalid MP4: {why}): {name}")
+                    else:
+                        url = _upload_file_to_spaces(
+                            s3=s3,
+                            bucket=bucket,
+                            region=region,
+                            public_base=public_base or "",
+                            local_path=out_path,
+                            object_key=object_key,
+                            make_public=bool(make_public),
+                            skip_if_exists=True,
+                            content_type="video/mp4",
+                        )
+                    if ok:
+                        if url not in st.session_state["spaces_public_urls"]:
+                            st.session_state["spaces_public_urls"].append(url)
+                        _ulog(f"✅ {name} -> {url}")
 
-                    murl = _write_and_upload_manifest(
-                        s3=s3,
-                        bucket=bucket,
-                        region=region,
-                        public_base=public_base or "",
-                        job_prefix=job_prefix,
-                        make_public=bool(make_public),
-                        out_dir=out_dir,
-                    )
-                    _ulog(f"📄 manifest.json -> {murl}")
+                    if ok:
+                        murl = _write_and_upload_manifest(
+                            s3=s3,
+                            bucket=bucket,
+                            region=region,
+                            public_base=public_base or "",
+                            job_prefix=job_prefix,
+                            make_public=bool(make_public),
+                            out_dir=out_dir,
+                        )
+                        _ulog(f"📄 manifest.json -> {murl}")
 
                 except Exception as e:
                     _ulog(f"❌ {name} upload failed: {type(e).__name__}: {e}")
