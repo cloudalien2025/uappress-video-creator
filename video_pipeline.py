@@ -1,3 +1,8 @@
+
+
+def image_cache_key(prompt: str, width: int, height: int) -> str:
+    import hashlib
+    return hashlib.sha256((prompt + f'|{width}x{height}').encode('utf-8')).hexdigest()[:16]
 # ============================================================
 # video_pipeline.py — UAPpress Video Creator
 #
@@ -874,8 +879,8 @@ def build_scene_clip_from_image(
         zs = 3.0
 
     frames = max(2, int(round(duration * fps_i)))
-    sw = _ensure_even(w * 2)
-    sh = _ensure_even(h * 2)
+    sw = _ensure_even(int(w * 1.45))
+    sh = _ensure_even(int(h * 1.45))
 
     zmax = 1.0 + (zs * 0.10)
     zexpr = f"min(1+(({zmax}-1)*on/{frames}),{zmax})"
