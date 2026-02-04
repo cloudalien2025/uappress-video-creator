@@ -466,7 +466,6 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
         pairs.append(
             {
                 "script_path": str(sp),
-                "script_file": sp.name,
                 "audio_path": str(a_match),
                 "kind_guess": kind,
                 "chapter_no": chapter_no,
@@ -490,7 +489,6 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
         pairs.append(
             {
                 "script_path": "",
-                "script_file": "",
                 "audio_path": str(ap),
                 "kind_guess": kind,
                 "chapter_no": chapter_no,
