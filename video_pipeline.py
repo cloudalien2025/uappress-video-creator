@@ -817,6 +817,224 @@ def _generate_segment_images(
     return images
 
 
+
+
+# ----------------------------
+# Scene clip building + concat + mux (core pipeline primitives)
+# ----------------------------
+
+def _ensure_even(x: int) -> int:
+    x = int(x)
+    return x if x % 2 == 0 else x - 1 if x > 1 else 2
+
+
+def build_scene_clip_from_image(
+    *,
+    image_path: Union[str, Path],
+    out_mp4_path: Union[str, Path],
+    duration_s: float,
+    width: int,
+    height: int,
+    fps: int,
+    zoom_strength: float,
+) -> Path:
+    """
+    Create a real video clip (H.264) from a still image using a zoom-only Ken Burns effect.
+
+    Streamlit Cloud requirements:
+    - Produces actual video frames (not an image-only MP4).
+    - Uses yuv420p for maximum compatibility.
+    - Keeps filter chain simple and deterministic.
+    """
+    img = Path(image_path)
+    out = Path(out_mp4_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not img.exists():
+        raise FileNotFoundError(str(img))
+
+    fps_i = clamp_int(int(fps or _DEFAULT_FPS), 12, 60)
+    dur = max(0.1, float(duration_s))
+    frames = max(2, int(round(dur * fps_i)))
+
+    w = _ensure_even(max(320, int(width)))
+    h = _ensure_even(max(320, int(height)))
+
+    # Clamp zoom strength so ffmpeg filter doesn't explode on extreme values
+    zmax = clamp_float(float(zoom_strength or 1.06), 1.0, 1.20)
+
+    # Zoompan: increase zoom slightly each frame until zmax, keep centered (zoom-only).
+    # - Start at 1.0, end near zmax over `frames`.
+    zstep = (zmax - 1.0) / float(frames) if frames > 0 else 0.0
+    z_expr = f"min(1+{zstep:.8f}*on,{zmax:.4f})"
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+        f"crop={w}:{h},"
+        f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"d={frames}:s={w}x{h}:fps={fps_i},"
+        f"format=yuv420p"
+    )
+
+    ff = which_ffmpeg()
+    cmd = [
+        ff,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-loop",
+        "1",
+        "-i",
+        str(img),
+        "-t",
+        f"{dur:.3f}",
+        "-vf",
+        vf,
+        "-r",
+        str(fps_i),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+    run_ffmpeg(cmd)
+
+    if not out.exists() or out.stat().st_size < 1024:
+        raise RuntimeError("Scene clip render failed (output missing or too small).")
+
+    return out
+
+
+def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Union[str, Path]) -> Path:
+    """
+    Concatenate scene clips in order.
+
+    We re-encode into a consistent H.264 stream to avoid concat/copy edge cases
+    across ffmpeg builds (Streamlit Cloud).
+    """
+    out = Path(out_mp4_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    clips = [Path(p) for p in clip_paths]
+    clips = [c for c in clips if c.exists() and c.stat().st_size > 1024]
+    if not clips:
+        raise RuntimeError("No valid scene clips to concatenate.")
+
+    list_file = out.parent / f"_{out.stem}_concat_list.txt"
+    def _esc(p: Path) -> str:
+        # ffmpeg concat demuxer single-quote escaping: ' -> '\''
+        return str(p).replace("'", "'\\''")
+    list_file.write_text("".join(["file '" + _esc(c) + "'\n" for c in clips]), encoding="utf-8")
+
+    ff = which_ffmpeg()
+    cmd = [
+        ff,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+    run_ffmpeg(cmd)
+
+    try:
+        list_file.unlink()
+    except Exception:
+        pass
+
+    if not out.exists() or out.stat().st_size < 2048:
+        raise RuntimeError("Concatenation failed (output missing or too small).")
+
+    return out
+
+
+def mux_audio_to_video(
+    *,
+    video_path: Union[str, Path],
+    audio_path: Union[str, Path],
+    out_mp4_path: Union[str, Path],
+    end_buffer_s: float = _DEFAULT_END_BUFFER,
+) -> Path:
+    """
+    Mux audio onto the concatenated video.
+
+    Requirements:
+    - Keep the pipeline order (mux is the last step).
+    - Apply a small end buffer (0.5–0.75s) deterministically.
+    - Avoid black frames (tpad clones last frame for buffer).
+    """
+    v = Path(video_path)
+    a = Path(audio_path)
+    out = Path(out_mp4_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not v.exists():
+        raise FileNotFoundError(str(v))
+    if not a.exists():
+        raise FileNotFoundError(str(a))
+
+    buf = clamp_float(float(end_buffer_s or _DEFAULT_END_BUFFER), _END_BUFFER_MIN, _END_BUFFER_MAX)
+
+    ff = which_ffmpeg()
+    # tpad extends video by cloning last frame; apad extends audio with silence for exactly buf seconds.
+    filt = f"[0:v]tpad=stop_mode=clone:stop_duration={buf:.3f}[v];[1:a]apad=pad_dur={buf:.3f}[a]"
+    cmd = [
+        ff,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(v),
+        "-i",
+        str(a),
+        "-filter_complex",
+        filt,
+        "-map",
+        "[v]",
+        "-map",
+        "[a]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+    run_ffmpeg(cmd)
+
+    if not out.exists() or out.stat().st_size < 2048:
+        raise RuntimeError("Mux failed (output missing or too small).")
+
+    return out
+
+
 # ----------------------------
 # The app.py-compatible segment renderer
 # ----------------------------
