@@ -103,6 +103,54 @@ _DEFAULT_IMAGE_SIZE_916 = os.environ.get("UAPPRESS_IMAGE_SIZE_916", "1024x1536")
 _IMAGE_CACHE_ROOT = os.environ.get("UAPPRESS_IMAGE_CACHE_ROOT", "_image_cache_v2")
 
 
+# ----------------------------
+# No-Object Visual Doctrine (UFO/UAP credibility-first)
+# ----------------------------
+# Default: DO NOT depict a clearly defined craft/object. Visuals should show the *conditions of uncertainty*:
+# observation context, environment, instruments, personnel, documents, terrain, weather, light, and ambiguity.
+#
+# Optional exception (default OFF): allow only *ambiguous distant lights* with no defined edges/shape/symmetry.
+_ALLOW_WEAK_HINT = os.environ.get("UAPPRESS_ALLOW_WEAK_HINT", "0").strip() == "1"
+
+_NO_OBJECT_DOCTRINE = (
+    "STRICT VISUAL DOCTRINE: Do NOT show a UFO craft, spaceship, saucer, disc, triangle, or any defined object. "
+    "Do NOT depict clear geometry, symmetry, metallic hulls, windows, seams/panels, landing gear, engines, beams, "
+    "or a centered 'object in the sky' composition. "
+    "Show only environments and observation context: skies, clouds, weather, silhouettes of terrain, airfields, "
+    "radar/ATC rooms, instrument panels, witnesses from behind, declassified documents, maps, and aftermath textures. "
+    "If anything unusual appears, it must be non-specific: faint illumination, atmospheric glow, lens flare, "
+    "distant indistinct light sources with NO visible edges or shape."
+)
+
+_WEAK_HINT_ADDENDUM = (
+    "WEAK HINT ONLY: You MAY include faint distant lights partially obscured by clouds/haze, "
+    "not centered, no shape, no symmetry, no hard edges, no metallic surfaces, no craft-like silhouette."
+)
+
+_SANITIZE_PATTERNS = [
+    (r"\b(disc|saucer|triangle|triangular|cigar|tic[\-\s]?tac|boomerang)\b", "anomaly"),
+    (r"\b(craft|spaceship|ufo|uap|vehicle)\b", "unidentified phenomenon"),
+    (r"\b(metallic|hull|panel(s)?|seam(s)?|rivets?|window(s)?|cockpit)\b", "indistinct"),
+    (r"\b(engine(s)?|thruster(s)?|exhaust|jet)\b", "light source"),
+    (r"\b(landing\s*gear|port(hole)?s?)\b", "details"),
+    (r"\b(beam(s)?|tractor\s*beam|laser(s)?)\b", "illumination"),
+    (r"\b(hovering|descending|ascending)\b", "moving"),
+]
+
+def _sanitize_scene_context(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s).strip()
+    for pat, repl in _SANITIZE_PATTERNS:
+        s = re.sub(pat, repl, s, flags=re.IGNORECASE)
+    return s
+
+def _doctrine_clause() -> str:
+    return _NO_OBJECT_DOCTRINE + (" " + _WEAK_HINT_ADDENDUM if _ALLOW_WEAK_HINT else "")
+
+
+
 def clamp_float(x: float, lo: float, hi: float) -> float:
     if x < lo:
         return lo
@@ -756,7 +804,7 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[
 
     prompts: List[str] = []
     for pi in idxs:
-        snippet = re.sub(r"\s+", " ", paras[pi]).strip()
+        snippet = _sanitize_scene_context(paras[pi])
         if len(snippet) > 420:
             snippet = snippet[:420].rstrip() + "…"
 
@@ -764,8 +812,10 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[
             "Create a documentary still image for a serious UFO/UAP investigative video. "
             "Cinematic, realistic, restrained, credibility-first. "
             "No text, no logos, no subtitles, no watermarks. "
-            "Moody lighting, archival / military / night-ops / radar / airbase / forest / coast as appropriate. "
-            f"Scene context: {snippet}"
+            "Moody lighting. Favor observation context: radar/ATC rooms, airbase perimeter, night-ops, "
+            "coastal/forest/desert terrain, archival documents, maps, witnesses from behind. "
+            + _doctrine_clause() + " "
+            f"Scene context (sanitized): {snippet}"
         )
     return prompts
 
