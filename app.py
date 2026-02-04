@@ -281,7 +281,7 @@ def _normalize_segments(pairs: List[dict]) -> List[dict]:
                 "key": key,
                 "label": label.title(),
                 "title": title,
-                "script_file": Path(p.get("script_path","")).name if p.get("script_path") else "",
+                "script_file": _safe_script_filename(p),
                 "pair": p,  # original pipeline pair (audio + script paths)
             }
         )
