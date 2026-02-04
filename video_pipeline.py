@@ -1213,12 +1213,22 @@ def build_sora_prompt(
     segment=None,
     *,
     scene_text: str | None = None,
-    character: str = "the character",
-    style: str = "Roblox-style 3D animation",
-    environment: str = "bright, colorful Roblox-style environments with clean lighting",
-    camera: str = "mid-body height camera, slight steady zoom",
-    movement: str = "smooth, exaggerated, cute game-like motion",
-    constraints: str = "No text, no logos, no realism, no scary elements.",
+    # Documentary-first defaults (UAPpress)
+    character: str = "a restrained documentary scene",
+    style: str = "cinematic documentary realism",
+    environment: str = "historically plausible locations, natural lighting, restrained color grade",
+    camera: str = "stable tripod or slow drift, documentary framing",
+    movement: str = "minimal motion, observational, no exaggerated action",
+    constraints: str = (
+        "No text, no logos, no subtitles, no watermarks. "
+        "No aliens, no creatures, no sci-fi effects. "
+        "No game aesthetics. Historically plausible."
+    ),
+    # Optional structured knobs (app may pass these)
+    mode: str = "cinematic_realism",
+    length_s: int | None = None,
+    aspect: str = "9:16",
+    fps: int = 30,
     **_ignored,
 ) -> str:
     """
@@ -1255,15 +1265,41 @@ def build_sora_prompt(
     if not resolved:
         resolved = "A short, engaging scene that matches the narration without any on-screen text."
 
-    prompt = (
-        f"Animate {character} in a {style}.\n\n"
-        f"Scene:\n{resolved}\n\n"
-        f"Environment: {environment}.\n"
-        f"Motion: {movement}.\n"
-        f"Camera: {camera}.\n\n"
-        f"{constraints}"
-    )
-    return prompt
+        style_bundle = build_sora_house_style(mode=mode)
+
+        # Normalize fps/aspect/length metadata (descriptive for Sora)
+        try:
+            fps_i = int(fps)
+        except Exception:
+            fps_i = 30
+        if fps_i <= 0:
+            fps_i = 30
+        asp = (aspect or "9:16").strip()
+
+        meta = []
+        if length_s is not None:
+            try:
+                meta.append(f"Target length: {int(length_s)} seconds.")
+            except Exception:
+                pass
+        meta.append(f"Aspect ratio: {asp}.")
+        meta.append(f"Frame rate: {fps_i} fps.")
+        meta_txt = " ".join(meta)
+
+        prompt = (
+            "Create a cinematic, documentary-style video scene.\n"
+            f"{meta_txt}\n\n"
+            f"Scene:\n{resolved}\n\n"
+            f"Style: {style}.\n"
+            f"Environment: {environment}.\n"
+            f"Camera: {camera}. {style_bundle.camera_rules}\n"
+            f"Motion: {movement}.\n"
+            f"Lighting: {style_bundle.lighting_rules}\n"
+            f"Texture: {style_bundle.grain_rules}\n"
+            f"Constraints: {constraints} {style_bundle.realism_constraints}"
+        )
+        return prompt
+
 
 
 def prepare_sora_short_job(
@@ -1277,7 +1313,7 @@ def prepare_sora_short_job(
     """Return a structured payload the app can store/log for a Sora short."""
     preset_map = {"7s": 7, "12s": 12, "18s": 18}
     length_s = preset_map.get((preset or "12s").strip().lower(), 12)
-    full_prompt = build_sora_prompt(prompt_text, mode=mode, length_s=length_s, aspect=aspect, fps=fps)
+    full_prompt = build_sora_prompt(scene_text=prompt_text, mode=mode, length_s=length_s, aspect=aspect, fps=fps)
     return {
         "preset": preset,
         "mode": mode,
