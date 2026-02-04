@@ -441,13 +441,22 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
         preview = _read_text_preview(sp, max_chars=1200)
         title_guess = ""
         for line in (preview or "").splitlines():
-            t = line.strip()
-            if not t:
+            raw = line.strip()
+            if not raw:
                 continue
-            t = t.lstrip("#").strip()
-            if t:
-                title_guess = t[:120]
-                break
+
+            # Only treat explicit headings/metadata as a "title".
+            # This prevents the first narration line from becoming the UI label.
+            if raw.startswith("#"):
+                t = raw.lstrip("#").strip()
+                if t:
+                    title_guess = t[:120]
+                    break
+            if raw.lower().startswith("title:"):
+                t = raw.split(":", 1)[1].strip()
+                if t:
+                    title_guess = t[:120]
+                    break
 
         # FIX: unique base_name to prevent cache collisions across segments.
         # Use absolute path + paired audio path (if any) for a stable unique hash.
