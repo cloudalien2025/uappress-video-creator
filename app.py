@@ -992,7 +992,7 @@ with colB:
         "FPS",
         min_value=12,
         max_value=60,
-        value=30,
+        value=30,  # YouTube-native default
         step=1,
         disabled=st.session_state["is_generating"],
         key="fps_value",
