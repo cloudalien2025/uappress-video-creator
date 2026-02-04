@@ -883,87 +883,6 @@ def _ffmpeg_make_vertical_clip(
 
 # ===============================================================
 # SECTION 7 — UI (Generate + Branding + Results + Previews + Logs)
-
-# ----------------------------
-# Cinematic / Visual-first Shorts — Sora Prompt Studio (Shorts mode only)
-# ----------------------------
-video_mode = st.session_state.get("video_mode", "Long-form (16:9)")  # sidebar selectbox key
-if video_mode.startswith("Shorts"):
-    st.header("🎬 Cinematic / Visual-first Shorts — Sora Prompt Studio")
-    st.caption("Build a clean, brand-consistent prompt for Sora. Paste the result into Sora. This does not generate video inside the app.")
-
-    colA, colB, colC = st.columns([1, 1, 1])
-    with colA:
-        sora_len_label = st.selectbox(
-            "Length preset",
-            ["7s (Ultra-hook)", "12s (Narrative beat)", "18s (Mini-story)"],
-            index=1,
-            key="sora_len_preset",
-        )
-    with colB:
-        sora_look = st.selectbox(
-            "Look",
-            ["Cinematic realism", "Archival reenactment"],
-            index=0,
-            key="sora_look",
-        )
-    with colC:
-        sora_camera = st.selectbox(
-            "Camera motion",
-            ["Slow drift (stable)", "Handheld subtle", "Orbit / parallax"],
-            index=0,
-            key="sora_camera",
-        )
-
-    sora_beat = st.text_area(
-        "Short beat (what happens on-screen)",
-        height=130,
-        key="sora_short_beat",
-        placeholder="Example: Night in Suffolk. A small patrol of U.S. Air Force security police moves through pine trees, red lights in the distance, fog hanging low, measured and restrained.",
-    )
-
-    sora_constraints = st.text_area(
-        "Constraints / notes (optional)",
-        height=90,
-        key="sora_constraints",
-        placeholder="Example: No gore, no monsters, no cheesy sci‑fi, no exaggerated UFO shapes, no logos. Minimal readable HUD overlays only.",
-    )
-
-    if st.button("Build Sora prompt", type="primary", key="build_sora_prompt_btn"):
-        seconds = int(sora_len_label.split("s")[0])
-        mode = "cinematic_realism" if sora_look == "Cinematic realism" else "archival_reenactment"
-        base_prompt = (sora_beat or "").strip()
-        if sora_camera:
-            base_prompt += f"\nCamera: {sora_camera}."
-        if sora_constraints and sora_constraints.strip():
-            base_prompt += f"\nConstraints: {sora_constraints.strip()}"
-        if not base_prompt.strip():
-            st.warning("Add at least a short beat to generate a Sora prompt.")
-        else:
-            final_prompt = vp.build_sora_prompt(
-                base_prompt,
-                mode=mode,
-                length_s=seconds,
-                aspect="9:16",
-                fps=30,
-            )
-            st.session_state["sora_prompt_built"] = final_prompt
-
-    if st.session_state.get("sora_prompt_built"):
-        st.text_area(
-            "Final Sora prompt (copy/paste)",
-            value=st.session_state["sora_prompt_built"],
-            height=260,
-            key="sora_prompt_out",
-        )
-        st.download_button(
-            "Download prompt (.txt)",
-            data=st.session_state["sora_prompt_built"].encode("utf-8"),
-            file_name="uappress_sora_short_prompt.txt",
-            mime="text/plain",
-        )
-
-    st.divider()
 # ===============================================================
 
 st.subheader("🎬 Generate Segment MP4s")
@@ -1129,8 +1048,8 @@ if generate_clicked:
             zoom_strength = float(st.session_state.get("zoom_strength_value", 1.06))
             results = generate_all_segments_sequential(
                 extract_dir=extract_dir,
-                        segments=segments,
-out_dir=out_dir,
+                segments=segments,
+                out_dir=out_dir,
                 overwrite=overwrite,
                 zoom_strength=zoom_strength,
                 fps=fps,
@@ -1152,6 +1071,88 @@ out_dir=out_dir,
 
 
 
+
+
+# ----------------------------
+# Cinematic / Visual-first Shorts — Sora Prompt Studio (Shorts mode only)
+# ----------------------------
+video_mode = st.session_state.get("video_mode", "Long-form (16:9)")  # sidebar selectbox key
+if video_mode.startswith("Shorts"):
+    st.header("🎬 Cinematic / Visual-first Shorts — Sora Prompt Studio")
+    st.caption("Build a clean, brand-consistent prompt for Sora. Paste the result into Sora. This does not generate video inside the app.")
+
+    colA, colB, colC = st.columns([1, 1, 1])
+    with colA:
+        sora_len_label = st.selectbox(
+            "Length preset",
+            ["7s (Ultra-hook)", "12s (Narrative beat)", "18s (Mini-story)"],
+            index=1,
+            key="sora_len_preset",
+        )
+    with colB:
+        sora_look = st.selectbox(
+            "Look",
+            ["Cinematic realism", "Archival reenactment"],
+            index=0,
+            key="sora_look",
+        )
+    with colC:
+        sora_camera = st.selectbox(
+            "Camera motion",
+            ["Slow drift (stable)", "Handheld subtle", "Orbit / parallax"],
+            index=0,
+            key="sora_camera",
+        )
+
+    sora_beat = st.text_area(
+        "Short beat (what happens on-screen)",
+        height=130,
+        key="sora_short_beat",
+        placeholder="Example: Night in Suffolk. A small patrol of U.S. Air Force security police moves through pine trees, red lights in the distance, fog hanging low, measured and restrained.",
+    )
+
+    sora_constraints = st.text_area(
+        "Constraints / notes (optional)",
+        height=90,
+        key="sora_constraints",
+        placeholder="Example: No gore, no monsters, no cheesy sci‑fi, no exaggerated UFO shapes, no logos. Minimal readable HUD overlays only.",
+    )
+
+    if st.button("Build Sora prompt", type="primary", key="build_sora_prompt_btn"):
+        seconds = int(sora_len_label.split("s")[0])
+        mode = "cinematic_realism" if sora_look == "Cinematic realism" else "archival_reenactment"
+        base_prompt = (sora_beat or "").strip()
+        if sora_camera:
+            base_prompt += f"\nCamera: {sora_camera}."
+        if sora_constraints and sora_constraints.strip():
+            base_prompt += f"\nConstraints: {sora_constraints.strip()}"
+        if not base_prompt.strip():
+            st.warning("Add at least a short beat to generate a Sora prompt.")
+        else:
+            final_prompt = vp.build_sora_prompt(
+                base_prompt,
+                mode=mode,
+                length_s=seconds,
+                aspect="9:16",
+                fps=30,
+            )
+            st.session_state["sora_prompt_built"] = final_prompt
+
+    if st.session_state.get("sora_prompt_built"):
+        st.text_area(
+            "Final Sora prompt (copy/paste)",
+            value=st.session_state["sora_prompt_built"],
+            height=260,
+            key="sora_prompt_out",
+        )
+        st.download_button(
+            "Download prompt (.txt)",
+            data=st.session_state["sora_prompt_built"].encode("utf-8"),
+            file_name="uappress_sora_short_prompt.txt",
+            mime="text/plain",
+        )
+
+    st.divider()
 
 st.markdown("---")
 st.subheader("3) Bonus — Shorts / TikTok / Reels Exporter (Upload-only sources)")
