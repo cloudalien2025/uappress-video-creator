@@ -1,5 +1,3 @@
-
-
 def image_cache_key(prompt: str, width: int, height: int) -> str:
     import hashlib
     return hashlib.sha256((prompt + f'|{width}x{height}').encode('utf-8')).hexdigest()[:16]
