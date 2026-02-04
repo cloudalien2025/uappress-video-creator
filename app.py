@@ -281,6 +281,7 @@ def _normalize_segments(pairs: List[dict]) -> List[dict]:
                 "key": key,
                 "label": label.title(),
                 "title": title,
+                "script_file": Path(p.get("script_path","")).name if p.get("script_path") else "",
                 "pair": p,  # original pipeline pair (audio + script paths)
             }
         )
@@ -343,7 +344,7 @@ if st.session_state.zip_path:
 
     with st.expander("Show detected segments"):
         for s in st.session_state.segments:
-            st.write(f"{s['index']}. **{s['label']}** — {s['title'] or 'Untitled'}")
+            st.write(f"{s['index']}. **{s['label']}** — {s.get('script_file', '') or s.get('key', '')}")
 
 st.caption("Next: Generate videos sequentially (crash-safe).")
 
