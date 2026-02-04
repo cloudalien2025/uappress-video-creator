@@ -828,6 +828,7 @@ def _ensure_even(x: int) -> int:
     return x if x % 2 == 0 else x - 1 if x > 1 else 2
 
 
+
 def build_scene_clip_from_image(
     *,
     image_path: Union[str, Path],
@@ -839,12 +840,11 @@ def build_scene_clip_from_image(
     zoom_strength: float,
 ) -> Path:
     """
-    Create a real video clip (H.264) from a still image using a zoom-only Ken Burns effect.
+    Create a real H.264 MP4 scene clip from a still image using FFmpeg zoompan.
 
-    Streamlit Cloud requirements:
-    - Produces actual video frames (not an image-only MP4).
-    - Uses yuv420p for maximum compatibility.
-    - Keeps filter chain simple and deterministic.
+    - No black video: always renders frames from the image.
+    - Deterministic duration: uses -t and a fixed frame count.
+    - Streamlit Cloud safe: creates parent dirs and validates output file size.
     """
     img = Path(image_path)
     out = Path(out_mp4_path)
@@ -853,25 +853,29 @@ def build_scene_clip_from_image(
     if not img.exists():
         raise FileNotFoundError(str(img))
 
-    fps_i = clamp_int(int(fps or _DEFAULT_FPS), 12, 60)
-    dur = max(0.1, float(duration_s))
-    frames = max(2, int(round(dur * fps_i)))
+    duration = max(0.05, float(duration_s))
+    fps_i = clamp_int(int(fps), 6, 60)
+    w = _ensure_even(clamp_int(int(width), 320, 3840))
+    h = _ensure_even(clamp_int(int(height), 320, 3840))
 
-    w = _ensure_even(max(320, int(width)))
-    h = _ensure_even(max(320, int(height)))
+    zs = float(zoom_strength)
+    if zs < 0:
+        zs = 0.0
+    if zs > 3.0:
+        zs = 3.0
 
-    # Clamp zoom strength so ffmpeg filter doesn't explode on extreme values
-    zmax = clamp_float(float(zoom_strength or 1.06), 1.0, 1.20)
+    frames = max(2, int(round(duration * fps_i)))
+    sw = _ensure_even(w * 2)
+    sh = _ensure_even(h * 2)
 
-    # Zoompan: increase zoom slightly each frame until zmax, keep centered (zoom-only).
-    # - Start at 1.0, end near zmax over `frames`.
-    zstep = (zmax - 1.0) / float(frames) if frames > 0 else 0.0
-    z_expr = f"min(1+{zstep:.8f}*on,{zmax:.4f})"
+    zmax = 1.0 + (zs * 0.10)
+    zexpr = f"min(1+(({zmax}-1)*on/{frames}),{zmax})"
+    xexpr = "iw/2-(iw/zoom/2)"
+    yexpr = "ih/2-(ih/zoom/2)"
+
     vf = (
-        f"scale={w}:{h}:force_original_aspect_ratio=increase,"
-        f"crop={w}:{h},"
-        f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"d={frames}:s={w}x{h}:fps={fps_i},"
+        f"scale={sw}:{sh},"
+        f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':d={frames}:s={w}x{h}:fps={fps_i},"
         f"format=yuv420p"
     )
 
@@ -886,16 +890,16 @@ def build_scene_clip_from_image(
         "1",
         "-i",
         str(img),
-        "-t",
-        f"{dur:.3f}",
         "-vf",
         vf,
+        "-t",
+        f"{duration:.3f}",
         "-r",
         str(fps_i),
         "-c:v",
         "libx264",
         "-preset",
-        "ultrafast",
+        os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -904,11 +908,10 @@ def build_scene_clip_from_image(
     ]
     run_ffmpeg(cmd)
 
-    if not out.exists() or out.stat().st_size < 1024:
+    if (not out.exists()) or out.stat().st_size < 4096:
         raise RuntimeError("Scene clip render failed (output missing or too small).")
 
     return out
-
 
 def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Union[str, Path]) -> Path:
     """
