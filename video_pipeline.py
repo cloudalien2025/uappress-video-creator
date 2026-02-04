@@ -1,6 +1,3 @@
-def image_cache_key(prompt: str, width: int, height: int) -> str:
-    import hashlib
-    return hashlib.sha256((prompt + f'|{width}x{height}').encode('utf-8')).hexdigest()[:16]
 # ============================================================
 # video_pipeline.py — UAPpress Video Creator
 #
@@ -45,6 +42,7 @@ def image_cache_key(prompt: str, width: int, height: int) -> str:
 # ============================================================
 
 from __future__ import annotations
+
 
 import dataclasses
 import io
