@@ -117,13 +117,15 @@ _ALLOW_LOCAL_FALLBACK = os.environ.get("UAPPRESS_ALLOW_LOCAL_FALLBACK", "0").str
 
 
 _NO_OBJECT_DOCTRINE = (
-    "STRICT VISUAL DOCTRINE: Do NOT show a UFO craft, spaceship, saucer, disc, triangle, or any defined object. "
+    "STRICT VISUAL DOCTRINE: Do NOT show a UFO craft, spaceship, saucer, disc, triangle, or any defined non-human vehicle. "
     "Do NOT depict clear geometry, symmetry, metallic hulls, windows, seams/panels, landing gear, engines, beams, "
     "or a centered 'object in the sky' composition. "
-    "Show only environments and observation context: skies, clouds, weather, silhouettes of terrain, airfields, "
-    "radar/ATC rooms, instrument panels, witnesses from behind, declassified documents, maps, and aftermath textures. "
-    "If anything unusual appears, it must be non-specific: faint illumination, atmospheric glow, lens flare, "
-    "distant indistinct light sources with NO visible edges or shape."
+    "Depict context only: environments and observation settings such as skies, clouds, weather, silhouettes of terrain, airfields, "
+    "radar/ATC rooms, instrument panels, witnesses from behind, declassified documents, maps, and quiet aftermath. "
+    "OBSCURED OBJECT POLICY (✅ B): ONLY when recovery/containment/handling is explicitly implied by context, "
+    "you MAY depict a non-descript tarp-covered bundle or plain covered crate as a prop. It must be indistinct and non-identifiable: "
+    "no shape language, no metallic surfaces, no hard edges, no symmetry, no windows, no engines, no craft silhouette. "
+    "ALSO: Do NOT add anomalous lights or effects in the sky (no glowing orbs, no flares, no spotlights, no searchlights) unless an incident profile explicitly allows it."
 )
 
 _WEAK_HINT_ADDENDUM = (
@@ -787,16 +789,19 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
 def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incident_hint: str = "") -> List[str]:
     """Build per-scene image prompts.
 
-    Baked-in house style:
-    - Illustrated (graphic-novel / storyboard / concept art), NOT photographic.
-    - Near-monochrome palette with ONE restrained accent color.
-    - Credibility-first, investigative, military/intel-adjacent tone.
-    - Humans allowed, but routine and non-performative (no hero poses).
+    HARD-WIRED UAPpress IMAGE HOUSE STYLE (2026-02):
+    - Non-photorealistic 3D illustrated world (NPR), flat/stepped shading, clean ink-like outlines.
+    - Minimal color: near-monochrome with ONE restrained muted accent color (5–10% of frame).
+    - NO soot / smudge / painterly texture. No cinematic lighting. No photorealism.
+    - Credibility-first, investigative, military/intel-adjacent tone. Humans allowed (routine, non-performative).
 
     Scene composition doctrine:
     - Depict context, not conclusions.
-    - Never show a craft/object; never show beams.
-    - Use 6 canonical scene categories to prevent "spaceship drift".
+    - No beams.
+    - Obscured object policy (✅ B):
+        * Allowed ONLY when the narration implies recovery/containment/handling.
+        * Must be non-descript (tarp-covered bundle/crate), no shape language, no metallic hull cues, no symmetry, no windows, no engines.
+    - Use 6 canonical scene categories to prevent drift.
     """
     text = (script_text or "").strip()
     if not text:
@@ -806,37 +811,41 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
 
     # Light-touch segmentation: paragraphs -> beats. Avoid over-fragmentation.
     paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
-    # Prefer substantial beats
     beats = [p for p in paras if len(p) >= 120] or paras
     if not beats:
         return []
 
-    # Choose N beats evenly, but keep stable for repeated runs.
+    # Choose N beats evenly, stable across runs.
     if len(beats) <= max_scenes_i:
         idxs = list(range(len(beats)))
     else:
         step = len(beats) / float(max_scenes_i)
         idxs = [min(len(beats) - 1, int(i * step)) for i in range(max_scenes_i)]
 
-    # House look
+    # Episode-wide accent color (keep consistent across scenes)
     accent = (os.environ.get("UAPPRESS_ACCENT_COLOR", "muted amber") or "muted amber").strip()
+
+    # HARD house look (single choke point)
+    # NOTE: Intentionally avoids the word "soot" per directive.
     style_block = (
-        "STYLE: graphic-novel storyboard illustration, military dossier concept art, visible ink linework, "
-        "matte shading, high contrast chiaroscuro lighting. "
-        "COLOR: near-monochrome (charcoal/gray/off-white) with a single restrained accent color: "
-        f"{accent}. Accent should be subtle (5–10% of frame). "
-        "No photographic realism, no film still, no lens bokeh, no camera metadata. "
-        "No text, no logos, no subtitles, no watermarks. "
-        "Faces should be non-identifiable; if people appear, they are routine silhouettes or small groups."
+        "STYLE: non-photorealistic 3D illustrated diorama (NPR). Flat/stepped shading, clean ink-like contour lines, "
+        "graphic readability, documentary distance. "
+        "SURFACES: clean matte materials, no painterly brushstrokes, no smudges, no grainy soot texture, no sketchy scribble. "
+        "LIGHTING: neutral and diagrammatic, no cinematic rim light, no bloom, no lens flare, no volumetric fog, no god rays. "
+        "COLOR: near-monochrome (graphite gray / off-white / deep black) with ONE restrained muted accent color: "
+        f"{accent}. Accent must be subtle (5–10% of frame), never used as a 'phenomena'. "
+        "RENDER: clearly illustrated, not photographic, not photoreal, not CGI realism, not a film still. "
+        "TEXT: no text, no logos, no subtitles, no watermarks. "
+        "PEOPLE: faces non-identifiable; if people appear, keep them routine, mid-distance, calm."
     )
 
-    # Canonical scene categories (cycled)
+    # Canonical scene categories (cycled). These describe WHAT to depict, not HOW to render.
     categories = [
         ("Institutional context", "military base exterior or government facility, plain architecture, procedural calm, routine personnel movement"),
         ("Environmental establishing", "wide environmental context, desert/road/skyline/terrain, empty or distant figures, stillness"),
-        ("Human scale / normalcy", "ordinary human activity, small group walking/standing, non-performative posture, seen from behind"),
+        ("Human scale / normalcy", "ordinary human activity, small group walking/standing, non-performative posture, seen from behind or mid-distance"),
         ("Procedural / process", "documents, folders, maps, radios, desks, briefing materials, hands-only or partial figures"),
-        ("Temporal / transition", "dusk/night corridor, road at night, exterior building at dawn, weather shifting, quiet transition"),
+        ("Temporal / transition", "corridor or road at dusk/night, exterior building at dawn, weather shifting, quiet transition"),
         ("Reflective / aftermath", "empty space after activity, quiet landscape, vacant room, ambiguity and restraint"),
     ]
 
@@ -845,9 +854,29 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
     if (incident_hint or "").strip().lower().find("phoenix") >= 0:
         allow_ambiguous_lights = True
 
-    doctrine = _doctrine_clause()
-    if allow_ambiguous_lights:
-        doctrine += (
+    def _implies_recovery_or_containment(s: str) -> bool:
+        s = (s or "").lower()
+        # Broad, conservative keyword set. Requires at least one strong cue.
+        cues = [
+            "recover", "recovered", "recovery", "retrieval", "retrieve",
+            "debris", "wreckage", "crash", "impact", "site", "field",
+            "secured", "security", "contain", "containment", "quarantine",
+            "transport", "convoy", "crate", "tarpaulin", "tarp", "covered",
+            "hangar", "warehouse", "evidence", "materials", "fragments",
+        ]
+        return any(c in s for c in cues)
+
+    base_doctrine = _doctrine_clause()
+
+    # Refine doctrine to match ✅ B policy and your new style.
+    # 1) Sky lights policy
+    if not allow_ambiguous_lights:
+        base_doctrine += (
+            " ALSO: Do NOT include any glowing orb, flare, spotlight, searchlight, beam, or bright point of light in the sky. "
+            "If the scene is night, keep the sky empty or with only subtle clouds/stars."
+        )
+    else:
+        base_doctrine += (
             " INCIDENT PROFILE (PHOENIX LIGHTS): You MAY include a few distant, soft-edged, irregularly spaced points of light "
             "partially obscured by haze/clouds. No structure, no symmetry, no hard edges, no beams, no centered sky-object framing."
         )
@@ -860,22 +889,38 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
             snippet = snippet[:380].rstrip() + "…"
 
         cat_name, cat_desc = categories[j % len(categories)]
+
         # Keep humans present in ~2/3 of scenes by default (routine presence).
         want_people = (j % 3) != 0
         people_clause = (
-            "HUMANS: include a few people in the frame (silhouettes or small group), routine posture, no drama, no pointing."
+            "HUMANS: include a few people in frame (silhouettes or small group), routine posture, no drama, no pointing."
             if want_people
-            else "HUMANS: none or distant silhouettes only."
+            else "HUMANS: none, or distant silhouettes only."
         )
+
+        # ✅ B: allow only an obscured, non-descript covered object when narration implies recovery/containment.
+        allow_obscured_object = _implies_recovery_or_containment(snippet)
+        if allow_obscured_object:
+            object_clause = (
+                "OBJECT POLICY (ALLOWED — OBSCURED ONLY): You may depict a non-descript tarp-covered bundle or plain covered crate "
+                "being handled/guarded/transported as context. It must be indistinct and non-identifiable: no shape language, "
+                "no metallic surfaces, no hard edges, no symmetry, no windows, no engines, no geometry, no craft silhouette."
+            )
+        else:
+            object_clause = (
+                "OBJECT POLICY (DISALLOWED): Do NOT depict any recovered object, craft, debris pile, metallic fragments, "
+                "or anything that reads as a vehicle or non-human technology."
+            )
 
         prompt = (
             "Create a still image for a credibility-first UAP investigative documentary.\n"
             f"{style_block}\n"
             f"SCENE CATEGORY: {cat_name}. Depict: {cat_desc}.\n"
             f"{people_clause}\n"
-            f"{doctrine}\n"
+            f"{object_clause}\n"
+            f"{base_doctrine}\n"
             f"Context (sanitized beat): {snippet}\n"
-            "COMPOSITION: editorial stillness, grounded realism, no spectacle, no overclaiming."
+            "COMPOSITION: editorial stillness, documentary distance, minimal color, no spectacle, no overclaiming."
         )
         prompts.append(prompt)
 
