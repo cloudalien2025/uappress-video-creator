@@ -919,7 +919,7 @@ def _generate_segment_images(
         return existing[:desired]
 
     # Script must exist in the extracted ZIP as <segment_id>.txt (hard-fail if missing).
-    script_path = str(pair.get("script") or "")
+    script_path = str(pair.get("script_path") or pair.get("script_file") or pair.get("script") or "").strip()
     if not script_path or not os.path.isfile(script_path):
         raise FileNotFoundError(
             f"Missing script for segment. Expected a .txt for this segment inside the ZIP. Got: {script_path}"
@@ -1244,7 +1244,7 @@ def render_segment_mp4(
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
 
-    audio_path = str(pair.get("audio_path") or "").strip()
+    audio_path = str(pair.get("audio_path") or pair.get("audio_file") or pair.get("audio") or "").strip()
     if not audio_path:
         raise RuntimeError("pair has no audio_path; cannot render segment.")
     audio_p = Path(audio_path)
@@ -1557,5 +1557,4 @@ def generate_all_segments_sequential(
 
     return outputs
 
-# Back-compat alias for older app.py calls
-_generate_all_segments_sequential = generate_all_segments_sequential
+# B
