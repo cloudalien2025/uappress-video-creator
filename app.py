@@ -772,8 +772,6 @@ def generate_all_segments_sequential(
                 max_scene_seconds=int(max_scene_seconds),
 ""),
 
-            )
-
             st.session_state["generated"][seg_key] = out_path
             outputs.append(out_path)
             dt = time.time() - t0
