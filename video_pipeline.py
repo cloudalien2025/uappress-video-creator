@@ -146,29 +146,28 @@ _SANITIZE_PATTERNS = [
 # ----------------------------
 # Script Loading (REQUIRED)
 # ----------------------------
-def load_segment_script(extract_dir: Path, segment_id: str) -> str:
+def load_segment_script(script_path: Union[str, Path]) -> str:
     """
     REQUIRED: Load narration script for a segment.
 
     Option A contract:
-      - The extracted ZIP MUST contain a text file named '<segment_id>.txt'
-        (e.g., '01_intro.txt', '02_chapter_1.txt', etc.)
+      - The extracted ZIP MUST contain a .txt script file for each segment.
+      - Scripts may live in subfolders inside the ZIP. We therefore load using the
+        exact script_path discovered during extraction, not by reconstructing a
+        root-level '<segment_id>.txt' path.
 
     We hard-fail if missing or empty to prevent silent fallback visuals.
     """
-    script_path = extract_dir / f"{segment_id}.txt"
-    if not script_path.exists():
+    sp = Path(script_path)
+    if not sp.exists():
         raise RuntimeError(
-            f"Missing required script file: {script_path.name}. "
-            "Each segment MUST have a corresponding .txt script file inside the ZIP."
+            f"Missing required script file: {sp.name}. "
+            "The ZIP must include a .txt script file for each segment."
         )
-    text = script_path.read_text(encoding="utf-8", errors="ignore").strip()
+    text = sp.read_text(encoding="utf-8", errors="ignore").strip()
     if not text:
-        raise RuntimeError(f"Script file is empty: {script_path.name}")
+        raise RuntimeError(f"Script file is empty: {sp.name}")
     return text
-
-
-
 def _sanitize_scene_context(text: str) -> str:
     s = (text or "").strip()
     if not s:
@@ -1021,9 +1020,11 @@ def _generate_segment_images(
         return existing[: max(1, int(max_scenes))]
 
     # Option A (REQUIRED): scripts must be inside the extracted ZIP as <segment_id>.txt
-    # We intentionally hard-fail if missing to prevent silent fallback visuals.
-    segment_id = str(pair.get("base_name") or Path(str(pair.get("audio_path") or "")).stem).strip()
-    script_text = load_segment_script(extract_dir, segment_id)
+    # We intentionally hard-fail if missing to prevent silent fallback visuals.    script_path = str(pair.get("script_path") or "").strip()
+    if not script_path:
+        raise RuntimeError("Missing required script_path for segment; ZIP must include .txt scripts.")
+    segment_id = Path(script_path).stem.strip()
+    script_text = load_segment_script(script_path)
     incident_hint = (str(pair.get("title_guess") or "") + " " + segment_id).strip()
     prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes), incident_hint=incident_hint)
 
