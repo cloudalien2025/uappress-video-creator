@@ -111,58 +111,6 @@ with st.sidebar:
         help="Required for image generation + Sora. Stored only in this session.",
     )
     st.session_state["api_key"] = (api_key_input or "").strip()
-
-    # -----------------------------------------------------------
-    # Style reference (MANDATORY for consistent illustrated look)
-    # -----------------------------------------------------------
-    st.subheader("🎨 Style Reference (MANDATORY)")
-    style_file = st.file_uploader(
-        "Upload style reference image",
-        type=["png", "jpg", "jpeg"],
-        help="This image conditions every scene so the look stays consistent. Required.",
-        key="style_ref_uploader",
-    )
-
-    def _save_style_ref(uploaded) -> None:
-        import tempfile
-        import shutil
-        from pathlib import Path
-
-        # Clean previous style temp dir (if any)
-        try:
-            old_root = st.session_state.get("style_ref_root", "") or ""
-            if old_root and os.path.isdir(old_root):
-                shutil.rmtree(old_root, ignore_errors=True)
-        except Exception:
-            pass
-
-        root = tempfile.mkdtemp(prefix="uappress_style_")
-        # Preserve extension when possible
-        ext = ".png"
-        try:
-            name = (uploaded.name or "").lower()
-            if name.endswith(".jpg") or name.endswith(".jpeg"):
-                ext = ".jpg"
-        except Exception:
-            pass
-
-        path = str(Path(root) / f"style_ref{ext}")
-        with open(path, "wb") as f:
-            f.write(uploaded.getbuffer())
-
-        st.session_state["style_ref_root"] = root
-        st.session_state["style_ref_path"] = path
-
-    if style_file is not None:
-        _save_style_ref(style_file)
-
-    style_ready = bool(st.session_state.get("style_ref_path", "")) and os.path.isfile(st.session_state.get("style_ref_path", ""))
-    if style_ready:
-        st.success("Style reference loaded ✅")
-    else:
-        st.warning("No style reference uploaded yet — generation will be blocked.")
-
-    st.divider()
     st.header("🎞️ Video Settings")
 
     # Mode selector (Shorts/Reels only show when selected)
@@ -820,7 +768,6 @@ def generate_all_segments_sequential(
                 max_scenes=int(max_scenes),
                 min_scene_seconds=int(min_scene_seconds),
                 max_scene_seconds=int(max_scene_seconds),
-                style_ref_path=str(st.session_state.get("style_ref_path","") or ""),
 
             )
 
@@ -1090,7 +1037,6 @@ with col1:
     generate_clicked = st.button(
         "🚀 Generate Videos",
         type="primary",
-        disabled=st.session_state["is_generating"] or (len(segments) == 0) or (not (st.session_state.get("style_ref_path","") and Path(st.session_state.get("style_ref_path","")).exists())),
         use_container_width=True,
         key="generate_videos_btn",
     )
@@ -1112,8 +1058,6 @@ if generate_clicked:
         st.warning("Enter your OpenAI API key in the sidebar first.")
     elif not segments:
         st.warning("No segments detected in the extracted ZIP.")
-    elif not (st.session_state.get("style_ref_path","") and Path(st.session_state.get("style_ref_path","")).exists()):
-        st.warning("Upload a Style Reference image in the sidebar first (required to lock the visual style).")
     else:
         st.session_state["stop_requested"] = False
         st.session_state["is_generating"] = True
