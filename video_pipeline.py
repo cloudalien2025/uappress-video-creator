@@ -960,10 +960,12 @@ def _generate_segment_images(
     if existing:
         return existing[: max(1, int(max_scenes))]
 
-    script_path = str(pair.get("script_path") or "")
-    script_text = _read_text_preview(script_path, max_chars=12000) if script_path else ""
-    incident_hint = (str(pair.get('title_guess') or '') + ' ' + str(pair.get('script_path') or '')).strip()
-    prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes), incident_hint=incident_hint) if script_text else []
+    # Option A (REQUIRED): scripts must be inside the extracted ZIP as <segment_id>.txt
+# We intentionally hard-fail if missing to prevent silent fallback visuals.
+segment_id = str(pair.get("base_name") or Path(str(pair.get("audio_path") or "")).stem).strip()
+script_text = load_segment_script(extract_dir, segment_id)
+incident_hint = (str(pair.get("title_guess") or "") + " " + segment_id).strip()
+prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes), incident_hint=incident_hint)
 
     if not prompts:
         prompts = [
