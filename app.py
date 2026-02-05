@@ -44,43 +44,6 @@ st.title("🛸 UAPpress — Video Creator")
 st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).")
 
 
-# ----------------------------
-# Cache / Temp Maintenance
-# ----------------------------
-if "CACHE_BUSTER" not in st.session_state:
-    st.session_state["CACHE_BUSTER"] = int(time.time())
-
-
-# ----------------------------
-# Sidebar: Maintenance
-with st.sidebar.expander("🧹 Maintenance"):
-    st.caption("Use this if you changed code/models and Streamlit keeps reusing old cached images or segments.")
-
-    if st.button("🧹 Clear app caches + temp", use_container_width=True, key="btn_clear_cache"):
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        try:
-            st.cache_resource.clear()
-        except Exception:
-            pass
-        # Clear temp working folders we create in this app
-        for d in ["_work", "_runs", "_segments", "_bonus_uploads"]:
-            try:
-                p = Path(d)
-                if p.exists() and p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
-            except Exception:
-                pass
-        # Reset per-run session state keys
-        for k in ["zip_bytes", "workdir", "extract_dir", "segments", "segment_meta", "last_run_id"]:
-            st.session_state.pop(k, None)
-        st.success("Cleared Streamlit caches + temp folders. Rerunning…")
-        time.sleep(0.4)
-        st.rerun()
-        st.stop()
-
 
 # ===============================================================
 # SECTION 2 — Safe session_state init + Sidebar
@@ -454,25 +417,55 @@ def _scan_mp4s(out_dir: str) -> List[str]:
 
 
 def _is_valid_mp4(path: str, min_bytes: int = 50_000) -> Tuple[bool, str]:
-    """Basic integrity gate for uploads (prevents uploading empty/invalid artifacts)."""
+    """Integrity gate for uploads.
+
+    Requirements:
+    - file exists
+    - non-trivial size
+    - duration > 0
+    - contains a real video stream
+    - contains an audio stream (expected for muxed segment outputs)
+    """
     try:
         p = Path(path)
         if not p.exists():
             return False, "missing"
         if p.stat().st_size < int(min_bytes):
             return False, f"too_small<{min_bytes}B"
-        # Duration check (cloud-safe: vp.ffprobe_duration_seconds falls back to ffmpeg parsing)
+
+        # Prefer pipeline-native validation if available (keeps app/vp logic in sync)
+        vfn = getattr(vp, "validate_mp4", None)
+        if callable(vfn):
+            ok, why = vfn(str(p), require_audio=True, min_bytes=int(min_bytes))
+            return (bool(ok), str(why))
+
+        # Fallback: duration + stream sniff via ffmpeg -i
         try:
             dur = float(vp.ffprobe_duration_seconds(p))  # type: ignore[attr-defined]
         except Exception:
             dur = 0.0
         if dur <= 0.05:
             return False, "zero_duration"
+
+        ff = vp.ffmpeg_exe()
+        import subprocess
+        proc = subprocess.run(
+            [ff, "-hide_banner", "-i", str(p)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        info = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        has_video = (" Video:" in info) or ("Stream #0:" in info and "Video:" in info)
+        has_audio = (" Audio:" in info) or ("Stream #0:" in info and "Audio:" in info)
+        if not has_video:
+            return False, "no_video_stream"
+        if not has_audio:
+            return False, "no_audio_stream"
+
         return True, f"ok_dur={dur:.2f}s"
     except Exception as e:
         return False, f"error:{type(e).__name__}"
-
-
 def _read_spaces_secret(key: str, default: str = "") -> str:
     # st.secrets first
     try:
@@ -966,9 +959,9 @@ w, h = _get_resolution_wh()
 
 # --- Crash-safe defaults for dependent sliders (Min/Max scene seconds) ---
 if "min_scene_seconds" not in st.session_state:
-    st.session_state["min_scene_seconds"] = 20
+    st.session_state["min_scene_seconds"] = 45
 if "max_scene_seconds" not in st.session_state:
-    st.session_state["max_scene_seconds"] = 40
+    st.session_state["max_scene_seconds"] = 90
 
 
 def _clamp_max_scene_seconds() -> None:
@@ -999,10 +992,10 @@ with colB:
     )
 with colC:
     zoom_strength = st.slider(
-        "Ken Burns zoom strength (zoom-only)",
+        "Micro zoom (no pans)",
         min_value=1.00,
-        max_value=1.20,
-        value=1.06,
+        max_value=1.06,
+        value=1.03,
         step=0.01,
         disabled=st.session_state["is_generating"],
         key="zoom_strength_value",
