@@ -1392,6 +1392,7 @@ def render_segment_mp4(
         width=int(width),
         height=int(height),
         max_scenes=int(target_scenes),
+        style_ref_path=str(style_ref_path),
     )
     if not images:
         raise RuntimeError("Image generation produced zero images (unexpected).")
