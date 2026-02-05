@@ -142,6 +142,31 @@ _SANITIZE_PATTERNS = [
     (r"\b(beam(s)?|tractor\s*beam|laser(s)?)\b", "illumination"),
     (r"\b(hovering|descending|ascending)\b", "moving"),
 ]
+# ----------------------------
+# Script Loading (REQUIRED)
+# ----------------------------
+def load_segment_script(extract_dir: Path, segment_id: str) -> str:
+    """
+    REQUIRED: Load narration script for a segment.
+
+    Option A contract:
+      - The extracted ZIP MUST contain a text file named '<segment_id>.txt'
+        (e.g., '01_intro.txt', '02_chapter_1.txt', etc.)
+
+    We hard-fail if missing or empty to prevent silent fallback visuals.
+    """
+    script_path = extract_dir / f"{segment_id}.txt"
+    if not script_path.exists():
+        raise RuntimeError(
+            f"Missing required script file: {script_path.name}. "
+            "Each segment MUST have a corresponding .txt script file inside the ZIP."
+        )
+    text = script_path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not text:
+        raise RuntimeError(f"Script file is empty: {script_path.name}")
+    return text
+
+
 
 def _sanitize_scene_context(text: str) -> str:
     s = (text or "").strip()
