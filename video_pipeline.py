@@ -828,16 +828,19 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
     # HARD house look (single choke point)
     # NOTE: Intentionally avoids the word "soot" per directive.
     style_block = (
-        "STYLE: non-photorealistic 3D illustrated diorama (NPR). Flat/stepped shading, clean ink-like contour lines, "
-        "graphic readability, documentary distance. "
-        "SURFACES: clean matte materials, no painterly brushstrokes, no smudges, no grainy soot texture, no sketchy scribble. "
-        "LIGHTING: neutral and diagrammatic, no cinematic rim light, no bloom, no lens flare, no volumetric fog, no god rays. "
-        "COLOR: near-monochrome (graphite gray / off-white / deep black) with ONE restrained muted accent color: "
-        f"{accent}. Accent must be subtle (5–10% of frame), never used as a 'phenomena'. "
-        "RENDER: clearly illustrated, not photographic, not photoreal, not CGI realism, not a film still. "
-        "TEXT: no text, no logos, no subtitles, no watermarks. "
-        "PEOPLE: faces non-identifiable; if people appear, keep them routine, mid-distance, calm."
-    )
+    "STYLE: illustrated archival storyboard, hand-inked linework with clean contour lines, "
+    "subtle pencil hatching, and soft watercolor wash shading. "
+    "LOOK: calm military / investigative illustration, wide establishing compositions, documentary distance. "
+    "SURFACES: clean matte, no photoreal texture, no gritty soot, no heavy painterly brush strokes, no smeared charcoal. "
+    "LIGHTING: soft practical light sources (hangar bulbs, desk lamps) with restrained warm glow; "
+    "overall neutral ambient light, no cinematic bloom, no lens flare, no volumetric fog, no god rays. "
+    "COLOR: near-monochrome (cool gray / off-white / deep charcoal) with ONE restrained muted accent color: "
+    f"{accent}. Accent must be subtle (5–10% of frame), used only for practical light or small details, "
+    "never used as the 'phenomena'. "
+    "RENDER: clearly illustrated, not photographic, not CGI realism, not a film still. "
+    "TEXT: no text, no logos, no subtitles, no watermarks. "
+    "PEOPLE: faces non-identifiable; if people appear, keep them routine, mid-distance, calm."
+)
 
     # Canonical scene categories (cycled). These describe WHAT to depict, not HOW to render.
     categories = [
