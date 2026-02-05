@@ -1091,6 +1091,10 @@ def build_scene_clip_from_image(
         "+faststart",
         str(out),
     ]
+    if target_dur is not None:
+        # Hard trim to audio-driven duration + buffer (prevents overlong video).
+        cmd.insert(-1, f"{target_dur:.3f}")
+        cmd.insert(-1, "-t")
     run_ffmpeg(cmd)
 
     if (not out.exists()) or out.stat().st_size < 4096:
@@ -1142,6 +1146,10 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
         "+faststart",
         str(out),
     ]
+    if target_dur is not None:
+        # Hard trim to audio-driven duration + buffer (prevents overlong video).
+        cmd.insert(-1, f"{target_dur:.3f}")
+        cmd.insert(-1, "-t")
     run_ffmpeg(cmd)
 
     try:
@@ -1161,6 +1169,7 @@ def mux_audio_to_video(
     audio_path: Union[str, Path],
     out_mp4_path: Union[str, Path],
     end_buffer_s: float = _DEFAULT_END_BUFFER,
+    audio_seconds: Optional[float] = None,
 ) -> Path:
     """
     Mux audio onto the concatenated video.
@@ -1181,6 +1190,14 @@ def mux_audio_to_video(
         raise FileNotFoundError(str(a))
 
     buf = clamp_float(float(end_buffer_s or _DEFAULT_END_BUFFER), _END_BUFFER_MIN, _END_BUFFER_MAX)
+    target_dur = None
+    try:
+        if audio_seconds is not None:
+            ad = float(audio_seconds)
+            if ad > 0:
+                target_dur = ad + buf
+    except Exception:
+        target_dur = None
 
     ff = which_ffmpeg()
     # tpad extends video by cloning last frame; apad extends audio with silence for exactly buf seconds.
@@ -1215,6 +1232,10 @@ def mux_audio_to_video(
         "+faststart",
         str(out),
     ]
+    if target_dur is not None:
+        # Hard trim to audio-driven duration + buffer (prevents overlong video).
+        cmd.insert(-1, f"{target_dur:.3f}")
+        cmd.insert(-1, "-t")
     run_ffmpeg(cmd)
 
     if not out.exists() or out.stat().st_size < 2048:
@@ -1310,13 +1331,25 @@ def render_segment_mp4(
 
     audio_seconds = ffprobe_duration_seconds(audio_p)
 
-    # Choose a good scene count for pacing
+    # Choose a scene count for pacing (audio-driven, but safe for user-provided bounds).
+    # IMPORTANT: 'min_scene_seconds' is treated as a *soft* guidance only.
+    # We will not clamp per-scene upward in a way that makes total video exceed the audio duration.
+
     if audio_seconds <= 0:
         target_scenes = clamp_int(int(max_scenes), 3, int(max_scenes))
     else:
-        mid = (float(min_scene_seconds) + float(max_scene_seconds)) / 2.0
+        # Start from a mid pacing guess.
+        mid = (float(min_s) + float(max_s)) / 2.0
         approx = int(max(1, round(audio_seconds / max(1.0, mid))))
         target_scenes = clamp_int(approx, 3, int(max_scenes))
+
+        # If per-scene would exceed max_s, increase scene count so we don't under-run video.
+        try:
+            if float(audio_seconds) / float(target_scenes) > float(max_s):
+                # ceil(audio/max_s)
+                target_scenes = clamp_int(int((float(audio_seconds) + float(max_s) - 1e-9) // float(max_s)) + 1, 3, int(max_scenes))
+        except Exception:
+            pass
 
     images = _generate_segment_images(
         api_key=str(api_key),
@@ -1333,10 +1366,13 @@ def render_segment_mp4(
     max_s = clamp_int(int(max_scene_seconds), min_s, 600)
 
     if audio_seconds <= 0:
-        per = clamp_scene_seconds(5.0, float(min_s), float(max_s))
+        per = 5.0
     else:
-        per = clamp_scene_seconds(audio_seconds / float(len(images)), float(min_s), float(max_s))
-
+        # True audio-driven pacing: distribute exactly across scenes (no upward clamp that would lengthen video).
+        per = max(0.05, float(audio_seconds) / float(len(images)))
+        # Safety: if per is unreasonably large due to a low image count, cap to max_s.
+        if per > float(max_s):
+            per = float(max_s)
     scene_seconds = [float(per) for _ in images]
 
     seg_slug = safe_slug(str(pair.get("title_guess") or segment_label(pair) or "segment"), max_len=48)
@@ -1365,6 +1401,7 @@ def render_segment_mp4(
         audio_path=audio_p,
         out_mp4_path=out_path_p,
         end_buffer_s=_DEFAULT_END_BUFFER,
+        audio_seconds=float(audio_seconds) if audio_seconds else None,
     )
 
     if os.environ.get("UAPPRESS_KEEP_CLIPS", "").strip() != "1":
