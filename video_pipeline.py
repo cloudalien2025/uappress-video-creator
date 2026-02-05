@@ -1020,7 +1020,8 @@ def _generate_segment_images(
         return existing[: max(1, int(max_scenes))]
 
     # Option A (REQUIRED): scripts must be inside the extracted ZIP as <segment_id>.txt
-    # We intentionally hard-fail if missing to prevent silent fallback visuals.    script_path = str(pair.get("script_path") or "").strip()
+    # We intentionally hard-fail if missing to prevent silent fallback visuals.
+    script_path = str(pair.get("script_path") or "").strip()
     if not script_path:
         raise RuntimeError("Missing required script_path for segment; ZIP must include .txt scripts.")
     segment_id = Path(script_path).stem.strip()
