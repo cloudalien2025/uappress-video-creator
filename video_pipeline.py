@@ -28,8 +28,8 @@
 #
 # IMPORTANT:
 # - This file keeps external dependencies optional/guarded.
-# - Image generation uses the OpenAI Images API (photorealistic documentary stills).
-# - Optional local scene-card fallback can be enabled to avoid hard-failing the pipeline.
+# - Image generation uses OpenAI Images API when available; falls back to local placeholders
+#   if generation fails (to avoid crashing the whole pipeline).
 #
 # FIXES INCLUDED (per your issues):
 #   1) ffprobe missing on Streamlit Cloud: duration detection now falls back to parsing ffmpeg output
@@ -727,14 +727,16 @@ def _make_scene_card_image(
 
 
 
+# ----------------------------
+# Image generation utilities
+# ----------------------------
 def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
-    """
-    Generate a single image via OpenAI Images API.
+    """Generate a single photorealistic image via OpenAI Images API (prompt-only).
 
     Streamlit Cloud reliability rules:
     - Always pass api_key explicitly to the OpenAI client.
     - Do NOT pass response_format; default b64_json output avoids SDK/version mismatches.
-    - Retry a couple times per model to ride out transient failures.
+    - Retry a couple times to ride out transient failures.
     """
     if OpenAI is None:
         raise RuntimeError("OpenAI SDK not available in this environment.")
@@ -744,86 +746,50 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         raise RuntimeError("Missing OpenAI API key (api_key is empty).")
 
     client = OpenAI(api_key=str(api_key))
+
+    # Try a small fallback ladder for robustness.
     models_to_try = [
         _DEFAULT_IMAGE_MODEL,
-        os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK_1", "dall-e-3"),
-        os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK_2", "dall-e-2"),
+        (os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK", "") or "").strip(),
     ]
+    models_to_try = [m for m in models_to_try if m]
 
     last_err: Exception | None = None
-    resp = None
 
-    for mname in models_to_try:
-        if not mname:
-            continue
-
-        for attempt in range(2):
+    for model in models_to_try:
+        for attempt in range(1, 3):
             try:
-                resp = client.images.generate(
-                    model=mname,
-                    prompt=prompt,
-                    size=size,
+                r = client.images.generate(
+                    model=str(model),
+                    prompt=str(prompt),
+                    size=str(size),
                 )
-                last_err = None
-                break
+                # SDK returns b64_json by default for Images API.
+                b64 = r.data[0].b64_json
+                if not b64:
+                    raise RuntimeError("Images API returned empty b64_json.")
+                import base64
+                return base64.b64decode(b64)
             except Exception as e:
                 last_err = e
-                try:
-                    import time as _time
-                    _time.sleep(0.5 + attempt * 0.5)
-                except Exception:
-                    pass
-                continue
+                # brief backoff for transient issues
+                time.sleep(0.35 * attempt)
 
-        if resp is not None and last_err is None:
-            break
-    if resp is None:
-        raise RuntimeError(
-            f"OpenAI image generation failed for models {models_to_try}. Last error: {last_err!r}"
-        ) from last_err
-
-    data0 = None
-    try:
-        data0 = resp.data[0]  # type: ignore[attr-defined]
-    except Exception:
-        data = resp.get("data") if isinstance(resp, dict) else None
-        if data and isinstance(data, list) and data:
-            data0 = data[0]
-
-    if data0 is None:
-        raise RuntimeError("Image response missing data[0].")
-
-    b64 = None
-    url = None
-    if isinstance(data0, dict):
-        b64 = data0.get("b64_json")
-        url = data0.get("url")
-    else:
-        b64 = getattr(data0, "b64_json", None)
-        url = getattr(data0, "url", None)
-
-    if b64:
-        import base64
-        return base64.b64decode(b64)
-
-    if url:
-        raise RuntimeError("Image API returned URL-only output; URL fetch not supported in this pipeline.")
-
-    raise RuntimeError("Image API response missing b64_json and url.")
-
+    raise RuntimeError(f"Images API failed after retries. Last error: {last_err}")
 
 def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incident_hint: str = "") -> List[str]:
-    """Build per-scene image prompts (PHOTOREALISTIC RESET).
+    """Build per-scene IMAGE prompts for a **photorealistic** UAPpress long-form segment.
 
-    Goal:
-    - Generate photorealistic, documentary-style still images that match the narration beats.
-    - Credibility-first: depict context and uncertainty, not conclusions.
-    - No on-screen text, no logos, no subtitles, no watermarks.
+    Goals:
+    - Photorealistic, credibility-first documentary visuals (not illustration, not CGI).
+    - Context over conclusions. No spectacle. No 'Hollywood UFO' tropes.
 
-    Safety/credibility doctrine:
-    - Default: DO NOT depict a clearly defined craft/object.
-    - Phoenix Lights exception: optionally allow faint distant lights with no shape/symmetry.
-    - If narration strongly implies recovery/containment, allow only an indistinct tarp-covered bundle/crate (no craft silhouette).
+    Guardrails:
+    - NO text, NO logos, NO subtitles, NO watermarks.
+    - NO beams, NO lens flares, NO god rays, NO dramatic sci-fi lighting.
+    - People allowed but faces should be non-identifiable (distance, angle, occlusion).
+    - 'Obscured object' allowed ONLY when narration implies recovery/containment/handling,
+      and MUST be non-descript (tarp-covered bundle/crate), no recognizable craft silhouette.
     """
     text = (script_text or "").strip()
     if not text:
@@ -844,93 +810,62 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
         step = len(beats) / float(max_scenes_i)
         idxs = [min(len(beats) - 1, int(i * step)) for i in range(max_scenes_i)]
 
-    # Photorealistic documentary house look (single choke point)
-    look_block = (
-        "STYLE: photorealistic documentary still, natural lighting, historically plausible wardrobe/props, "
-        "restrained color grade, no cinematic spectacle. "
-        "CAMERA: 28–50mm equivalent, documentary distance, stable framing, no extreme wide distortion. "
-        "DETAIL: realistic textures, believable environments, no stylized illustration, no cartoon, no anime, no 3D render. "
+    # Episode-wide subtle palette hint (optional, keeps things restrained)
+    accent = (os.environ.get("UAPPRESS_ACCENT_COLOR", "muted amber") or "muted amber").strip()
+
+    style_block = (
+        "STYLE: photorealistic documentary still, 35mm film look, natural camera exposure, subtle film grain. "
+        "LIGHTING: practical, believable, soft overcast or interior practical lighting, no cinematic bloom, no volumetric fog. "
+        "COLOR: muted realistic palette (cool grays, off-whites, deep charcoals) with very subtle practical accents (" + accent + "). "
+        "CAMERA: calm editorial framing, documentary distance, no extreme wide-angle distortion, no dutch angles. "
+        "RENDER: real-world photo, not illustration, not CGI, not a movie poster. "
         "TEXT: no text, no logos, no subtitles, no watermarks."
     )
 
-    # Canonical scene categories (cycled). These describe WHAT to depict.
+    base_doctrine = (
+        "DOCTRINE: depict verifiable context only; avoid implying conclusions; keep the scene grounded and ordinary. "
+        "NO spectacle, NO beams, NO dramatic UFO tropes, NO glowing craft, NO aliens."
+    )
+
+    people_clause = (
+        "PEOPLE: allowed, but faces non-identifiable (mid-distance, turned away, shadowed, partial occlusion). "
+        "Body language routine and calm."
+    )
+
+    object_clause = (
+        "OBJECT POLICY: if narration implies recovery/containment, an obscured non-descript covered bundle/crate is allowed; "
+        "must look generic and tarp-covered with no recognizable craft silhouette."
+    )
+
     categories = [
-        ("Institutional context", "military base exterior or government facility, plain architecture, procedural calm, routine personnel movement"),
-        ("Environmental establishing", "wide environmental context, desert/road/skyline/terrain, stillness, weather and light"),
-        ("Human scale / normalcy", "ordinary human activity, small group walking/standing, non-performative posture, seen from behind or mid-distance"),
-        ("Procedural / process", "documents, folders, maps, radios, desks, briefing materials, hands-only or partial figures"),
-        ("Temporal / transition", "corridor or road at dusk/night, exterior building at dawn, weather shifting, quiet transition"),
-        ("Reflective / aftermath", "empty space after activity, quiet landscape, vacant room, ambiguity and restraint"),
+        ("Institutional context", "military base exterior, administrative buildings, guarded gate, routine patrols"),
+        ("Paper trail", "desks with files, radios, clipped documents, maps, archival storage, low-key evidence handling"),
+        ("Witness context", "ordinary people or service members at a distance, looking toward a horizon or lights off-screen"),
+        ("Search/response", "vehicles staged, flashlights, perimeter tape, field search patterns, no object shown"),
+        ("Containment handling", "warehouse/hangar with tarp-covered crate or covered pallet, forklifts, guarded calm"),
+        ("Aftermath reflection", "quiet empty spaces: corridors, hangars, file rooms, dusk exterior, unresolved mood"),
     ]
 
-    # Incident-specific allowance: Phoenix Lights may include ambiguous lights (NOT beams/craft).
-    allow_ambiguous_lights = False
-    if (incident_hint or "").strip().lower().find("phoenix") >= 0:
-        allow_ambiguous_lights = True
-
-    def _implies_recovery_or_containment(s: str) -> bool:
-        s = (s or "").lower()
-        cues = [
-            "recover", "recovered", "recovery", "retrieval", "retrieve",
-            "debris", "wreckage", "crash", "impact", "site", "field",
-            "secured", "security", "contain", "containment", "quarantine",
-            "transport", "convoy", "crate", "tarpaulin", "tarp", "covered",
-            "hangar", "warehouse", "evidence", "materials", "fragments",
-        ]
-        return any(c in s for c in cues)
-
-    base_doctrine = _doctrine_clause()
-
-    if not allow_ambiguous_lights:
-        base_doctrine += (
-            " ALSO: Do NOT include any glowing orb, flare, spotlight, searchlight, beam, or bright point of light in the sky. "
-            "If the scene is night, keep the sky empty or with only subtle clouds/stars."
-        )
-    else:
-        base_doctrine += (
-            " INCIDENT PROFILE (PHOENIX LIGHTS): You MAY include a few distant, soft-edged, irregularly spaced points of light "
-            "partially obscured by haze/clouds. No structure, no symmetry, no hard edges, no beams, no centered sky-object framing."
-        )
-
     prompts: List[str] = []
-    for j, bi in enumerate(idxs):
-        raw = beats[bi]
-        snippet = _sanitize_scene_context(raw)
-        if len(snippet) > 380:
-            snippet = snippet[:380].rstrip() + "…"
+    hint = (incident_hint or "").strip()
+    if hint:
+        hint = f"INCIDENT CONTEXT: {hint}. "
+
+    for j, idx in enumerate(idxs):
+        beat = beats[idx]
+        snippet = _sanitize_scene_context(beat, max_chars=380)
 
         cat_name, cat_desc = categories[j % len(categories)]
 
-        # Keep humans present in ~2/3 of scenes by default (routine presence).
-        want_people = (j % 3) != 0
-        people_clause = (
-            "HUMANS: include a few people in frame (silhouettes or small group), routine posture, no drama, no pointing."
-            if want_people
-            else "HUMANS: none, or distant silhouettes only."
-        )
-
-        allow_obscured_object = _implies_recovery_or_containment(snippet)
-        if allow_obscured_object:
-            object_clause = (
-                "OBJECT POLICY (ALLOWED — OBSCURED ONLY): You may depict a non-descript tarp-covered bundle or plain covered crate "
-                "being handled/guarded/transported as context. It must be indistinct and non-identifiable: no shape language, "
-                "no metallic surfaces, no hard edges, no symmetry, no windows, no engines, no geometry, no craft silhouette."
-            )
-        else:
-            object_clause = (
-                "OBJECT POLICY (DISALLOWED): Do NOT depict any recovered object, craft, debris pile, metallic fragments, "
-                "or anything that reads as a vehicle or non-human technology."
-            )
-
         prompt = (
             "Create a photorealistic still image for a credibility-first UAP investigative documentary.\n"
-            f"{look_block}\n"
+            f"{hint}{style_block}\n"
             f"SCENE CATEGORY: {cat_name}. Depict: {cat_desc}.\n"
             f"{people_clause}\n"
             f"{object_clause}\n"
             f"{base_doctrine}\n"
             f"Context (sanitized beat): {snippet}\n"
-            "COMPOSITION: editorial stillness, documentary distance, minimal spectacle, no overclaiming."
+            "COMPOSITION: stillness, grounded realism, minimal spectacle, no overclaiming."
         )
         prompts.append(prompt)
 
@@ -956,72 +891,64 @@ def _generate_segment_images(
     height: int,
     max_scenes: int,
 ) -> List[Path]:
+    """Generate (or reuse cached) images for this segment.
+
+    IMPORTANT CACHE BEHAVIOR (bugfix):
+    - If SOME cached images exist, we **do not** stop early.
+    - We return cached images only when we already have the target count.
+    - Otherwise we generate the remaining scenes to reach the target count.
+
+    This prevents the 'one scene stretched across the whole segment' failure mode.
     """
-    Generate (or reuse cached) images for this segment.
-    Uses a segment-specific cache folder to avoid shared images across segments.
-    """
-    img_dir = _segment_image_dir(extract_dir, pair)
+    img_dir = Path(_segment_image_dir(extract_dir, pair))
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    desired = clamp_int(int(max_scenes), 1, 120)
     size = _image_size_for_mode(int(width), int(height))
 
-    existing = sorted([p for p in img_dir.glob("scene_*.*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".ppm")])
-    if existing:
-        return existing[: max(1, int(max_scenes))]
-
-    # Option A (REQUIRED): scripts must be inside the extracted ZIP as <segment_id>.txt
-    # We intentionally hard-fail if missing to prevent silent fallback visuals.
-    script_path = str(pair.get("script_path") or "").strip()
-    if not script_path:
-        raise RuntimeError("Missing required script_path for segment; ZIP must include .txt scripts.")
-    segment_id = Path(script_path).stem.strip()
-    script_text = load_segment_script(script_path)
-    incident_hint = (str(pair.get("title_guess") or "") + " " + segment_id).strip()
-    prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes), incident_hint=incident_hint)
-
-    if not prompts:
-        prompts = [
-            "Graphic-novel storyboard illustration, near-monochrome with a single muted accent color, investigative tone. "
-            "Depict only context: airbase perimeter, radar room, documents, night road, witnesses from behind. "
-            + _doctrine_clause()
-        ] * max(3, min(8, int(max_scenes)))
-
-    images: List[Path] = []
-    for i, prompt in enumerate(prompts, start=1):
-        out = img_dir / f"scene_{i:03d}.png"
+    def _is_valid_img(p: Path) -> bool:
         try:
-            data = _openai_generate_image_bytes(str(api_key), prompt, size)
-            # Basic byte validation (prevents silent placeholder uploads)
-            if not isinstance(data, (bytes, bytearray)) or len(data) < 2048:
-                raise RuntimeError(f"OpenAI image returned invalid bytes (len={len(data) if hasattr(data,'__len__') else 'n/a'}).")
-            out.write_bytes(bytes(data))
-        except Exception as e:
-            if _ALLOW_LOCAL_FALLBACK:
-                _make_scene_card_image(
-                    out,
-                    int(width),
-                    int(height),
-                    headline="SCENE IMAGE (LOCAL FALLBACK)",
-                    body=(f"{type(e).__name__}: {e}\n\n" + str(prompt))[:900],
-                    footer="UAPpress",
-                )
-                # If Pillow isn't installed, the fallback may write a .ppm instead of .png
-                if not out.exists() and out.with_suffix(".ppm").exists():
-                    out = out.with_suffix(".ppm")
-            else:
-                raise RuntimeError(
-                    f"Image generation failed (scene {i}/{len(prompts)}). "
-                    f"Set UAPPRESS_ALLOW_LOCAL_FALLBACK=1 to allow scene-card placeholders. "
-                    f"Error: {type(e).__name__}: {e}"
-                ) from e
-        images.append(out)
+            return p.is_file() and p.stat().st_size > 1024 and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".ppm")
+        except Exception:
+            return False
 
-    return images
+    existing = sorted([p for p in img_dir.glob("scene_*.*") if _is_valid_img(p)])
 
+    # If we already have enough cached images, reuse them (deterministic order).
+    if len(existing) >= desired:
+        return existing[:desired]
 
+    # Script must exist in the extracted ZIP as <segment_id>.txt (hard-fail if missing).
+    script_path = str(pair.get("script") or "")
+    if not script_path or not os.path.isfile(script_path):
+        raise FileNotFoundError(
+            f"Missing script for segment. Expected a .txt for this segment inside the ZIP. Got: {script_path}"
+        )
 
+    script_text = Path(script_path).read_text(encoding="utf-8", errors="ignore")
 
-# ----------------------------
-# Scene clip building + concat + mux (core pipeline primitives)
-# ----------------------------
+    # Best-effort hint to keep scenes coherent (e.g., 'Roswell', 'Rendlesham', etc.)
+    incident_hint = (pair.get("label") or pair.get("id") or "").strip()
+
+    prompts = _build_scene_prompts_from_script(script_text, desired, incident_hint=incident_hint)
+    if not prompts:
+        # Extremely defensive fallback — should not happen if script_text exists.
+        prompts = ["Photorealistic documentary still, grounded military/archival context, no text, no logos."] * desired
+
+    # Generate missing scenes only.
+    for i in range(len(existing), desired):
+        prompt = prompts[min(i, len(prompts) - 1)]
+        img_bytes = _openai_generate_image_bytes(
+            api_key=api_key,
+            prompt=prompt,
+            size=size,
+        )
+        out_path = img_dir / f"scene_{i+1:02d}.png"
+        _write_bytes_to_file(img_bytes, out_path)
+
+    final = sorted([p for p in img_dir.glob("scene_*.*") if _is_valid_img(p)])
+    # Ensure we return exactly 'desired' items when possible.
+    return final[:desired]
 
 def _ensure_even(x: int) -> int:
     x = int(x)
@@ -1340,8 +1267,8 @@ def render_segment_mp4(
         pair=pair,
         width=int(width),
         height=int(height),
-        max_scenes=int(target_scenes)
-    )
+        max_scenes=int(target_scenes),
+        )
     if not images:
         raise RuntimeError("Image generation produced zero images (unexpected).")
 
