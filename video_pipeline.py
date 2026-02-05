@@ -168,13 +168,33 @@ def load_segment_script(script_path: Union[str, Path]) -> str:
     if not text:
         raise RuntimeError(f"Script file is empty: {sp.name}")
     return text
-def _sanitize_scene_context(text: str) -> str:
+def _sanitize_scene_context(text: str, *, max_chars: int = 380) -> str:
+    """Sanitize script text snippets before embedding into image prompts.
+
+    - Normalizes whitespace
+    - Applies conservative term replacements via _SANITIZE_PATTERNS
+    - Enforces a hard length cap to prevent prompt bloat
+
+    Keyword-only max_chars prevents call-site drift (e.g., unexpected kwargs).
+    """
     s = (text or "").strip()
     if not s:
         return ""
     s = re.sub(r"\s+", " ", s).strip()
     for pat, repl in _SANITIZE_PATTERNS:
         s = re.sub(pat, repl, s, flags=re.IGNORECASE)
+
+    # Hard cap for prompt safety / token economy
+    try:
+        mc = int(max_chars)
+    except Exception:
+        mc = 380
+    if mc < 40:
+        mc = 40
+    if mc > 2000:
+        mc = 2000
+    if len(s) > mc:
+        s = s[:mc].rstrip() + "…"
     return s
 
 def _doctrine_clause() -> str:
@@ -1557,4 +1577,5 @@ def generate_all_segments_sequential(
 
     return outputs
 
-# B
+# Back-compat alias for older app.py calls
+_generate_all_segments_sequential = generate_all_segments_sequential
