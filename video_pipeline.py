@@ -797,19 +797,85 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
 
     raise RuntimeError(f"Images API failed after retries. Last error: {last_err}")
 
+def _free_roll_scene_type(beat: str, j: int) -> str:
+    """Cheap deterministic 'Visual Director' router.
+
+    No extra model calls. Uses keyword scoring + rotation to choose a scene type.
+    """
+    b = (beat or "").lower()
+
+    score: Dict[str, int] = {k: 0 for k in _FREE_ROLL_SCENE_TYPES.keys()}
+
+    def add(scene_type: str, pts: int) -> None:
+        if scene_type in score:
+            score[scene_type] += int(pts)
+
+    # Evidence / paperwork
+    if re.search(r"\b(memo|memorandum|report|file|files|document|documents|declassified|classification|classified|telegram|teletype|dispatch|archive|archival|newspaper|headline|foia|record|records)\b", b):
+        add("DOCUMENT", 6)
+    if re.search(r"\b(interview|testimony|witness|witnesses|statement|said|recalled|reported|account)\b", b):
+        add("WITNESS", 5)
+    if re.search(r"\b(radar|scope|blip|atc|tower|controller|logbook|logs|transcript|tape|audio|frequency|comms|communications)\b", b):
+        add("PROCESS", 6)
+
+    # Places / environments
+    if re.search(r"\b(base|airfield|runway|hangar|gate|perimeter|fence|checkpoint|security|guard|patrol)\b", b):
+        add("ESTABLISHING", 4)
+    if re.search(r"\b(corridor|office|briefing|conference|warehouse|storage|archive room|file room|hangar interior|barracks)\b", b):
+        add("INTERIOR", 4)
+    if re.search(r"\b(night|dusk|dawn|storm|cloud|fog|rain|wind|haze|desert|forest|field|coast|ocean|mountain)\b", b):
+        add("ATMOSPHERE", 3)
+
+    # If beat is very abstract, bias toward ATMOSPHERE/PROCESS
+    if len(b) < 180:
+        add("ATMOSPHERE", 1)
+        add("PROCESS", 1)
+
+    # Pick best-scoring; if tie/low, rotate deterministically.
+    best_type = None
+    best_val = -10
+    for k, v in score.items():
+        if v > best_val:
+            best_val = v
+            best_type = k
+
+    if not best_type or best_val <= 0:
+        keys = list(_FREE_ROLL_SCENE_TYPES.keys())
+        return keys[j % len(keys)]
+
+    return best_type
+
+
+_FREE_ROLL_SCENE_TYPES: Dict[str, str] = {
+    "ESTABLISHING": "an exterior establishing shot of the location (base, road, gate, airfield, landscape)",
+    "DOCUMENT": "archival evidence on a desk (papers, folders, photographs, maps), documentary tabletop composition",
+    "PROCESS": "investigation process visuals (radar room, logbooks, maps with markings, radios, filing systems)",
+    "WITNESS": "a human perspective without identifiable faces (silhouette, hands, notebook, looking toward distance)",
+    "INTERIOR": "institutional interiors (corridors, offices, hangar interior, storage rooms), grounded realism",
+    "ATMOSPHERE": "neutral b-roll atmosphere (night sky, clouds, empty road, lights, terrain), restrained and calm",
+}
+
+_FREE_ROLL_SHOT_WHEEL: List[str] = [
+    "SHOT: wide establishing composition, eye-level camera, stable tripod framing.",
+    "SHOT: medium documentary framing, slight push-in, natural perspective.",
+    "SHOT: close detail composition, tabletop or hands/instruments, shallow depth of field.",
+    "SHOT: wide with foreground framing (fence line, doorway, window frame), calm composition.",
+    "SHOT: medium from behind (observer POV), gentle lateral slide, grounded realism.",
+    "SHOT: close-up of objects (maps, papers, radios, instruments), clean editorial lighting.",
+]
+
+
 def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incident_hint: str = "") -> List[str]:
-    """Build per-scene IMAGE prompts for a **photorealistic** UAPpress long-form segment.
+    """Build per-scene IMAGE prompts using a **Free Roll Visual Director**.
 
-    Goals:
-    - Photorealistic, credibility-first documentary visuals (not illustration, not CGI).
-    - Context over conclusions. No spectacle. No 'Hollywood UFO' tropes.
+    Design goals:
+    - No extra model calls for "directing" (token-cheap): deterministic routing + shot variation.
+    - Short prompts (no giant constraint blocks).
+    - Visuals support narration without trying to literalize uncertainty into repetitive props.
 
-    Guardrails:
-    - NO text, NO logos, NO subtitles, NO watermarks.
-    - NO beams, NO lens flares, NO god rays, NO dramatic sci-fi lighting.
-    - People allowed but faces should be non-identifiable (distance, angle, occlusion).
-    - 'Obscured object' allowed ONLY when narration implies recovery/containment/handling,
-      and MUST be non-descript (tarp-covered bundle/crate), no recognizable craft silhouette.
+    Notes:
+    - We keep universal production-quality constraints only (no on-image text/logos/watermarks),
+      because those break YouTube visuals and continuity.
     """
     text = (script_text or "").strip()
     if not text:
@@ -817,75 +883,46 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
 
     max_scenes_i = clamp_int(int(max_scenes), 1, 120)
 
-    # Light-touch segmentation: paragraphs -> beats. Avoid over-fragmentation.
+    # Paragraph beats; keep stable and avoid over-fragmentation
     paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     beats = [p for p in paras if len(p) >= 120] or paras
     if not beats:
         return []
 
-    # Choose N beats evenly, stable across runs.
+    # Choose N beats evenly, stable across runs
     if len(beats) <= max_scenes_i:
         idxs = list(range(len(beats)))
     else:
         step = len(beats) / float(max_scenes_i)
         idxs = [min(len(beats) - 1, int(i * step)) for i in range(max_scenes_i)]
 
-    # Episode-wide subtle palette hint (optional, keeps things restrained)
     accent = (os.environ.get("UAPPRESS_ACCENT_COLOR", "muted amber") or "muted amber").strip()
-
-    style_block = (
-        "STYLE: photorealistic documentary still, 35mm film look, natural camera exposure, subtle film grain. "
-        "LIGHTING: practical, believable, soft overcast or interior practical lighting, no cinematic bloom, no volumetric fog. "
-        "COLOR: muted realistic palette (cool grays, off-whites, deep charcoals) with very subtle practical accents (" + accent + "). "
-        "CAMERA: calm editorial framing, documentary distance, no extreme wide-angle distortion, no dutch angles. "
-        "RENDER: real-world photo, not illustration, not CGI, not a movie poster. "
-        "TEXT: no text, no logos, no subtitles, no watermarks."
+    style_line = (
+        "STYLE: photorealistic documentary still, natural exposure, subtle film grain, restrained color grade. "
+        f"Palette: muted neutrals with subtle practical accents ({accent}). "
+        "TEXT: no on-image text, no logos, no subtitles, no watermarks."
     )
 
-    base_doctrine = (
-        "DOCTRINE: depict verifiable context only; avoid implying conclusions; keep the scene grounded and ordinary. "
-        "NO spectacle, NO beams, NO dramatic UFO tropes, NO glowing craft, NO aliens."
-    )
-
-    people_clause = (
-        "PEOPLE: allowed, but faces non-identifiable (mid-distance, turned away, shadowed, partial occlusion). "
-        "Body language routine and calm."
-    )
-
-    object_clause = (
-        "OBJECT POLICY: if narration implies recovery/containment, an obscured non-descript covered bundle/crate is allowed; "
-        "must look generic and tarp-covered with no recognizable craft silhouette."
-    )
-
-    categories = [
-        ("Institutional context", "military base exterior, administrative buildings, guarded gate, routine patrols"),
-        ("Paper trail", "desks with files, radios, clipped documents, maps, archival storage, low-key evidence handling"),
-        ("Witness context", "ordinary people or service members at a distance, looking toward a horizon or lights off-screen"),
-        ("Search/response", "vehicles staged, flashlights, perimeter tape, field search patterns, no object shown"),
-        ("Containment handling", "warehouse/hangar with tarp-covered crate or covered pallet, forklifts, guarded calm"),
-        ("Aftermath reflection", "quiet empty spaces: corridors, hangars, file rooms, dusk exterior, unresolved mood"),
-    ]
+    hint = (incident_hint or "").strip()
+    hint_line = f"CONTEXT: {hint}." if hint else ""
 
     prompts: List[str] = []
-    hint = (incident_hint or "").strip()
-    if hint:
-        hint = f"INCIDENT CONTEXT: {hint}. "
-
     for j, idx in enumerate(idxs):
         beat = beats[idx]
-        snippet = _sanitize_scene_context(beat, max_chars=380)
+        snippet = _sanitize_scene_context(beat, max_chars=340)
 
-        cat_name, cat_desc = categories[j % len(categories)]
+        scene_type = _free_roll_scene_type(beat, j)
+        scene_desc = _FREE_ROLL_SCENE_TYPES.get(scene_type, _FREE_ROLL_SCENE_TYPES["ATMOSPHERE"])
+        shot = _FREE_ROLL_SHOT_WHEEL[j % len(_FREE_ROLL_SHOT_WHEEL)]
 
         prompt = (
-            "Create a photorealistic still image for a credibility-first UAP investigative documentary.\n"
-            f"{hint}{style_block}\n"
-            f"SCENE CATEGORY: {cat_name}. Depict: {cat_desc}.\n"
-            f"{people_clause}\n"
-            f"{object_clause}\n"
-            f"{base_doctrine}\n"
-            f"Context (sanitized beat): {snippet}\n"
-            "COMPOSITION: stillness, grounded realism, minimal spectacle, no overclaiming."
+            "Create a single photorealistic still image for a long-form investigative documentary.\n"
+            + (hint_line + "\n" if hint_line else "")
+            + style_line + "\n"
+            + f"SCENE TYPE: {scene_type}. Depict: {scene_desc}.\n"
+            + shot + "\n"
+            + f"Beat context: {snippet}\n"
+            + "Deliver: grounded realism, documentary framing, coherent environment details."
         )
         prompts.append(prompt)
 
