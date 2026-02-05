@@ -49,6 +49,7 @@ import io
 import json
 import math
 import os
+import hashlib
 import re
 import shutil
 import subprocess
@@ -145,53 +146,26 @@ _SANITIZE_PATTERNS = [
 # ----------------------------
 # Script Loading (REQUIRED)
 # ----------------------------
-def load_segment_script(extract_dir: Path, pair: Dict[str, Any]) -> str:
+def load_segment_script(extract_dir: Path, segment_id: str) -> str:
     """
     REQUIRED: Load narration script for a segment.
 
-    ✅ Option A (robust, cloud-safe):
-      - Prefer the script file that was actually discovered in the ZIP and stored on the pair:
-            pair["script_path"]
-      - If script_path is missing, fall back to '<audio_stem>.txt' inside extract_dir (rare).
-      - Hard-fail if missing or empty to prevent silent placeholder visuals.
+    Option A contract:
+      - The extracted ZIP MUST contain a text file named '<segment_id>.txt'
+        (e.g., '01_intro.txt', '02_chapter_1.txt', etc.)
 
-    This fixes the prior bug where we looked for a derived filename (e.g., intro_<hash>.txt)
-    that doesn't exist in real TTS Studio ZIPs.
+    We hard-fail if missing or empty to prevent silent fallback visuals.
     """
-    extract_dir = Path(extract_dir)
-
-    # 1) Primary: explicit script path discovered by find_files() and attached by pair_segments()
-    sp = str(pair.get("script_path") or "").strip()
-    if sp:
-        p = Path(sp)
-        if not p.is_absolute():
-            p = (extract_dir / p).resolve()
-        if not p.exists():
-            raise RuntimeError(
-                f"Missing required script file referenced by pair['script_path']: {p.name}."
-            )
-        text = p.read_text(encoding="utf-8", errors="ignore").strip()
-        if not text:
-            raise RuntimeError(f"Script file is empty: {p.name}")
-        return text
-
-    # 2) Fallback: '<audio_stem>.txt' inside extracted ZIP root (only if script_path wasn't provided)
-    ap = str(pair.get("audio_path") or "").strip()
-    if ap:
-        stem = Path(ap).stem
-        cand = extract_dir / f"{stem}.txt"
-        if cand.exists():
-            text = cand.read_text(encoding="utf-8", errors="ignore").strip()
-            if not text:
-                raise RuntimeError(f"Script file is empty: {cand.name}")
-            return text
-
-    # 3) Hard fail
-    raise RuntimeError(
-        "Missing required script file for this segment. "
-        "Expected pair['script_path'] to be present (recommended), "
-        "or a '<audio_stem>.txt' file inside the ZIP."
-    )
+    script_path = extract_dir / f"{segment_id}.txt"
+    if not script_path.exists():
+        raise RuntimeError(
+            f"Missing required script file: {script_path.name}. "
+            "Each segment MUST have a corresponding .txt script file inside the ZIP."
+        )
+    text = script_path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not text:
+        raise RuntimeError(f"Script file is empty: {script_path.name}")
+    return text
 
 
 
@@ -752,7 +726,23 @@ def _make_scene_card_image(
 
     img.save(path, format="PNG")
 
-def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
+
+
+# ----------------------------
+# Style reference utilities
+# ----------------------------
+def _load_style_ref_bytes(style_ref_path: str) -> tuple[bytes, str]:
+    """Load reference image bytes and return (bytes, mime). Hard-fail if missing/empty."""
+    p = Path(str(style_ref_path or "").strip())
+    if not p.exists():
+        raise RuntimeError(f"Style reference image missing: {p}")
+    b = p.read_bytes()
+    if not b or len(b) < 1024:
+        raise RuntimeError(f"Style reference image is empty/too small: {p.name}")
+    ext = p.suffix.lower().lstrip(".")
+    mime = "image/png" if ext == "png" else "image/jpeg"
+    return b, mime
+def _openai_generate_image_bytes(api_key: str, prompt: str, size: str, *, style_ref: tuple[bytes, str] | None = None) -> bytes:
     """
     Generate a single image via OpenAI Images API.
 
@@ -769,6 +759,8 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
         raise RuntimeError("Missing OpenAI API key (api_key is empty).")
 
     client = OpenAI(api_key=str(api_key))
+
+    allow_prompt_only = str(os.environ.get("UAPPRESS_ALLOW_PROMPT_ONLY", "")).strip() == "1"
 
     models_to_try = [
         _DEFAULT_IMAGE_MODEL,
@@ -805,6 +797,14 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
             break
 
     if resp is None:
+        if style_ref is not None and not allow_prompt_only:
+            raise RuntimeError(
+                "Style-reference generation failed (no conditioned endpoint succeeded). "
+                "This pipeline will not fall back to prompt-only. "
+                "If you want to allow prompt-only fallback (NOT RECOMMENDED), set UAPPRESS_ALLOW_PROMPT_ONLY=1. "
+                f"Last error: {last_err!r}"
+            ) from last_err
+
         raise RuntimeError(
             f"OpenAI image generation failed for models {models_to_try}. Last error: {last_err!r}"
         ) from last_err
@@ -1000,19 +1000,31 @@ def _generate_segment_images(
     width: int,
     height: int,
     max_scenes: int,
+    style_ref_path: str,
 ) -> List[Path]:
     """
     Generate (or reuse cached) images for this segment.
     Uses a segment-specific cache folder to avoid shared images across segments.
     """
     img_dir = _segment_image_dir(extract_dir, pair)
+
+    # Style reference (MANDATORY)
+    style_ref_bytes, style_mime = _load_style_ref_bytes(style_ref_path)
+    style_hash = hashlib.sha256(style_ref_bytes).hexdigest()[:10]
+    img_dir = Path(img_dir) / f"style_{style_hash}"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    style_ref = (style_ref_bytes, style_mime)
     size = _image_size_for_mode(int(width), int(height))
 
     existing = sorted([p for p in img_dir.glob("scene_*.*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".ppm")])
     if existing:
         return existing[: max(1, int(max_scenes))]
-    script_text = load_segment_script(extract_dir, pair)
-    incident_hint = (str(pair.get("title_guess") or "") + " " + str(Path(str(pair.get("script_path") or "")).stem)).strip()
+
+    # Option A (REQUIRED): scripts must be inside the extracted ZIP as <segment_id>.txt
+    # We intentionally hard-fail if missing to prevent silent fallback visuals.
+    segment_id = str(pair.get("base_name") or Path(str(pair.get("audio_path") or "")).stem).strip()
+    script_text = load_segment_script(extract_dir, segment_id)
+    incident_hint = (str(pair.get("title_guess") or "") + " " + segment_id).strip()
     prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes), incident_hint=incident_hint)
 
     if not prompts:
@@ -1341,6 +1353,7 @@ def render_segment_mp4(
     max_scenes: int,
     min_scene_seconds: int,
     max_scene_seconds: int,
+    style_ref_path: str,
 ) -> None:
     """
     Locked pipeline:
