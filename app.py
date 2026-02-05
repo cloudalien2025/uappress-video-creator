@@ -1,6 +1,6 @@
 # ============================
-# app.py — UAPpress Video Creator (PHOTOREALISTIC ONLY)
-# FIXED: Syntax-safe, no Style Reference, no malformed multiline args
+# app.py — UAPpress Video Creator
+# PHOTOREALISTIC-ONLY • IMPORT-SAFE • STREAMLIT-CLOUD SAFE
 # ============================
 
 from __future__ import annotations
@@ -13,10 +13,8 @@ from typing import List
 
 import streamlit as st
 
-from video_pipeline import generate_video_segment
-
 # ----------------------------
-# App config
+# Page config
 # ----------------------------
 st.set_page_config(
     page_title="UAPpress — Video Creator",
@@ -24,7 +22,7 @@ st.set_page_config(
 )
 
 st.title("🛸 UAPpress — Video Creator")
-st.caption("Photorealistic documentary video segments. No style reference.")
+st.caption("Photorealistic documentary video segments.")
 
 # ----------------------------
 # Sidebar — API + settings
@@ -82,6 +80,14 @@ if st.button("🎬 Generate Segment MP4s"):
 
     os.environ["OPENAI_API_KEY"] = api_key
 
+    # 🔒 SAFE IMPORT — avoids Streamlit boot crash
+    try:
+        from video_pipeline import render_segment_mp4
+    except Exception as e:
+        st.error("Failed to import video_pipeline.render_segment_mp4")
+        st.exception(e)
+        st.stop()
+
     for script_path in segments:
         seg_key = script_path.stem
         audio_path = script_path.with_suffix(".mp3")
@@ -93,14 +99,19 @@ if st.button("🎬 Generate Segment MP4s"):
         st.info(f"Generating {seg_key}…")
         t0 = time.time()
 
-        out_path = generate_video_segment(
-            script_path=str(script_path),
-            audio_path=str(audio_path),
-            max_scenes=int(max_scenes),
-            min_scene_seconds=int(min_scene_seconds),
-            max_scene_seconds=int(max_scene_seconds),
-            zoom_strength=float(zoom_strength),
-        )
+        try:
+            out_path = render_segment_mp4(
+                script_path=str(script_path),
+                audio_path=str(audio_path),
+                max_scenes=int(max_scenes),
+                min_scene_seconds=int(min_scene_seconds),
+                max_scene_seconds=int(max_scene_seconds),
+                zoom_strength=float(zoom_strength),
+            )
+        except Exception as e:
+            st.error(f"Generation failed for {seg_key}")
+            st.exception(e)
+            continue
 
         outputs.append(out_path)
         st.success(f"✅ Generated {seg_key} in {time.time() - t0:.1f}s")
