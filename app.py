@@ -770,6 +770,7 @@ def generate_all_segments_sequential(
                 max_scenes=int(max_scenes),
                 min_scene_seconds=int(min_scene_seconds),
                 max_scene_seconds=int(max_scene_seconds),
+"") or ""),
 
             )
 
