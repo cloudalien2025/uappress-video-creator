@@ -45,6 +45,7 @@ st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos
 
 
 
+
 # ===============================================================
 # SECTION 2 — Safe session_state init + Sidebar
 # ===============================================================
@@ -417,55 +418,25 @@ def _scan_mp4s(out_dir: str) -> List[str]:
 
 
 def _is_valid_mp4(path: str, min_bytes: int = 50_000) -> Tuple[bool, str]:
-    """Integrity gate for uploads.
-
-    Requirements:
-    - file exists
-    - non-trivial size
-    - duration > 0
-    - contains a real video stream
-    - contains an audio stream (expected for muxed segment outputs)
-    """
+    """Basic integrity gate for uploads (prevents uploading empty/invalid artifacts)."""
     try:
         p = Path(path)
         if not p.exists():
             return False, "missing"
         if p.stat().st_size < int(min_bytes):
             return False, f"too_small<{min_bytes}B"
-
-        # Prefer pipeline-native validation if available (keeps app/vp logic in sync)
-        vfn = getattr(vp, "validate_mp4", None)
-        if callable(vfn):
-            ok, why = vfn(str(p), require_audio=True, min_bytes=int(min_bytes))
-            return (bool(ok), str(why))
-
-        # Fallback: duration + stream sniff via ffmpeg -i
+        # Duration check (cloud-safe: vp.ffprobe_duration_seconds falls back to ffmpeg parsing)
         try:
             dur = float(vp.ffprobe_duration_seconds(p))  # type: ignore[attr-defined]
         except Exception:
             dur = 0.0
         if dur <= 0.05:
             return False, "zero_duration"
-
-        ff = vp.ffmpeg_exe()
-        import subprocess
-        proc = subprocess.run(
-            [ff, "-hide_banner", "-i", str(p)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        info = (proc.stderr or "") + "\n" + (proc.stdout or "")
-        has_video = (" Video:" in info) or ("Stream #0:" in info and "Video:" in info)
-        has_audio = (" Audio:" in info) or ("Stream #0:" in info and "Audio:" in info)
-        if not has_video:
-            return False, "no_video_stream"
-        if not has_audio:
-            return False, "no_audio_stream"
-
         return True, f"ok_dur={dur:.2f}s"
     except Exception as e:
         return False, f"error:{type(e).__name__}"
+
+
 def _read_spaces_secret(key: str, default: str = "") -> str:
     # st.secrets first
     try:
@@ -959,9 +930,9 @@ w, h = _get_resolution_wh()
 
 # --- Crash-safe defaults for dependent sliders (Min/Max scene seconds) ---
 if "min_scene_seconds" not in st.session_state:
-    st.session_state["min_scene_seconds"] = 45
+    st.session_state["min_scene_seconds"] = 20
 if "max_scene_seconds" not in st.session_state:
-    st.session_state["max_scene_seconds"] = 90
+    st.session_state["max_scene_seconds"] = 40
 
 
 def _clamp_max_scene_seconds() -> None:
@@ -992,10 +963,10 @@ with colB:
     )
 with colC:
     zoom_strength = st.slider(
-        "Micro zoom (no pans)",
+        "Ken Burns zoom strength (zoom-only)",
         min_value=1.00,
-        max_value=1.06,
-        value=1.03,
+        max_value=1.20,
+        value=1.06,
         step=0.01,
         disabled=st.session_state["is_generating"],
         key="zoom_strength_value",
