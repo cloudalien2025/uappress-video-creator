@@ -112,6 +112,10 @@ _IMAGE_CACHE_ROOT = os.environ.get("UAPPRESS_IMAGE_CACHE_ROOT", "_image_cache_v2
 # Optional exception (default OFF): allow only *ambiguous distant lights* with no defined edges/shape/symmetry.
 _ALLOW_WEAK_HINT = os.environ.get("UAPPRESS_ALLOW_WEAK_HINT", "0").strip() == "1"
 
+# Local fallback artifacts (OFF by default). If enabled, failures generate clearly-marked scene cards.
+_ALLOW_LOCAL_FALLBACK = os.environ.get("UAPPRESS_ALLOW_LOCAL_FALLBACK", "0").strip() == "1"
+
+
 _NO_OBJECT_DOCTRINE = (
     "STRICT VISUAL DOCTRINE: Do NOT show a UFO craft, spaceship, saucer, disc, triangle, or any defined object. "
     "Do NOT depict clear geometry, symmetry, metallic hulls, windows, seams/panels, landing gear, engines, beams, "
@@ -780,45 +784,102 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
 
     raise RuntimeError("Image API response missing b64_json and url.")
 
-def _build_scene_prompts_from_script(script_text: str, max_scenes: int) -> List[str]:
-    """
-    Heuristic: break script into chunks and generate scene prompts.
-    Keep prompts restrained (investigative tone, no logos/subtitles).
+def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incident_hint: str = "") -> List[str]:
+    """Build per-scene image prompts.
+
+    Baked-in house style:
+    - Illustrated (graphic-novel / storyboard / concept art), NOT photographic.
+    - Near-monochrome palette with ONE restrained accent color.
+    - Credibility-first, investigative, military/intel-adjacent tone.
+    - Humans allowed, but routine and non-performative (no hero poses).
+
+    Scene composition doctrine:
+    - Depict context, not conclusions.
+    - Never show a craft/object; never show beams.
+    - Use 6 canonical scene categories to prevent "spaceship drift".
     """
     text = (script_text or "").strip()
     if not text:
         return []
 
-    paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
-    paras = [p for p in paras if len(p) >= 80] or paras
+    max_scenes_i = clamp_int(int(max_scenes), 1, 120)
 
-    n = min(int(max_scenes), max(1, len(paras)))
-    if n <= 0:
+    # Light-touch segmentation: paragraphs -> beats. Avoid over-fragmentation.
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    # Prefer substantial beats
+    beats = [p for p in paras if len(p) >= 120] or paras
+    if not beats:
         return []
 
-    if len(paras) <= n:
-        idxs = list(range(len(paras)))
+    # Choose N beats evenly, but keep stable for repeated runs.
+    if len(beats) <= max_scenes_i:
+        idxs = list(range(len(beats)))
     else:
-        step = len(paras) / float(n)
-        idxs = [min(len(paras) - 1, int(i * step)) for i in range(n)]
+        step = len(beats) / float(max_scenes_i)
+        idxs = [min(len(beats) - 1, int(i * step)) for i in range(max_scenes_i)]
+
+    # House look
+    accent = (os.environ.get("UAPPRESS_ACCENT_COLOR", "muted amber") or "muted amber").strip()
+    style_block = (
+        "STYLE: graphic-novel storyboard illustration, military dossier concept art, visible ink linework, "
+        "matte shading, high contrast chiaroscuro lighting. "
+        "COLOR: near-monochrome (charcoal/gray/off-white) with a single restrained accent color: "
+        f"{accent}. Accent should be subtle (5–10% of frame). "
+        "No photographic realism, no film still, no lens bokeh, no camera metadata. "
+        "No text, no logos, no subtitles, no watermarks. "
+        "Faces should be non-identifiable; if people appear, they are routine silhouettes or small groups."
+    )
+
+    # Canonical scene categories (cycled)
+    categories = [
+        ("Institutional context", "military base exterior or government facility, plain architecture, procedural calm, routine personnel movement"),
+        ("Environmental establishing", "wide environmental context, desert/road/skyline/terrain, empty or distant figures, stillness"),
+        ("Human scale / normalcy", "ordinary human activity, small group walking/standing, non-performative posture, seen from behind"),
+        ("Procedural / process", "documents, folders, maps, radios, desks, briefing materials, hands-only or partial figures"),
+        ("Temporal / transition", "dusk/night corridor, road at night, exterior building at dawn, weather shifting, quiet transition"),
+        ("Reflective / aftermath", "empty space after activity, quiet landscape, vacant room, ambiguity and restraint"),
+    ]
+
+    # Incident-specific allowance: Phoenix Lights may include ambiguous lights (NOT beams/craft).
+    allow_ambiguous_lights = False
+    if (incident_hint or "").strip().lower().find("phoenix") >= 0:
+        allow_ambiguous_lights = True
+
+    doctrine = _doctrine_clause()
+    if allow_ambiguous_lights:
+        doctrine += (
+            " INCIDENT PROFILE (PHOENIX LIGHTS): You MAY include a few distant, soft-edged, irregularly spaced points of light "
+            "partially obscured by haze/clouds. No structure, no symmetry, no hard edges, no beams, no centered sky-object framing."
+        )
 
     prompts: List[str] = []
-    for pi in idxs:
-        snippet = _sanitize_scene_context(paras[pi])
-        if len(snippet) > 420:
-            snippet = snippet[:420].rstrip() + "…"
+    for j, bi in enumerate(idxs):
+        raw = beats[bi]
+        snippet = _sanitize_scene_context(raw)
+        if len(snippet) > 380:
+            snippet = snippet[:380].rstrip() + "…"
 
-        prompts.append(
-            "Create a documentary still image for a serious UFO/UAP investigative video. "
-            "Cinematic, realistic, restrained, credibility-first. "
-            "No text, no logos, no subtitles, no watermarks. "
-            "Moody lighting. Favor observation context: radar/ATC rooms, airbase perimeter, night-ops, "
-            "coastal/forest/desert terrain, archival documents, maps, witnesses from behind. "
-            + _doctrine_clause() + " "
-            f"Scene context (sanitized): {snippet}"
+        cat_name, cat_desc = categories[j % len(categories)]
+        # Keep humans present in ~2/3 of scenes by default (routine presence).
+        want_people = (j % 3) != 0
+        people_clause = (
+            "HUMANS: include a few people in the frame (silhouettes or small group), routine posture, no drama, no pointing."
+            if want_people
+            else "HUMANS: none or distant silhouettes only."
         )
-    return prompts
 
+        prompt = (
+            "Create a still image for a credibility-first UAP investigative documentary.\n"
+            f"{style_block}\n"
+            f"SCENE CATEGORY: {cat_name}. Depict: {cat_desc}.\n"
+            f"{people_clause}\n"
+            f"{doctrine}\n"
+            f"Context (sanitized beat): {snippet}\n"
+            "COMPOSITION: editorial stillness, grounded realism, no spectacle, no overclaiming."
+        )
+        prompts.append(prompt)
+
+    return prompts
 
 def _segment_image_dir(extract_dir: Union[str, Path], pair: Dict[str, Any]) -> Path:
     """
@@ -853,12 +914,14 @@ def _generate_segment_images(
 
     script_path = str(pair.get("script_path") or "")
     script_text = _read_text_preview(script_path, max_chars=12000) if script_path else ""
-    prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes)) if script_text else []
+    incident_hint = (str(pair.get('title_guess') or '') + ' ' + str(pair.get('script_path') or '')).strip()
+    prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes), incident_hint=incident_hint) if script_text else []
 
     if not prompts:
         prompts = [
-            "Cinematic documentary still, restrained investigative tone, no text, no logos, no subtitles. "
-            "UAP investigation mood: night sky, distant lights, radar room, airbase perimeter, forest trail."
+            "Graphic-novel storyboard illustration, near-monochrome with a single muted accent color, investigative tone. "
+            "Depict only context: airbase perimeter, radar room, documents, night road, witnesses from behind. "
+            + _doctrine_clause()
         ] * max(3, min(8, int(max_scenes)))
 
     images: List[Path] = []
@@ -866,12 +929,29 @@ def _generate_segment_images(
         out = img_dir / f"scene_{i:03d}.png"
         try:
             data = _openai_generate_image_bytes(str(api_key), prompt, size)
-            out.write_bytes(data)
-        except Exception:
-            _make_scene_card_image(out, int(width), int(height), headline='SCENE IMAGE (LOCAL FALLBACK)', body=str(prompt)[:900], footer='UAPpress')
-            # If Pillow isn't installed, the fallback may write a .ppm instead of .png
-            if not out.exists() and out.with_suffix('.ppm').exists():
-                out = out.with_suffix('.ppm')
+            # Basic byte validation (prevents silent placeholder uploads)
+            if not isinstance(data, (bytes, bytearray)) or len(data) < 2048:
+                raise RuntimeError(f"OpenAI image returned invalid bytes (len={len(data) if hasattr(data,'__len__') else 'n/a'}).")
+            out.write_bytes(bytes(data))
+        except Exception as e:
+            if _ALLOW_LOCAL_FALLBACK:
+                _make_scene_card_image(
+                    out,
+                    int(width),
+                    int(height),
+                    headline="SCENE IMAGE (LOCAL FALLBACK)",
+                    body=(f"{type(e).__name__}: {e}\n\n" + str(prompt))[:900],
+                    footer="UAPpress",
+                )
+                # If Pillow isn't installed, the fallback may write a .ppm instead of .png
+                if not out.exists() and out.with_suffix(".ppm").exists():
+                    out = out.with_suffix(".ppm")
+            else:
+                raise RuntimeError(
+                    f"Image generation failed (scene {i}/{len(prompts)}). "
+                    f"Set UAPPRESS_ALLOW_LOCAL_FALLBACK=1 to allow scene-card placeholders. "
+                    f"Error: {type(e).__name__}: {e}"
+                ) from e
         images.append(out)
 
     return images
@@ -928,7 +1008,8 @@ def build_scene_clip_from_image(
     sw = _ensure_even(int(w * 1.45))
     sh = _ensure_even(int(h * 1.45))
 
-    zmax = 1.0 + (zs * 0.10)
+    # zoom_strength is interpreted as the FINAL max zoom factor (e.g., 1.01–1.06).
+    zmax = clamp_float(float(zs), 1.0, 1.20)
     zexpr = f"min(1+(({zmax}-1)*on/{frames}),{zmax})"
     xexpr = "iw/2-(iw/zoom/2)"
     yexpr = "ih/2-(ih/zoom/2)"
@@ -1096,6 +1177,53 @@ def mux_audio_to_video(
         raise RuntimeError("Mux failed (output missing or too small).")
 
     return out
+
+
+
+def validate_mp4(path: str, *, require_audio: bool = True, min_bytes: int = 50_000) -> Tuple[bool, str]:
+    """Validate an MP4 for upload gating.
+
+    Checks:
+    - exists and non-trivial size
+    - duration > 0
+    - contains a video stream
+    - contains an audio stream if require_audio=True
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return False, "missing"
+        if p.stat().st_size < int(min_bytes):
+            return False, f"too_small<{min_bytes}B"
+
+        # Duration (ffprobe if available; otherwise ffmpeg -i parse)
+        dur = 0.0
+        try:
+            dur = float(ffprobe_duration_seconds(p))
+        except Exception:
+            dur = 0.0
+        if dur <= 0.05:
+            return False, "zero_duration"
+
+        ff = which_ffmpeg()
+        proc = subprocess.run(
+            [ff, "-hide_banner", "-i", str(p)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        info = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        has_video = "Video:" in info
+        has_audio = "Audio:" in info
+
+        if not has_video:
+            return False, "no_video_stream"
+        if require_audio and (not has_audio):
+            return False, "no_audio_stream"
+
+        return True, f"ok_dur={dur:.2f}s"
+    except Exception as e:
+        return False, f"error:{type(e).__name__}:{e}"
 
 
 # ----------------------------
@@ -1325,42 +1453,40 @@ def build_sora_prompt(
     if not resolved:
         resolved = "A short, engaging scene that matches the narration without any on-screen text."
 
-        style_bundle = build_sora_house_style(mode=mode)
+    style_bundle = build_sora_house_style(mode=mode)
 
-        # Normalize fps/aspect/length metadata (descriptive for Sora)
+    # Normalize fps/aspect/length metadata (descriptive for Sora)
+    try:
+        fps_i = int(fps)
+    except Exception:
+        fps_i = 30
+    if fps_i <= 0:
+        fps_i = 30
+    asp = (aspect or "9:16").strip()
+
+    meta = []
+    if length_s is not None:
         try:
-            fps_i = int(fps)
+            meta.append(f"Target length: {int(length_s)} seconds.")
         except Exception:
-            fps_i = 30
-        if fps_i <= 0:
-            fps_i = 30
-        asp = (aspect or "9:16").strip()
+            pass
+    meta.append(f"Aspect ratio: {asp}.")
+    meta.append(f"Frame rate: {fps_i} fps.")
+    meta_txt = " ".join(meta)
 
-        meta = []
-        if length_s is not None:
-            try:
-                meta.append(f"Target length: {int(length_s)} seconds.")
-            except Exception:
-                pass
-        meta.append(f"Aspect ratio: {asp}.")
-        meta.append(f"Frame rate: {fps_i} fps.")
-        meta_txt = " ".join(meta)
-
-        prompt = (
-            "Create a cinematic, documentary-style video scene.\n"
-            f"{meta_txt}\n\n"
-            f"Scene:\n{resolved}\n\n"
-            f"Style: {style}.\n"
-            f"Environment: {environment}.\n"
-            f"Camera: {camera}. {style_bundle.camera_rules}\n"
-            f"Motion: {movement}.\n"
-            f"Lighting: {style_bundle.lighting_rules}\n"
-            f"Texture: {style_bundle.grain_rules}\n"
-            f"Constraints: {constraints} {style_bundle.realism_constraints}"
-        )
-        return prompt
-
-
+    prompt = (
+        "Create a cinematic, documentary-style video scene.\n"
+        f"{meta_txt}\n\n"
+        f"Scene:\n{resolved}\n\n"
+        f"Style: {style}.\n"
+        f"Environment: {environment}.\n"
+        f"Camera: {camera}. {style_bundle.camera_rules}\n"
+        f"Motion: {movement}.\n"
+        f"Lighting: {style_bundle.lighting_rules}\n"
+        f"Texture: {style_bundle.grain_rules}\n"
+        f"Constraints: {constraints} {style_bundle.realism_constraints}"
+    )
+    return prompt
 
 def prepare_sora_short_job(
     prompt_text: str,
