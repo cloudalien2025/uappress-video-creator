@@ -28,8 +28,8 @@
 #
 # IMPORTANT:
 # - This file keeps external dependencies optional/guarded.
-# - Image generation uses OpenAI Images API when available; falls back to local placeholders
-#   if generation fails (to avoid crashing the whole pipeline).
+# - Image generation uses the OpenAI Images API (photorealistic documentary stills).
+# - Optional local scene-card fallback can be enabled to avoid hard-failing the pipeline.
 #
 # FIXES INCLUDED (per your issues):
 #   1) ffprobe missing on Streamlit Cloud: duration detection now falls back to parsing ffmpeg output
@@ -727,21 +727,7 @@ def _make_scene_card_image(
 
 
 
-# ----------------------------
-# Style reference utilities
-# ----------------------------
-def _load_style_ref_bytes(style_ref_path: str) -> tuple[bytes, str]:
-    """Load reference image bytes and return (bytes, mime). Hard-fail if missing/empty."""
-    p = Path(str(style_ref_path or "").strip())
-    if not p.exists():
-        raise RuntimeError(f"Style reference image missing: {p}")
-    b = p.read_bytes()
-    if not b or len(b) < 1024:
-        raise RuntimeError(f"Style reference image is empty/too small: {p.name}")
-    ext = p.suffix.lower().lstrip(".")
-    mime = "image/png" if ext == "png" else "image/jpeg"
-    return b, mime
-def _openai_generate_image_bytes(api_key: str, prompt: str, size: str, *, style_ref: tuple[bytes, str] | None = None) -> bytes:
+def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     """
     Generate a single image via OpenAI Images API.
 
@@ -758,9 +744,6 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str, *, style_
         raise RuntimeError("Missing OpenAI API key (api_key is empty).")
 
     client = OpenAI(api_key=str(api_key))
-
-    allow_prompt_only = str(os.environ.get("UAPPRESS_ALLOW_PROMPT_ONLY", "")).strip() == "1"
-
     models_to_try = [
         _DEFAULT_IMAGE_MODEL,
         os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK_1", "dall-e-3"),
@@ -794,16 +777,7 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str, *, style_
 
         if resp is not None and last_err is None:
             break
-
     if resp is None:
-        if style_ref is not None and not allow_prompt_only:
-            raise RuntimeError(
-                "Style-reference generation failed (no conditioned endpoint succeeded). "
-                "This pipeline will not fall back to prompt-only. "
-                "If you want to allow prompt-only fallback (NOT RECOMMENDED), set UAPPRESS_ALLOW_PROMPT_ONLY=1. "
-                f"Last error: {last_err!r}"
-            ) from last_err
-
         raise RuntimeError(
             f"OpenAI image generation failed for models {models_to_try}. Last error: {last_err!r}"
         ) from last_err
@@ -837,22 +811,19 @@ def _openai_generate_image_bytes(api_key: str, prompt: str, size: str, *, style_
 
     raise RuntimeError("Image API response missing b64_json and url.")
 
+
 def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incident_hint: str = "") -> List[str]:
-    """Build per-scene image prompts.
+    """Build per-scene image prompts (PHOTOREALISTIC RESET).
 
-    HARD-WIRED UAPpress IMAGE HOUSE STYLE (2026-02):
-    - Non-photorealistic 3D illustrated world (NPR), flat/stepped shading, clean ink-like outlines.
-    - Minimal color: near-monochrome with ONE restrained muted accent color (5–10% of frame).
-    - NO soot / smudge / painterly texture. No cinematic lighting. No photorealism.
-    - Credibility-first, investigative, military/intel-adjacent tone. Humans allowed (routine, non-performative).
+    Goal:
+    - Generate photorealistic, documentary-style still images that match the narration beats.
+    - Credibility-first: depict context and uncertainty, not conclusions.
+    - No on-screen text, no logos, no subtitles, no watermarks.
 
-    Scene composition doctrine:
-    - Depict context, not conclusions.
-    - No beams.
-    - Obscured object policy (✅ B):
-        * Allowed ONLY when the narration implies recovery/containment/handling.
-        * Must be non-descript (tarp-covered bundle/crate), no shape language, no metallic hull cues, no symmetry, no windows, no engines.
-    - Use 6 canonical scene categories to prevent drift.
+    Safety/credibility doctrine:
+    - Default: DO NOT depict a clearly defined craft/object.
+    - Phoenix Lights exception: optionally allow faint distant lights with no shape/symmetry.
+    - If narration strongly implies recovery/containment, allow only an indistinct tarp-covered bundle/crate (no craft silhouette).
     """
     text = (script_text or "").strip()
     if not text:
@@ -873,30 +844,19 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
         step = len(beats) / float(max_scenes_i)
         idxs = [min(len(beats) - 1, int(i * step)) for i in range(max_scenes_i)]
 
-    # Episode-wide accent color (keep consistent across scenes)
-    accent = (os.environ.get("UAPPRESS_ACCENT_COLOR", "muted amber") or "muted amber").strip()
+    # Photorealistic documentary house look (single choke point)
+    look_block = (
+        "STYLE: photorealistic documentary still, natural lighting, historically plausible wardrobe/props, "
+        "restrained color grade, no cinematic spectacle. "
+        "CAMERA: 28–50mm equivalent, documentary distance, stable framing, no extreme wide distortion. "
+        "DETAIL: realistic textures, believable environments, no stylized illustration, no cartoon, no anime, no 3D render. "
+        "TEXT: no text, no logos, no subtitles, no watermarks."
+    )
 
-    # HARD house look (single choke point)
-    # NOTE: Intentionally avoids the word "soot" per directive.
-    style_block = (
-    "STYLE: illustrated archival storyboard, hand-inked linework with clean contour lines, "
-    "subtle pencil hatching, and soft watercolor wash shading. "
-    "LOOK: calm military / investigative illustration, wide establishing compositions, documentary distance. "
-    "SURFACES: clean matte, no photoreal texture, no gritty soot, no heavy painterly brush strokes, no smeared charcoal. "
-    "LIGHTING: soft practical light sources (hangar bulbs, desk lamps) with restrained warm glow; "
-    "overall neutral ambient light, no cinematic bloom, no lens flare, no volumetric fog, no god rays. "
-    "COLOR: near-monochrome (cool gray / off-white / deep charcoal) with ONE restrained muted accent color: "
-    f"{accent}. Accent must be subtle (5–10% of frame), used only for practical light or small details, "
-    "never used as the 'phenomena'. "
-    "RENDER: clearly illustrated, not photographic, not CGI realism, not a film still. "
-    "TEXT: no text, no logos, no subtitles, no watermarks. "
-    "PEOPLE: faces non-identifiable; if people appear, keep them routine, mid-distance, calm."
-)
-
-    # Canonical scene categories (cycled). These describe WHAT to depict, not HOW to render.
+    # Canonical scene categories (cycled). These describe WHAT to depict.
     categories = [
         ("Institutional context", "military base exterior or government facility, plain architecture, procedural calm, routine personnel movement"),
-        ("Environmental establishing", "wide environmental context, desert/road/skyline/terrain, empty or distant figures, stillness"),
+        ("Environmental establishing", "wide environmental context, desert/road/skyline/terrain, stillness, weather and light"),
         ("Human scale / normalcy", "ordinary human activity, small group walking/standing, non-performative posture, seen from behind or mid-distance"),
         ("Procedural / process", "documents, folders, maps, radios, desks, briefing materials, hands-only or partial figures"),
         ("Temporal / transition", "corridor or road at dusk/night, exterior building at dawn, weather shifting, quiet transition"),
@@ -910,7 +870,6 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
 
     def _implies_recovery_or_containment(s: str) -> bool:
         s = (s or "").lower()
-        # Broad, conservative keyword set. Requires at least one strong cue.
         cues = [
             "recover", "recovered", "recovery", "retrieval", "retrieve",
             "debris", "wreckage", "crash", "impact", "site", "field",
@@ -922,8 +881,6 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
 
     base_doctrine = _doctrine_clause()
 
-    # Refine doctrine to match ✅ B policy and your new style.
-    # 1) Sky lights policy
     if not allow_ambiguous_lights:
         base_doctrine += (
             " ALSO: Do NOT include any glowing orb, flare, spotlight, searchlight, beam, or bright point of light in the sky. "
@@ -952,7 +909,6 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
             else "HUMANS: none, or distant silhouettes only."
         )
 
-        # ✅ B: allow only an obscured, non-descript covered object when narration implies recovery/containment.
         allow_obscured_object = _implies_recovery_or_containment(snippet)
         if allow_obscured_object:
             object_clause = (
@@ -967,14 +923,14 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
             )
 
         prompt = (
-            "Create a still image for a credibility-first UAP investigative documentary.\n"
-            f"{style_block}\n"
+            "Create a photorealistic still image for a credibility-first UAP investigative documentary.\n"
+            f"{look_block}\n"
             f"SCENE CATEGORY: {cat_name}. Depict: {cat_desc}.\n"
             f"{people_clause}\n"
             f"{object_clause}\n"
             f"{base_doctrine}\n"
             f"Context (sanitized beat): {snippet}\n"
-            "COMPOSITION: editorial stillness, documentary distance, minimal color, no spectacle, no overclaiming."
+            "COMPOSITION: editorial stillness, documentary distance, minimal spectacle, no overclaiming."
         )
         prompts.append(prompt)
 
@@ -999,20 +955,12 @@ def _generate_segment_images(
     width: int,
     height: int,
     max_scenes: int,
-    style_ref_path: str,
 ) -> List[Path]:
     """
     Generate (or reuse cached) images for this segment.
     Uses a segment-specific cache folder to avoid shared images across segments.
     """
     img_dir = _segment_image_dir(extract_dir, pair)
-
-    # Style reference (MANDATORY)
-    style_ref_bytes, style_mime = _load_style_ref_bytes(style_ref_path)
-    style_hash = hashlib.sha256(style_ref_bytes).hexdigest()[:10]
-    img_dir = Path(img_dir) / f"style_{style_hash}"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    style_ref = (style_ref_bytes, style_mime)
     size = _image_size_for_mode(int(width), int(height))
 
     existing = sorted([p for p in img_dir.glob("scene_*.*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".ppm")])
@@ -1355,7 +1303,6 @@ def render_segment_mp4(
     max_scenes: int,
     min_scene_seconds: int,
     max_scene_seconds: int,
-    style_ref_path: str,
 ) -> None:
     """
     Locked pipeline:
@@ -1393,8 +1340,7 @@ def render_segment_mp4(
         pair=pair,
         width=int(width),
         height=int(height),
-        max_scenes=int(target_scenes),
-        style_ref_path=str(style_ref_path),
+        max_scenes=int(target_scenes)
     )
     if not images:
         raise RuntimeError("Image generation produced zero images (unexpected).")
