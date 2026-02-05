@@ -145,26 +145,53 @@ _SANITIZE_PATTERNS = [
 # ----------------------------
 # Script Loading (REQUIRED)
 # ----------------------------
-def load_segment_script(extract_dir: Path, segment_id: str) -> str:
+def load_segment_script(extract_dir: Path, pair: Dict[str, Any]) -> str:
     """
     REQUIRED: Load narration script for a segment.
 
-    Option A contract:
-      - The extracted ZIP MUST contain a text file named '<segment_id>.txt'
-        (e.g., '01_intro.txt', '02_chapter_1.txt', etc.)
+    ✅ Option A (robust, cloud-safe):
+      - Prefer the script file that was actually discovered in the ZIP and stored on the pair:
+            pair["script_path"]
+      - If script_path is missing, fall back to '<audio_stem>.txt' inside extract_dir (rare).
+      - Hard-fail if missing or empty to prevent silent placeholder visuals.
 
-    We hard-fail if missing or empty to prevent silent fallback visuals.
+    This fixes the prior bug where we looked for a derived filename (e.g., intro_<hash>.txt)
+    that doesn't exist in real TTS Studio ZIPs.
     """
-    script_path = extract_dir / f"{segment_id}.txt"
-    if not script_path.exists():
-        raise RuntimeError(
-            f"Missing required script file: {script_path.name}. "
-            "Each segment MUST have a corresponding .txt script file inside the ZIP."
-        )
-    text = script_path.read_text(encoding="utf-8", errors="ignore").strip()
-    if not text:
-        raise RuntimeError(f"Script file is empty: {script_path.name}")
-    return text
+    extract_dir = Path(extract_dir)
+
+    # 1) Primary: explicit script path discovered by find_files() and attached by pair_segments()
+    sp = str(pair.get("script_path") or "").strip()
+    if sp:
+        p = Path(sp)
+        if not p.is_absolute():
+            p = (extract_dir / p).resolve()
+        if not p.exists():
+            raise RuntimeError(
+                f"Missing required script file referenced by pair['script_path']: {p.name}."
+            )
+        text = p.read_text(encoding="utf-8", errors="ignore").strip()
+        if not text:
+            raise RuntimeError(f"Script file is empty: {p.name}")
+        return text
+
+    # 2) Fallback: '<audio_stem>.txt' inside extracted ZIP root (only if script_path wasn't provided)
+    ap = str(pair.get("audio_path") or "").strip()
+    if ap:
+        stem = Path(ap).stem
+        cand = extract_dir / f"{stem}.txt"
+        if cand.exists():
+            text = cand.read_text(encoding="utf-8", errors="ignore").strip()
+            if not text:
+                raise RuntimeError(f"Script file is empty: {cand.name}")
+            return text
+
+    # 3) Hard fail
+    raise RuntimeError(
+        "Missing required script file for this segment. "
+        "Expected pair['script_path'] to be present (recommended), "
+        "or a '<audio_stem>.txt' file inside the ZIP."
+    )
 
 
 
@@ -984,12 +1011,8 @@ def _generate_segment_images(
     existing = sorted([p for p in img_dir.glob("scene_*.*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".ppm")])
     if existing:
         return existing[: max(1, int(max_scenes))]
-
-    # Option A (REQUIRED): scripts must be inside the extracted ZIP as <segment_id>.txt
-    # We intentionally hard-fail if missing to prevent silent fallback visuals.
-    segment_id = str(pair.get("base_name") or Path(str(pair.get("audio_path") or "")).stem).strip()
-    script_text = load_segment_script(extract_dir, segment_id)
-    incident_hint = (str(pair.get("title_guess") or "") + " " + segment_id).strip()
+    script_text = load_segment_script(extract_dir, pair)
+    incident_hint = (str(pair.get("title_guess") or "") + " " + str(Path(str(pair.get("script_path") or "")).stem)).strip()
     prompts = _build_scene_prompts_from_script(script_text, max_scenes=int(max_scenes), incident_hint=incident_hint)
 
     if not prompts:
