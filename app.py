@@ -769,7 +769,8 @@ def generate_all_segments_sequential(
                 zoom_strength=float(zoom_strength),
                 max_scenes=int(max_scenes),
                 min_scene_seconds=int(min_scene_seconds),
-                max_scene_seconds=int(max_scene_seconds),
+                max_scene_seconds=int(max_scene_seconds),                style_ref_path=str(st.session_state.get("style_ref_path","") or ""),
+
             )
 
             st.session_state["generated"][seg_key] = out_path
