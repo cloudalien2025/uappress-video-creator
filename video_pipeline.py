@@ -1211,6 +1211,12 @@ def build_scene_clip_from_image(
         "yuv420p",
         "-movflags",
         "+faststart",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-avoid_negative_ts",
+        "make_zero",
         str(out),
     ]
     run_ffmpeg(cmd)
@@ -1262,6 +1268,12 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
         "yuv420p",
         "-movflags",
         "+faststart",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-avoid_negative_ts",
+        "make_zero",
         str(out),
     ]
     run_ffmpeg(cmd)
@@ -1315,7 +1327,7 @@ def mux_audio_to_video(
 
     ff = which_ffmpeg()
     # tpad extends video by cloning last frame; apad extends audio with silence for exactly buf seconds.
-    filt = f"[0:v]tpad=stop_mode=clone:stop_duration={buf:.3f}[v];[1:a]apad=pad_dur={buf:.3f}[a]"
+    filt = f"[0:v]tpad=stop_mode=clone:stop_duration={buf:.3f},setpts=PTS-STARTPTS[v];[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,apad=pad_dur={buf:.3f}[a]"
     cmd = [
         ff,
         "-y",
@@ -1344,6 +1356,12 @@ def mux_audio_to_video(
         os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
         "-movflags",
         "+faststart",
+        "-muxdelay",
+        "0",
+        "-muxpreload",
+        "0",
+        "-avoid_negative_ts",
+        "make_zero",
         str(out),
     ]
     run_ffmpeg(cmd)
@@ -1728,14 +1746,20 @@ def burn_subtitles_to_mp4(
     # - Use proportional margins so 720x1280 and 1080x1920 both behave.
     # - original_size pins libass script resolution to the actual video to avoid scaling surprises.
     if stl == "shorts":
-        fs = 28 if h >= 1600 else 24
-        margin_v = max(180, int(h * 0.14))     # ~270px at 1920h
-        margin_lr = max(70, int(w * 0.06))     # ~65px at 1080w
+        # Shorts-safe: always bottom-center with conservative safe-area margins.
+        # Never top/true-center (Shorts UI + overscan will clip).
+        fs = 54 if h >= 1900 else (44 if h >= 1600 else 38)
+        # Lower-third safe area. Clamp to a sane band to prevent drift.
+        margin_v = int(h * 0.11)  # ~211px at 1920h
+        margin_v = max(int(h * 0.08), min(margin_v, int(h * 0.16)))
+        margin_lr = int(w * 0.06)
+        margin_lr = max(int(w * 0.04), min(margin_lr, int(w * 0.08)))
         force = (
-            f"FontName=DejaVu Sans,FontSize={fs},Outline=2,Shadow=1,"
+            f"FontName=DejaVu Sans,FontSize={fs},Outline=3,Shadow=1,"
             f"Alignment=2,WrapStyle=2,MarginV={margin_v},MarginL={margin_lr},MarginR={margin_lr}"
         )
     else:
+
         fs = 30 if h >= 900 else 26
         margin_v = max(60, int(h * 0.06))
         margin_lr = max(50, int(w * 0.04))
@@ -1963,6 +1987,7 @@ def render_segment_mp4(
                         max_lines=cap_max_lines,
                     ).strip()
                 except Exception:
+                    # Whisper alignment failed; fall back to script-distribution.
                     srt_text = ""
 
         # Fallback: distribute captions across total duration (cheap, but not perfectly aligned).
@@ -2032,14 +2057,6 @@ def render_segment_mp4(
         try:
             if concat_path.exists():
                 concat_path.unlink()
-        except Exception:
-            pass
-        try:
-            if concat_path.exists():
-                try:
-                    concat_path.unlink()
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -2284,7 +2301,7 @@ def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
     """Resolve subtitle style to 'shorts' or 'standard'.
 
     Accepts:
-      - UI strings from app.py: 'Auto', 'Shorts (big, center)', 'Standard (bottom)'
+      - UI strings from app.py: 'Auto', 'Shorts (big, lower-safe)', 'Standard (bottom)'
       - canonical tokens: 'auto', 'shorts', 'standard'
     """
     w = int(width)
