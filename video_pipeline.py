@@ -1660,13 +1660,7 @@ def burn_subtitles_to_mp4(
     w = int(width)
     is_vertical = h > w
 
-    stl = (style or "auto").strip().lower()
-    if stl == "auto":
-        stl = "shorts" if is_vertical else "standard"
-    if stl.startswith("short"):
-        stl = "shorts"
-    if stl not in ("shorts", "standard"):
-        stl = "standard"
+    stl = _subtitle_style_resolved(style, width=w, height=h)
     # ASS force_style values:
     # Alignment: 2 = bottom center, 5 = middle center
     # WrapStyle=2 enables smart wrapping; MarginL/R create safe area.
@@ -2196,3 +2190,32 @@ def generate_all_segments_sequential(
 
 # Back-compat alias for older app.py calls
 _generate_all_segments_sequential = generate_all_segments_sequential
+
+
+def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
+    """Resolve subtitle style to 'shorts' or 'standard'.
+
+    Accepts:
+      - UI strings from app.py: 'Auto', 'Shorts (big, center)', 'Standard (bottom)'
+      - canonical tokens: 'auto', 'shorts', 'standard'
+    """
+    w = int(width)
+    h = int(height)
+    is_vertical = h > w
+
+    s = (style or "auto").strip().lower()
+
+    # Normalize common UI labels / aliases
+    if "auto" in s:
+        s = "auto"
+    elif "short" in s or "center" in s:
+        s = "shorts"
+    elif "standard" in s or "bottom" in s:
+        s = "standard"
+
+    if s == "auto":
+        return "shorts" if is_vertical else "standard"
+    if s.startswith("short"):
+        return "shorts"
+    return "standard"
+
