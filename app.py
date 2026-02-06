@@ -322,15 +322,27 @@ if uploaded is not None:
         segments = _normalize_segments(pairs)
 
         # Preflight: enforce audio pairing integrity (prevents runtime 'pair has no audio_path').
-        missing_audio = [p for p in segments if not str(p.get("audio_path") or "").strip()]
+        # NOTE: `segments` are app-normalized wrappers; the actual pairing lives in seg["pair"].
+        missing_audio = []
+        for seg in segments:
+            pair = (seg or {}).get("pair") or {}
+            ap = str(pair.get("audio_path") or "").strip()
+            sp = str(pair.get("script_path") or "").strip()
+            # Only enforce for script-backed segments; ignore rare audio-only rows.
+            if sp and not ap:
+                missing_audio.append(pair)
+
         if missing_audio:
-            labels = [vp.segment_label(p) + ": " + (Path(p.get("script_path") or "").name or "<no_script>") for p in missing_audio]
+            labels = [
+                vp.segment_label(p) + ": " + (Path(p.get("script_path") or "").name or "<no_script>")
+                for p in missing_audio
+            ]
             raise RuntimeError(
-    "One or more segments have no matched audio file in the ZIP. "
-    "Fix: ensure each script has a corresponding .mp3/.wav with the same stem, "
-    "or include enough audio files for every script."
-    "\n\nMissing audio for:\n- " + "\n- ".join(labels)
-)
+                "One or more segments have no matched audio file in the ZIP. "
+                "Fix: ensure each script has a corresponding .mp3/.wav with the same stem, "
+                "or include enough audio files for every script."
+                "\n\nMissing audio for:\n- " + "\n- ".join(labels)
+            )
 
         st.session_state.workdir = workdir
         st.session_state.extract_dir = extract_dir
