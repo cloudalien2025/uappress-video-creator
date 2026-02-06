@@ -1586,7 +1586,7 @@ def burn_subtitles_to_mp4(
     # Alignment: 2 = bottom center, 5 = middle center
     # MarginV helps avoid UI overlays (esp. Shorts).
     if stl == "shorts":
-        force = "FontName=DejaVu Sans,FontSize=56,Outline=3,Shadow=1,Alignment=5,MarginV=140"
+        force = "FontName=DejaVu Sans,FontSize=42,Outline=3,Shadow=1,Alignment=2,MarginV=180"
     else:
         force = "FontName=DejaVu Sans,FontSize=34,Outline=2,Shadow=1,Alignment=2,MarginV=64"
 
