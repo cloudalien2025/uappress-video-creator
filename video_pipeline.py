@@ -1621,6 +1621,67 @@ def build_srt_from_script(
 
     return "\n".join(lines).strip() + "\n"
 
+
+def build_srt_from_audio_whisper(
+    audio_path: Union[str, Path],
+    *,
+    api_key: str,
+    max_line_chars: int = 20,
+    max_lines: int = 2,
+) -> str:
+    """Best-effort SRT from audio using OpenAI transcription (Whisper).
+
+    Returns empty string on failure; caller should fall back to script-distributed SRT.
+    """
+    ap = Path(audio_path)
+    if not ap.exists() or ap.stat().st_size < 1024:
+        return ""
+
+    try:
+        client = OpenAI(api_key=api_key)
+        with ap.open("rb") as f:
+            # verbose_json includes segment-level timestamps
+            tr = client.audio.transcriptions.create(
+                model=os.environ.get("UAPPRESS_WHISPER_MODEL", "whisper-1"),
+                file=f,
+                response_format="verbose_json",
+            )
+        segments = getattr(tr, "segments", None) or tr.get("segments") if isinstance(tr, dict) else None
+        if not segments:
+            return ""
+
+        lines: List[str] = []
+        idx = 1
+        for seg in segments:
+            try:
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", start + 0.8))
+                txt = (seg.get("text") or "").strip()
+            except Exception:
+                continue
+
+            if not txt:
+                continue
+
+            cap = _wrap_caption_lines(txt, max_line_chars=int(max_line_chars), max_lines=int(max_lines))
+            if not cap:
+                continue
+
+            # Guard tiny / invalid ranges
+            if end <= start:
+                end = start + 0.40
+
+            lines.append(str(idx))
+            lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
+            lines.append(cap)
+            lines.append("")
+            idx += 1
+
+        return "\n".join(lines).strip() + "\n"
+    except Exception:
+        return ""
+
+
 def _ffmpeg_filter_escape(path: str) -> str:
     """Escape a filesystem path for ffmpeg filter arguments."""
     p = str(path)
@@ -1643,8 +1704,8 @@ def burn_subtitles_to_mp4(
 
     style:
       - 'auto' (Shorts style for vertical, Standard for horizontal)
-      - 'shorts' (big, center-ish)
-      - 'standard' (bottom)
+      - 'shorts' (large, lower-third safe)
+      - 'standard' (bottom safe)
     """
     src = Path(src_mp4)
     srt = Path(srt_path)
@@ -1656,31 +1717,38 @@ def burn_subtitles_to_mp4(
     if not srt.exists():
         raise FileNotFoundError(str(srt))
 
-    h = int(height)
     w = int(width)
-    is_vertical = h > w
+    h = int(height)
 
     stl = _subtitle_style_resolved(style, width=w, height=h)
-    # ASS force_style values:
-    # Alignment: 2 = bottom center, 5 = middle center
-    # WrapStyle=2 enables smart wrapping; MarginL/R create safe area.
-    # For 9:16 big subtitles, we keep font size conservative to prevent edge clipping.
+
+    # IMPORTANT:
+    # - For Shorts, we prefer LOWER-THIRD (Alignment=2) with a generous vertical margin.
+    #   Many players overlay UI controls near the bottom; raising the baseline prevents apparent "cutoff".
+    # - Use proportional margins so 720x1280 and 1080x1920 both behave.
+    # - original_size pins libass script resolution to the actual video to avoid scaling surprises.
     if stl == "shorts":
-        # Vertical outputs: reduce font a bit and force tighter safe margins.
-        # Height-based sizing keeps 720x1280 readable without clipping.
-        fs = 26 if int(height) >= 1600 else 22
+        fs = 28 if h >= 1600 else 24
+        margin_v = max(180, int(h * 0.14))     # ~270px at 1920h
+        margin_lr = max(70, int(w * 0.06))     # ~65px at 1080w
         force = (
             f"FontName=DejaVu Sans,FontSize={fs},Outline=2,Shadow=1,"
-            "Alignment=5,WrapStyle=2,MarginV=200,MarginL=80,MarginR=80"
+            f"Alignment=2,WrapStyle=2,MarginV={margin_v},MarginL={margin_lr},MarginR={margin_lr}"
         )
     else:
-        fs = 30 if int(height) >= 900 else 26
+        fs = 30 if h >= 900 else 26
+        margin_v = max(60, int(h * 0.06))
+        margin_lr = max(50, int(w * 0.04))
         force = (
             f"FontName=DejaVu Sans,FontSize={fs},Outline=2,Shadow=1,"
-            "Alignment=2,WrapStyle=2,MarginV=70,MarginL=60,MarginR=60"
+            f"Alignment=2,WrapStyle=2,MarginV={margin_v},MarginL={margin_lr},MarginR={margin_lr}"
         )
 
-    vf = f"subtitles='{_ffmpeg_filter_escape(str(srt))}':force_style='{force}'"
+    vf = (
+        f"subtitles='{_ffmpeg_filter_escape(str(srt))}':"
+        f"original_size={w}x{h}:"
+        f"force_style='{force}'"
+    )
 
     ff = which_ffmpeg()
     cmd = [
@@ -1710,7 +1778,6 @@ def burn_subtitles_to_mp4(
     if not dst.exists() or dst.stat().st_size < 4096:
         raise RuntimeError("Subtitle burn failed (output missing or too small).")
     return dst
-
 
 # ----------------------------
 # The app.py-compatible segment renderer
@@ -1880,14 +1947,35 @@ def render_segment_mp4(
             cap_max_line_chars = 44
             cap_max_lines = 1
 
-        srt_text = build_srt_from_script(
-            script_text,
-            total_seconds=total_for_srt,
-            max_words=cap_max_words,
-            max_chars=cap_max_chars,
-            max_line_chars=cap_max_line_chars,
-            max_lines=cap_max_lines,
-        ).strip()
+        # Prefer audio-aligned subtitles when possible (fixes drift vs narration).
+        # Controlled via env var:
+        #   UAPPRESS_SUBTITLE_SYNC = 'whisper' (default) | 'script' | 'off'
+        srt_text = ""
+        sync_mode = (os.environ.get("UAPPRESS_SUBTITLE_SYNC", "whisper") or "whisper").strip().lower()
+
+        if sync_mode not in ("off", "false", "0", "none", ""):
+            if sync_mode in ("whisper", "auto"):
+                try:
+                    srt_text = build_srt_from_audio_whisper(
+                        audio_path,
+                        api_key=api_key,
+                        max_line_chars=cap_max_line_chars,
+                        max_lines=cap_max_lines,
+                    ).strip()
+                except Exception:
+                    srt_text = ""
+
+        # Fallback: distribute captions across total duration (cheap, but not perfectly aligned).
+        if not srt_text:
+            srt_text = build_srt_from_script(
+                script_text,
+                total_seconds=total_for_srt,
+                max_words=cap_max_words,
+                max_chars=cap_max_chars,
+                max_line_chars=cap_max_line_chars,
+                max_lines=cap_max_lines,
+            ).strip()
+
         if not srt_text:
             raise RuntimeError("Subtitles requested, but SRT generation produced empty output.")
 
