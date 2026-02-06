@@ -1404,43 +1404,38 @@ def validate_mp4(path: str, *, require_audio: bool = True, min_bytes: int = 50_0
 
 # ----------------------------
 # Subtitles (Burn-in) — helpers
-
-
-def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
-    """Normalize subtitle style strings to one of: 'shorts', 'standard'.
-
-    Accepts app.py UI values:
-      - 'Auto'
-      - 'Shorts (big, center)'
-      - 'Standard (bottom)'
-
-    Also accepts:
-      - 'shorts' / 'standard' / 'auto' (any casing)
-
-    Auto selects 'shorts' for vertical outputs (height > width), otherwise 'standard'.
-    """
-    s = (style or "auto").strip().lower()
-    if s in ("auto", ""):
-        return "shorts" if int(height) > int(width) else "standard"
-    if s.startswith("short"):
-        return "shorts"
-    if s.startswith("stand"):
-        return "standard"
-    # Unknown -> safe default based on aspect
-    return "shorts" if int(height) > int(width) else "standard"
 # ----------------------------
+
+def _normalize_caption_text(t: str) -> str:
+    """Normalize text for subtitle legibility + libass wrapping.
+
+    Key fix for 'cutoff' in Shorts:
+    - libass will NOT wrap long tokens that contain no spaces (e.g., 'stories—after').
+      We normalize dash-like characters to include spaces so line breaks can occur.
+    """
+    s = (t or "").strip()
+    if not s:
+        return ""
+    # Normalize dash variants to spaced em dash
+    s = s.replace("\u2014", " — ").replace("\u2013", " — ").replace("\u2212", " — ")
+    # Common punctuation spacing to encourage wraps
+    s = s.replace("/", " / ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 
 def _split_text_for_captions(text: str, *, max_words: int = 6, max_chars: int = 44) -> List[str]:
     """Split narration text into short, readable caption chunks.
 
-    This is intentionally heuristic (no extra model calls).
-    Goal: 'Shorts-style' readability, not verbatim transcription.
+    Heuristic (no extra model calls). Optimized for Shorts readability.
+
+    IMPORTANT:
+    - We normalize dash characters to include spaces, otherwise libass may not wrap
+      and text can get clipped off-screen (e.g., 'stories—after').
     """
-    t = (text or "").strip()
+    t = _normalize_caption_text(text)
     if not t:
         return []
-    # Normalize whitespace
-    t = re.sub(r"\s+", " ", t).strip()
 
     # Sentence-ish split
     parts = re.split(r"(?<=[\.\!\?])\s+", t)
@@ -1450,12 +1445,14 @@ def _split_text_for_captions(text: str, *, max_words: int = 6, max_chars: int = 
         s = sent.strip()
         if not s:
             continue
+
         # Break long sentences by commas/semicolons first
         subparts = re.split(r"(?<=[,;:])\s+", s)
         for sp in subparts:
             sp = sp.strip()
             if not sp:
                 continue
+
             words = sp.split()
             if not words:
                 continue
@@ -1470,26 +1467,28 @@ def _split_text_for_captions(text: str, *, max_words: int = 6, max_chars: int = 
             if cur:
                 chunks.append(" ".join(cur).strip())
 
-    # Final cleanup: enforce max_chars by hard wrap
+    # Final cleanup: enforce max_chars by hard wrap at spaces (fallback to hard split)
     final: List[str] = []
+    mc = int(max_chars)
     for c in chunks:
         c = (c or "").strip()
         if not c:
             continue
-        if len(c) <= int(max_chars):
+        if len(c) <= mc:
             final.append(c)
-        else:
-            # Hard wrap at nearest space
-            while len(c) > int(max_chars):
-                cut = c.rfind(" ", 0, int(max_chars))
-                if cut <= 0:
-                    cut = int(max_chars)
-                final.append(c[:cut].strip())
-                c = c[cut:].strip()
-            if c:
-                final.append(c)
-    return final
+            continue
 
+        # Prefer splitting at spaces
+        while len(c) > mc:
+            cut = c.rfind(" ", 0, mc)
+            if cut <= 0:
+                cut = mc
+            final.append(c[:cut].strip())
+            c = c[cut:].strip()
+        if c:
+            final.append(c)
+
+    return final
 
 def _format_srt_time(seconds: float) -> str:
     s = max(0.0, float(seconds))
@@ -1501,6 +1500,61 @@ def _format_srt_time(seconds: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
 
+def _wrap_caption_lines(c: str, *, max_line_chars: int, max_lines: int = 2) -> str:
+    """Insert line breaks so captions stay inside safe margins.
+
+    libass wrapping is space-dependent; we proactively insert '\n' to:
+    - keep lines short (especially for 9:16 big subtitles)
+    - avoid right-edge clipping on long tokens / hyphenated phrases
+    """
+    s = _normalize_caption_text(c)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    mlc = max(10, int(max_line_chars))
+    ml = max(1, int(max_lines))
+
+    # Already short enough
+    if len(s) <= mlc:
+        return s
+
+    lines: List[str] = []
+    remaining = s
+
+    while remaining and len(lines) < ml:
+        if len(remaining) <= mlc:
+            lines.append(remaining.strip())
+            remaining = ""
+            break
+
+        # Prefer break at last space within limit
+        cut = remaining.rfind(" ", 0, mlc + 1)
+        if cut <= 0:
+            # Try break at em dash (now spaced) or punctuation
+            dash = remaining.find(" — ")
+            if 0 < dash < (mlc + 1):
+                cut = dash + 1
+            else:
+                cut = mlc
+
+        lines.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+
+    # If we still have remaining text, append to last line with ellipsis
+    if remaining:
+        if lines:
+            lines[-1] = (lines[-1] + " " + remaining).strip()
+        else:
+            lines = [remaining.strip()]
+
+    # Final safety: if last line is still too long, truncate a bit
+    if lines and len(lines[-1]) > mlc * 2:
+        lines[-1] = lines[-1][: (mlc * 2 - 1)].rstrip() + "…"
+
+    return "\n".join(lines)
+
+
 def build_srt_from_script(
     script_text: str,
     *,
@@ -1509,6 +1563,8 @@ def build_srt_from_script(
     max_caption_s: float = 2.80,
     max_words: int = 6,
     max_chars: int = 44,
+    max_line_chars: Optional[int] = None,
+    max_lines: int = 2,
 ) -> str:
     """Create SRT text by distributing caption chunks across total_seconds."""
     chunks = _split_text_for_captions(script_text, max_words=int(max_words), max_chars=int(max_chars))
@@ -1537,6 +1593,9 @@ def build_srt_from_script(
     scale = total_seconds / max(0.001, sum(durs))
     durs = [d * scale for d in durs]
 
+    # Line wrapping settings
+    mlc = int(max_line_chars) if max_line_chars is not None else int(max_chars)
+
     # Build SRT entries
     lines: List[str] = []
     t = 0.0
@@ -1549,9 +1608,11 @@ def build_srt_from_script(
         if end - start < 0.25:
             end = min(total_seconds, start + 0.25)
 
+        cap = _wrap_caption_lines(c, max_line_chars=mlc, max_lines=int(max_lines))
+
         lines.append(str(i))
         lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
-        lines.append(c)
+        lines.append(cap)
         lines.append("")  # blank line
         t = end
 
@@ -1559,7 +1620,6 @@ def build_srt_from_script(
             break
 
     return "\n".join(lines).strip() + "\n"
-
 
 def _ffmpeg_filter_escape(path: str) -> str:
     """Escape a filesystem path for ffmpeg filter arguments."""
@@ -1607,14 +1667,24 @@ def burn_subtitles_to_mp4(
         stl = "shorts"
     if stl not in ("shorts", "standard"):
         stl = "standard"
-
     # ASS force_style values:
     # Alignment: 2 = bottom center, 5 = middle center
-    # MarginV helps avoid UI overlays (esp. Shorts).
+    # WrapStyle=2 enables smart wrapping; MarginL/R create safe area.
+    # For 9:16 big subtitles, we keep font size conservative to prevent edge clipping.
     if stl == "shorts":
-        force = "FontName=DejaVu Sans,FontSize=32,Outline=2,Shadow=1,Alignment=2,MarginV=140"
+        # Vertical outputs: reduce font a bit and force tighter safe margins.
+        # Height-based sizing keeps 720x1280 readable without clipping.
+        fs = 26 if int(height) >= 1600 else 22
+        force = (
+            f"FontName=DejaVu Sans,FontSize={fs},Outline=2,Shadow=1,"
+            "Alignment=5,WrapStyle=2,MarginV=200,MarginL=80,MarginR=80"
+        )
     else:
-        force = "FontName=DejaVu Sans,FontSize=34,Outline=2,Shadow=1,Alignment=2,MarginV=64"
+        fs = 30 if int(height) >= 900 else 26
+        force = (
+            f"FontName=DejaVu Sans,FontSize={fs},Outline=2,Shadow=1,"
+            "Alignment=2,WrapStyle=2,MarginV=70,MarginL=60,MarginR=60"
+        )
 
     vf = f"subtitles='{_ffmpeg_filter_escape(str(srt))}':force_style='{force}'"
 
@@ -1798,17 +1868,32 @@ def render_segment_mp4(
             is_vertical = False
 
         stl = _subtitle_style_resolved(subtitle_style, width=int(width), height=int(height))
+
+        # Caption chunking + wrapping tuned by aspect/style to prevent edge clipping.
         if is_vertical and stl == "shorts":
             cap_max_words = 5
             cap_max_chars = 28
+            cap_max_line_chars = 16   # keep each line short for big center subtitles
+            cap_max_lines = 2
         elif is_vertical:
             cap_max_words = 6
             cap_max_chars = 34
+            cap_max_line_chars = 20
+            cap_max_lines = 2
         else:
             cap_max_words = 6
             cap_max_chars = 44
+            cap_max_line_chars = 44
+            cap_max_lines = 1
 
-        srt_text = build_srt_from_script(script_text, total_seconds=total_for_srt, max_words=cap_max_words, max_chars=cap_max_chars).strip()
+        srt_text = build_srt_from_script(
+            script_text,
+            total_seconds=total_for_srt,
+            max_words=cap_max_words,
+            max_chars=cap_max_chars,
+            max_line_chars=cap_max_line_chars,
+            max_lines=cap_max_lines,
+        ).strip()
         if not srt_text:
             raise RuntimeError("Subtitles requested, but SRT generation produced empty output.")
 
@@ -1821,7 +1906,13 @@ def render_segment_mp4(
             srt_path.write_text(srt_text, encoding="utf-8")
 
         tmp_out = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
-        style_norm = _subtitle_style_resolved(subtitle_style, width=int(width), height=int(height))
+        style_norm = (subtitle_style or "Auto").strip().lower()
+        if style_norm.startswith("short"):
+            style_norm = "shorts"
+        elif style_norm.startswith("standard"):
+            style_norm = "standard"
+        else:
+            style_norm = "auto"
 
         burn_subtitles_to_mp4(
             src_mp4=out_path_p,
