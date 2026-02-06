@@ -2098,7 +2098,7 @@ def render_segment_mp4(
     # 3) concatenate
     concat_path = out_path_p.with_name(out_path_p.stem + "_concat.mp4")
     concat_video_clips(clip_paths, concat_path)
-    ok, why = validate_mp4(concat_path)
+    ok, why = validate_mp4(str(concat_path), require_audio=False)
     if not ok:
         raise RuntimeError(f"Concat MP4 validation failed: {why}")
 
