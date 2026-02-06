@@ -1050,7 +1050,7 @@ colSub1, colSub2, colSub3 = st.columns([1, 1, 1])
 with colSub1:
     burn_subtitles = st.checkbox(
         "Burn subtitles into MP4 (hardcode)",
-        value=bool(st.session_state.get("burn_subtitles", False)),
+        value=bool(st.session_state.get("burn_subtitles", True)),
         disabled=st.session_state["is_generating"],
         help="Renders captions into the video so they show everywhere (YouTube Shorts, CapCut, Instagram).",
         key="burn_subtitles",
