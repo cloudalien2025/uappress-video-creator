@@ -41,7 +41,7 @@ from botocore.exceptions import ClientError
 # ----------------------------
 st.set_page_config(page_title="UAPpress — Video Creator", layout="wide")
 st.title("🛸 UAPpress — Video Creator")
-st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (no subs, no logos, no stitching).")
+st.caption("Upload a TTS Studio ZIP → Generate segment MP4s (optional burned-in subtitles; no logos; no stitching).")
 
 
 
@@ -100,6 +100,16 @@ if "shorts_make_vertical" not in st.session_state:
 # NEW: upload-only bonus source persistence
 if "bonus_uploaded_mp4s" not in st.session_state:
     st.session_state["bonus_uploaded_mp4s"] = []  # list[str] (absolute paths)
+
+
+# Subtitles (burn-in) state
+if "burn_subtitles" not in st.session_state:
+    st.session_state["burn_subtitles"] = False
+if "subtitle_style" not in st.session_state:
+    st.session_state["subtitle_style"] = "Auto"
+if "export_srt" not in st.session_state:
+    st.session_state["export_srt"] = False
+
 
 
 with st.sidebar:
@@ -661,6 +671,9 @@ def generate_all_segments_sequential(
     auto_upload: bool,
     make_public: bool,
     prefix_override: str,
+    burn_subtitles: bool,
+    subtitle_style: str,
+    export_srt: bool,
 ) -> list[str]:
     st.session_state["is_generating"] = True
     st.session_state["stop_requested"] = False
@@ -769,6 +782,9 @@ def generate_all_segments_sequential(
                 min_scene_seconds=int(min_scene_seconds),
                 max_scene_seconds=int(max_scene_seconds),
 
+                burn_subtitles=bool(burn_subtitles),
+                subtitle_style=str(subtitle_style or "Auto"),
+                export_srt=bool(export_srt),
             )
 
             st.session_state["generated"][seg_key] = out_path
@@ -1003,6 +1019,40 @@ with colF:
         key="max_scene_seconds",
     )
 
+
+st.markdown("---")
+st.subheader("📝 Subtitles (optional)")
+
+colSub1, colSub2, colSub3 = st.columns([1, 1, 1])
+with colSub1:
+    burn_subtitles = st.checkbox(
+        "Burn subtitles into MP4 (hardcode)",
+        value=bool(st.session_state.get("burn_subtitles", False)),
+        disabled=st.session_state["is_generating"],
+        help="Renders captions into the video so they show everywhere (YouTube Shorts, CapCut, Instagram).",
+        key="burn_subtitles",
+    )
+with colSub2:
+    # Style options are intentionally simple + safe for Streamlit Cloud (libass).
+    # Auto chooses Shorts style when in 9:16 mode, otherwise Standard.
+    subtitle_style = st.selectbox(
+        "Subtitle style",
+        options=["Auto", "Shorts (big, center)", "Standard (bottom)"],
+        index=["Auto", "Shorts (big, center)", "Standard (bottom)"].index(st.session_state.get("subtitle_style", "Auto")),
+        disabled=st.session_state["is_generating"] or not bool(burn_subtitles),
+        key="subtitle_style",
+        help="Shorts style is larger and placed near center to avoid UI overlays.",
+    )
+with colSub3:
+    export_srt = st.checkbox(
+        "Also save .srt file next to MP4",
+        value=bool(st.session_state.get("export_srt", False)),
+        disabled=st.session_state["is_generating"] or not bool(burn_subtitles),
+        key="export_srt",
+        help="Creates a sidecar SRT file for uploads/editing. MP4 will still have burned-in subtitles.",
+    )
+
+
 st.markdown("---")
 st.subheader("☁️ DigitalOcean Spaces (Auto-upload)")
 
@@ -1079,6 +1129,9 @@ if generate_clicked:
                 auto_upload=auto_upload,
                 make_public=make_public,
                 prefix_override=prefix_override,
+                burn_subtitles=bool(st.session_state.get('burn_subtitles', False)),
+                subtitle_style=str(st.session_state.get('subtitle_style', 'Auto')),
+                export_srt=bool(st.session_state.get('export_srt', False)),
             )
             st.session_state["render_results"] = results or []
         finally:
