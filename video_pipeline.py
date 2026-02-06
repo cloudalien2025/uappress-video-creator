@@ -1792,7 +1792,7 @@ def _srt_to_ass(
     # Safe sizing
     if stl == "shorts":
         # Big, but never "title at top". Keep in lower third safe area.
-        fs = 64 if h >= 1900 else (52 if h >= 1600 else 44)
+        fs = 52 if h >= 1900 else (46 if h >= 1600 else 40)
         margin_v = int(h * 0.12)
         margin_v = max(int(h * 0.10), min(margin_v, int(h * 0.18)))
         margin_lr = int(w * 0.07)
@@ -1874,7 +1874,7 @@ def burn_subtitles_to_mp4(
     tmp_ass = dst.with_suffix(".tmp.ass")
     tmp_ass.write_text(ass_text, encoding="utf-8")
 
-    vf = f"ass='{_ffmpeg_filter_escape(str(tmp_ass))}'"
+    vf = f"ass={_ffmpeg_filter_escape(str(tmp_ass))}"
 
     ff = which_ffmpeg()
     cmd = [
@@ -1940,3 +1940,299 @@ def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
         return "shorts"
     return "standard"
 
+
+# ===============================================================
+# Public segment render API (app.py expects this)
+# ===============================================================
+
+def _compute_scene_durations(
+    total_seconds: float,
+    n_scenes: int,
+    *,
+    min_scene_seconds: float,
+    max_scene_seconds: float,
+) -> List[float]:
+    """
+    Allocate scene durations that sum exactly to total_seconds, while respecting per-scene
+    min/max bounds (best-effort by reducing n_scenes if needed).
+
+    Strategy:
+      - Choose the largest n <= n_scenes such that n*min <= total <= n*max (if possible).
+      - Initialize all scenes at min, then distribute remaining seconds up to max.
+      - Any leftover fractional drift is applied to the final scene.
+    """
+    total = max(0.01, float(total_seconds))
+    n = max(1, int(n_scenes))
+    mn = max(0.05, float(min_scene_seconds))
+    mx = max(mn, float(max_scene_seconds))
+
+    # Reduce n until feasible or n == 1
+    while n > 1 and (n * mn > total or n * mx < total):
+        n -= 1
+
+    # If still infeasible (extremely short/long), clamp behavior:
+    if n * mn > total:
+        # Total is too short; return one scene of total.
+        return [total]
+    if n * mx < total:
+        # Total is too long; cap all to mx and let last one carry remainder (will exceed mx, but avoids crash).
+        base = [mx] * n
+        rem = total - (mx * n)
+        base[-1] += rem
+        return base
+
+    d = [mn] * n
+    remaining = total - (mn * n)
+
+    per_cap = mx - mn
+    i = 0
+    while remaining > 1e-6 and i < n:
+        add = min(per_cap, remaining)
+        d[i] += add
+        remaining -= add
+        i += 1
+        if i >= n and remaining > 1e-6:
+            # Wrap around distributing any leftover (rare)
+            i = 0
+            per_cap = max(0.0, per_cap)
+            if per_cap <= 1e-9:
+                break
+
+    # Apply any tiny float drift to last scene
+    drift = total - sum(d)
+    d[-1] += drift
+
+    # Safety: no negative
+    d = [max(0.05, float(x)) for x in d]
+    return d
+
+
+def render_segment_mp4(
+    *,
+    pair: Dict[str, Any],
+    extract_dir: Union[str, Path],
+    out_path: Union[str, Path],
+    api_key: str,
+    fps: int,
+    width: int,
+    height: int,
+    zoom_strength: float,
+    max_scenes: int,
+    min_scene_seconds: int,
+    max_scene_seconds: int,
+    burn_subtitles: bool = False,
+    subtitle_style: str = "Auto",
+    export_srt: bool = False,
+) -> Path:
+    """
+    Render ONE segment MP4, keeping the locked pipeline order:
+      images → scene clips → concatenate → mux audio → (optional) burn subtitles
+
+    Hard requirements:
+    - No black video: scene clips are real frames from still images via zoompan.
+    - Audio-driven timing: scene durations are allocated from audio duration.
+    - End buffer: mux step pads exactly 0.50–0.75s (see mux_audio_to_video()).
+    - Output integrity: validates MP4 existence/streams; raises on failure.
+    """
+    out_path_p = Path(out_path)
+    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+
+    pair = dict(pair or {})
+    script_path = str(pair.get("script_path") or "").strip()
+    audio_path = str(pair.get("audio_path") or "").strip()
+
+    if not script_path or not Path(script_path).is_file():
+        raise FileNotFoundError(f"Segment script missing: {script_path}")
+    if not audio_path or not Path(audio_path).is_file():
+        raise FileNotFoundError(f"Segment audio missing: {audio_path}")
+
+    # Duration (audio-driven)
+    audio_seconds = float(ffprobe_duration_seconds(audio_path))
+    if audio_seconds <= 0:
+        raise RuntimeError(f"Could not determine audio duration for: {audio_path}")
+
+    # 1) images
+    images = _generate_segment_images(
+        api_key=str(api_key),
+        extract_dir=extract_dir,
+        pair=pair,
+        width=int(width),
+        height=int(height),
+        max_scenes=int(max_scenes),
+    )
+    if not images:
+        raise RuntimeError("Image generation returned no images for this segment.")
+
+    # 2) scene clips (durations sum to audio_seconds)
+    durs = _compute_scene_durations(
+        audio_seconds,
+        n_scenes=min(len(images), clamp_int(int(max_scenes), 1, 120)),
+        min_scene_seconds=float(min_scene_seconds),
+        max_scene_seconds=float(max_scene_seconds),
+    )
+    n_use = min(len(images), len(durs))
+    images = images[:n_use]
+    durs = durs[:n_use]
+
+    # Clip directory (segment-scoped)
+    extract_dir_p = Path(extract_dir)
+    clips_dir = ensure_dir(extract_dir_p / "_clips" / safe_slug(segment_label(pair), max_len=60))
+    clip_paths: List[Path] = []
+
+    for idx, (img, dur) in enumerate(zip(images, durs), start=1):
+        clip_out = clips_dir / f"clip_{idx:03d}.mp4"
+        build_scene_clip_from_image(
+            image_path=img,
+            out_mp4_path=clip_out,
+            duration_s=float(dur),
+            width=int(width),
+            height=int(height),
+            fps=int(fps),
+            zoom_strength=float(zoom_strength),
+        )
+        clip_paths.append(clip_out)
+
+    if not clip_paths:
+        raise RuntimeError("No scene clips were produced.")
+
+    # 3) concatenate
+    concat_path = out_path_p.with_name(out_path_p.stem + "_concat.mp4")
+    concat_video_clips(clip_paths, concat_path)
+    ok, why = validate_mp4(concat_path)
+    if not ok:
+        raise RuntimeError(f"Concat MP4 validation failed: {why}")
+
+    # 4) mux audio (adds strict end buffer internally)
+    mux_path = out_path_p.with_name(out_path_p.stem + "_mux.mp4")
+    mux_audio_to_video(
+        video_path=concat_path,
+        audio_path=audio_path,
+        out_mp4_path=mux_path,
+        end_buffer_s=_DEFAULT_END_BUFFER,
+        audio_seconds=audio_seconds,
+    )
+    ok, why = validate_mp4(mux_path)
+    if not ok:
+        raise RuntimeError(f"Mux MP4 validation failed: {why}")
+
+    # 5) optional subtitles (burn after mux)
+    final_path = mux_path
+
+    if burn_subtitles:
+        # Build SRT (prefer Whisper alignment unless disabled)
+        script_text = load_segment_script(script_path)
+        total_for_srt = float(audio_seconds)
+
+        # Caption chunking based on aspect/style to avoid edge clipping.
+        stl = _subtitle_style_resolved(subtitle_style, width=int(width), height=int(height))
+        is_vertical = int(height) > int(width)
+
+        if is_vertical and stl == "shorts":
+            cap_max_words = 5
+            cap_max_chars = 28
+            cap_max_line_chars = 16
+            cap_max_lines = 2
+        elif is_vertical:
+            cap_max_words = 6
+            cap_max_chars = 34
+            cap_max_line_chars = 20
+            cap_max_lines = 2
+        else:
+            cap_max_words = 6
+            cap_max_chars = 44
+            cap_max_line_chars = 44
+            cap_max_lines = 1
+
+        srt_text = ""
+        sync_mode = (os.environ.get("UAPPRESS_SUBTITLE_SYNC", "whisper") or "whisper").strip().lower()
+        if sync_mode not in ("off", "false", "0", "none", ""):
+            if sync_mode in ("whisper", "auto"):
+                try:
+                    srt_text = build_srt_from_audio_whisper(
+                        audio_path,
+                        api_key=str(api_key),
+                        max_line_chars=cap_max_line_chars,
+                        max_lines=cap_max_lines,
+                    ).strip()
+                except Exception:
+                    srt_text = ""
+
+        if not srt_text:
+            srt_text = build_srt_from_script(
+                script_text,
+                total_seconds=total_for_srt,
+                max_words=cap_max_words,
+                max_chars=cap_max_chars,
+                max_line_chars=cap_max_line_chars,
+                max_lines=cap_max_lines,
+            ).strip()
+
+        if not srt_text:
+            raise RuntimeError("Subtitles requested, but SRT generation produced empty output.")
+
+        # Write SRT next to output if requested, otherwise temp.
+        srt_path = out_path_p.with_suffix(".srt")
+        if export_srt:
+            srt_path.write_text(srt_text, encoding="utf-8")
+        else:
+            tmp_srt_dir = ensure_dir(extract_dir_p / "_subs")
+            srt_path = tmp_srt_dir / (out_path_p.stem + ".srt")
+            srt_path.write_text(srt_text, encoding="utf-8")
+
+        subbed_path = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
+        burn_subtitles_to_mp4(
+            src_mp4=final_path,
+            srt_path=srt_path,
+            dst_mp4=subbed_path,
+            style=str(subtitle_style or "Auto"),
+            width=int(width),
+            height=int(height),
+        )
+        ok, why = validate_mp4(subbed_path)
+        if not ok:
+            raise RuntimeError(f"Subtitle-burn MP4 validation failed: {why}")
+
+        final_path = subbed_path
+
+    # Replace destination atomically
+    if out_path_p.exists():
+        try:
+            out_path_p.unlink()
+        except Exception:
+            pass
+    final_path.replace(out_path_p)
+
+    # Final validation gate
+    ok, why = validate_mp4(out_path_p)
+    if not ok:
+        raise RuntimeError(f"Final MP4 validation failed: {why}")
+
+    # Cleanup intermediate files best-effort
+    for p in (concat_path, mux_path):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    return out_path_p
+
+
+# Backwards-compat aliases (app.py may probe for these names)
+def render_segment_video(**kwargs):  # type: ignore
+    return render_segment_mp4(**kwargs)
+
+def render_segment(**kwargs):  # type: ignore
+    return render_segment_mp4(**kwargs)
+
+def render_mp4_segment(**kwargs):  # type: ignore
+    return render_segment_mp4(**kwargs)
+
+def make_segment_mp4(**kwargs):  # type: ignore
+    return render_segment_mp4(**kwargs)
+
+def build_segment_mp4(**kwargs):  # type: ignore
+    return render_segment_mp4(**kwargs)
+
+def create_segment_mp4(**kwargs):  # type: ignore
+    return render_segment_mp4(**kwargs)
