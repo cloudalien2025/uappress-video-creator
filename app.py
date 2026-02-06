@@ -1060,11 +1060,11 @@ with colSub2:
     # Auto chooses Shorts style when in 9:16 mode, otherwise Standard.
     subtitle_style = st.selectbox(
         "Subtitle style",
-        options=["Auto", "Shorts (big, center)", "Standard (bottom)"],
-        index=["Auto", "Shorts (big, center)", "Standard (bottom)"].index(st.session_state.get("subtitle_style", "Auto")),
+        options=["Auto", "Shorts (big, lower-safe)", "Standard (bottom)"],
+        index=["Auto", "Shorts (big, lower-safe)", "Standard (bottom)"].index(st.session_state.get("subtitle_style", "Auto")),
         disabled=st.session_state["is_generating"] or not bool(burn_subtitles),
         key="subtitle_style",
-        help="Shorts style is larger and placed near center to avoid UI overlays.",
+        help="Shorts style is larger and placed in the lower-third SAFE area (never top/true-center) to avoid Shorts UI cutoffs.",
     )
 with colSub3:
     export_srt = st.checkbox(
