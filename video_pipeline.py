@@ -881,6 +881,96 @@ _FREE_ROLL_SCENE_TYPES: Dict[str, str] = {
     "ATMOSPHERE": "neutral b-roll atmosphere (night sky, clouds, empty road, lights, terrain), restrained and calm",
 }
 
+# ----------------------------
+# Editorial Beat Routing (Intent Layer)
+# ----------------------------
+# Zero-token, deterministic "why this shot" layer.
+# This is NOT a ban-list. It is a positive editorial purpose signal used to
+# shape what is shown, so visuals feel intentional and documentary-grade.
+
+_EDITORIAL_BEATS: Dict[str, str] = {
+    "ESTABLISH": "Orient the viewer with place, time-of-day, and institutional context.",
+    "EVIDENCE": "Show credible artifacts that support claims: documents, photos, files, maps, records.",
+    "PROCESS": "Show how information is produced or analyzed: radar scopes, logbooks, maps, radios, investigative work.",
+    "HUMAN": "Show the human stake without identities: silhouettes, hands, notebooks, observers, quiet tension.",
+    "DOUBT": "Show uncertainty and limits: missing pages, redactions, empty archives, conflicting notes, unresolved spaces.",
+}
+
+# Editorial anchors (positive, reusable). Used preferentially when beat is clear.
+_ANCHORS_BY_BEAT: Dict[str, List[str]] = {
+    "ESTABLISH": [
+        "a guarded base gate with period-appropriate signage and a small guard booth",
+        "a quiet airfield perimeter at dusk with service lights and distant hangars",
+        "a rural two-lane road approaching a restricted facility under overcast skies",
+        "a wide establishing view of an institutional compound boundary and access road",
+    ],
+    "EVIDENCE": [
+        "a tabletop evidence layout: folders, stamped paperwork, and a map with marked coordinates",
+        "archival documents spread on a desk under a practical lamp, with a notepad and pen nearby",
+        "a close view of a file folder beside photographs and a clipped report, shallow depth of field",
+        "a stack of reports and an index card box on an archival table, documentary lighting",
+    ],
+    "PROCESS": [
+        "a radar or operations room environment with period-appropriate equipment and dim practical lighting",
+        "a logbook open to handwritten entries beside a radio handset and frequency notes",
+        "a wall map with pins and string, an investigator’s hand marking a location",
+        "a filing cabinet drawer open with labeled folders in a calm institutional interior",
+    ],
+    "HUMAN": [
+        "a witness perspective from behind, looking out toward distant lights, face not visible",
+        "hands holding a notebook with handwritten notes, interior practical lighting",
+        "a lone figure silhouette in an office doorway, quiet tension, no identifiable features",
+        "a seated interviewer’s viewpoint across a table with papers and a recorder, faces out of frame",
+    ],
+    "DOUBT": [
+        "a document with heavy redactions on a desk, clipped alongside an incomplete memo",
+        "an empty archive room with open drawers and missing folders, subdued institutional lighting",
+        "a torn or partially missing page on a table beside a logbook, unresolved mood",
+        "a corkboard of conflicting notes and timelines, some gaps left blank, investigative atmosphere",
+    ],
+}
+
+def _editorial_beat(beat: str, j: int) -> str:
+    """Deterministic editorial intent router (no tokens, no extra model calls)."""
+    b = (beat or "").lower()
+    score: Dict[str, int] = {k: 0 for k in _EDITORIAL_BEATS.keys()}
+
+    def add(k: str, pts: int) -> None:
+        if k in score:
+            score[k] += int(pts)
+
+    # Evidence signals
+    if re.search(r"\b(memo|memorandum|report|file|files|document|documents|declassified|classified|telegram|teletype|dispatch|archive|archival|newspaper|headline|foia|record|records|photograph|photo|photos|map|maps)\b", b):
+        add("EVIDENCE", 6)
+
+    # Process signals
+    if re.search(r"\b(radar|scope|blip|atc|tower|controller|logbook|logs|transcript|tape|audio|frequency|comms|communications|analysis|analyze|investigation|investigators|timeline|triangulate)\b", b):
+        add("PROCESS", 6)
+
+    # Human signals
+    if re.search(r"\b(witness|witnesses|testimony|interview|statement|recalled|reported|saw|heard|felt|fear|panic|confused|startled)\b", b):
+        add("HUMAN", 5)
+
+    # Doubt/uncertainty signals
+    if re.search(r"\b(uncertain|unclear|unknown|disputed|contradict|contradiction|incomplete|missing|redacted|withheld|classified|unverified|rumor|speculation|alleged|cannot confirm|no record)\b", b):
+        add("DOUBT", 5)
+
+    # Establishing signals
+    if re.search(r"\b(base|airfield|runway|hangar|gate|perimeter|fence|checkpoint|security|corridor|office|briefing|conference|warehouse|archive room|file room|barracks)\b", b):
+        add("ESTABLISH", 3)
+
+    # If beat is very short/abstract, bias to ESTABLISH/DOUBT.
+    if len(b) < 180:
+        add("ESTABLISH", 1)
+        add("DOUBT", 1)
+
+    best = max(score.items(), key=lambda kv: kv[1])
+    if best[1] <= 0:
+        # Rotate deterministically if nothing triggers
+        keys = list(_EDITORIAL_BEATS.keys())
+        return keys[j % len(keys)]
+    return best[0]
+
 _FREE_ROLL_SHOT_WHEEL: List[str] = _SHOT_WHEEL
 
 
@@ -925,7 +1015,11 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
         snippet = _sanitize_scene_context(beat, max_chars=320)
 
         scene_type = _free_roll_scene_type(beat, j)
-        anchors = _ANCHORS_BY_TYPE.get(scene_type) or _ANCHORS_BY_TYPE.get("ATMOSPHERE") or []
+        beat_kind = _editorial_beat(beat, j)
+        beat_desc = _EDITORIAL_BEATS.get(beat_kind, "")
+
+        # Prefer editorial anchors when available; fall back to scene-type anchors.
+        anchors = _ANCHORS_BY_BEAT.get(beat_kind) or _ANCHORS_BY_TYPE.get(scene_type) or _ANCHORS_BY_TYPE.get("ATMOSPHERE") or []
         anchor = anchors[j % len(anchors)] if anchors else "a grounded documentary environment"
 
         camera = _SHOT_WHEEL[j % len(_SHOT_WHEEL)]
@@ -938,6 +1032,7 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
         prompt = (
             "Create a single photorealistic still image for a long-form investigative documentary.\n"
             + (hint_line + "\n" if hint_line else "")
+            + (f"EDITORIAL BEAT: {beat_kind} — {beat_desc}\n" if beat_kind else "")
             + what + "\n"
             + camera + "\n"
             + "STYLE: " + _VISUAL_BIBLE_STYLE + "\n"
