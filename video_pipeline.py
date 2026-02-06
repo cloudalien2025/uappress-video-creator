@@ -202,19 +202,18 @@ def load_segment_script(script_path: Union[str, Path]) -> str:
     if not text:
         raise RuntimeError(f"Script file is empty: {sp.name}")
     return text
-def _sanitize_scene_context(text: str, *, max_chars: int = 380) -> str:
+def _sanitize_scene_context(text: str, max_chars: int = 380, **_ignored: Any) -> str:
     """Sanitize script text snippets before embedding into image prompts.
 
     - Normalizes whitespace
     - Enforces a hard length cap to prevent prompt bloat
-
-    Keyword-only max_chars prevents call-site drift (e.g., unexpected kwargs).
+    - Accepts extra kwargs defensively to prevent call-site drift (Streamlit reruns / older call sites)
     """
     s = (text or "").strip()
     if not s:
         return ""
     s = re.sub(r"\s+", " ", s).strip()
-        # Hard cap for prompt safety / token economy
+
     try:
         mc = int(max_chars)
     except Exception:
@@ -223,6 +222,7 @@ def _sanitize_scene_context(text: str, *, max_chars: int = 380) -> str:
         mc = 40
     if mc > 2000:
         mc = 2000
+
     if len(s) > mc:
         s = s[:mc].rstrip() + "…"
     return s
@@ -557,6 +557,14 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                     best = a
                     break
             a_match = best or ""
+
+        # Fallback pairing (prevents 'pair has no audio_path' runtime failures):
+        # If we still have no match, or the match is already used, assign the next unused audio deterministically.
+        if not a_match or (a_match in used_audio):
+            for a in audios:
+                if a not in used_audio:
+                    a_match = a
+                    break
 
         if a_match and a_match not in used_audio:
             used_audio.add(a_match)
@@ -1286,77 +1294,6 @@ def mux_audio_to_video(
     - Avoid black frames (tpad clones last frame for buffer).
     """
     v = Path(video_path)
-
-    # Optional: burn subtitles into the final MP4 (post-mux).
-    # This keeps the core locked order intact:
-    # images → scene clips → concatenate → mux audio
-    # then (optional) subtitles burn.
-    if bool(burn_subtitles):
-        # Load narration script (required)
-        script_path = str(pair.get("script_path") or pair.get("script_file") or pair.get("script") or "").strip()
-        script_text = ""
-        try:
-            if script_path and Path(script_path).exists():
-                script_text = Path(script_path).read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            script_text = ""
-
-        # Build SRT aligned to video duration (audio + small end buffer)
-        try:
-            total_for_srt = float(audio_seconds or 0.0) + float(_DEFAULT_END_BUFFER)
-            if total_for_srt <= 0.5:
-                total_for_srt = float(ffprobe_duration_seconds(out_path_p) or 0.0) or 1.0
-        except Exception:
-            total_for_srt = 1.0
-
-        srt_text = build_srt_from_script(script_text, total_seconds=total_for_srt)
-        if srt_text.strip():
-            srt_path = out_path_p.with_suffix(".srt")
-            try:
-                srt_path.write_text(srt_text, encoding="utf-8")
-            except Exception:
-                # If we can't write next to MP4, write into temp next to extract_dir
-                srt_path = Path(extract_dir_p) / "_subs" / (out_path_p.stem + ".srt")
-                srt_path.parent.mkdir(parents=True, exist_ok=True)
-                srt_path.write_text(srt_text, encoding="utf-8")
-
-            # Burn subtitles to a temp file then swap in place (atomic-ish)
-            tmp_out = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
-            style_norm = (subtitle_style or "Auto").strip().lower()
-            if style_norm.startswith("short"):
-                style_norm = "shorts"
-            elif style_norm.startswith("standard"):
-                style_norm = "standard"
-            else:
-                style_norm = "auto"
-
-            try:
-                burn_subtitles_to_mp4(
-                    src_mp4=out_path_p,
-                    srt_path=srt_path,
-                    dst_mp4=tmp_out,
-                    style=style_norm,
-                    width=int(width),
-                    height=int(height),
-                )
-                # Replace original
-                try:
-                    out_path_p.unlink()
-                except Exception:
-                    pass
-                tmp_out.replace(out_path_p)
-            except Exception:
-                # If burn fails, keep original MP4 and keep SRT for debugging.
-                pass
-
-            # If user doesn't want sidecar SRT, remove it after burn.
-            if not bool(export_srt):
-                try:
-                    if srt_path.exists():
-                        srt_path.unlink()
-                except Exception:
-                    pass
-
     a = Path(audio_path)
     out = Path(out_mp4_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1804,6 +1741,73 @@ def render_segment_mp4(
         end_buffer_s=_DEFAULT_END_BUFFER,
         audio_seconds=float(audio_seconds) if audio_seconds > 0 else None,
     )
+
+
+    # Optional: burn subtitles AFTER mux (keeps locked order intact).
+    if bool(burn_subtitles):
+        script_path = str(pair.get("script_path") or pair.get("script_file") or pair.get("script") or "").strip()
+        script_text = ""
+        if script_path and Path(script_path).exists():
+            script_text = Path(script_path).read_text(encoding="utf-8", errors="ignore")
+        script_text = (script_text or "").strip()
+
+        if not script_text:
+            raise RuntimeError("Subtitles requested, but script text is missing/empty for this segment.")
+
+        try:
+            total_for_srt = float(audio_seconds or 0.0) + float(_DEFAULT_END_BUFFER)
+            if total_for_srt <= 0.5:
+                total_for_srt = float(ffprobe_duration_seconds(out_path_p) or 0.0) or 1.0
+        except Exception:
+            total_for_srt = 1.0
+
+        srt_text = build_srt_from_script(script_text, total_seconds=total_for_srt).strip()
+        if not srt_text:
+            raise RuntimeError("Subtitles requested, but SRT generation produced empty output.")
+
+        # Write SRT next to the MP4 (preferred). Fall back to extract_dir/_subs if needed.
+        srt_path = out_path_p.with_suffix(".srt")
+        try:
+            srt_path.write_text(srt_text, encoding="utf-8")
+        except Exception:
+            srt_path = ensure_dir(extract_dir_p / "_subs") / (out_path_p.stem + ".srt")
+            srt_path.write_text(srt_text, encoding="utf-8")
+
+        tmp_out = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
+        style_norm = (subtitle_style or "Auto").strip().lower()
+        if style_norm.startswith("short"):
+            style_norm = "shorts"
+        elif style_norm.startswith("standard"):
+            style_norm = "standard"
+        else:
+            style_norm = "auto"
+
+        burn_subtitles_to_mp4(
+            src_mp4=out_path_p,
+            srt_path=srt_path,
+            dst_mp4=tmp_out,
+            style=style_norm,
+            width=int(width),
+            height=int(height),
+        )
+
+        # Replace original (validate temp first).
+        if not tmp_out.exists() or tmp_out.stat().st_size < 50_000:
+            raise RuntimeError("Subtitle burn failed (output missing or too small).")
+
+        try:
+            out_path_p.unlink()
+        except Exception:
+            pass
+        tmp_out.replace(out_path_p)
+
+        # If user doesn't want sidecar SRT, remove it after successful burn.
+        if not bool(export_srt):
+            try:
+                if srt_path.exists():
+                    srt_path.unlink()
+            except Exception:
+                pass
 
     # Cleanup
     if os.environ.get("UAPPRESS_KEEP_CLIPS", "").strip() != "1":
