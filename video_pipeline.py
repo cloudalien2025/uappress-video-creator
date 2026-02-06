@@ -1774,6 +1774,24 @@ def _escape_ass_text(s: str) -> str:
     return s
 
 
+
+def _strip_leading_dashes_for_shorts(text: str) -> str:
+    """Remove leading em/en dashes (— / –) from each caption line for Shorts.
+
+    These are common in documentary scripts (e.g., "— after interviews") but read like a stray slash
+    at large subtitle sizes in 9:16.
+    """
+    try:
+        lines = []
+        for ln in str(text or "").splitlines():
+            ln2 = re.sub(r"^\s*[—–]\s*", "", ln)
+            lines.append(ln2)
+        return "\n".join(lines)
+    except Exception:
+        return str(text or "")
+
+
+
 def _srt_to_ass(
     *,
     srt_text: str,
@@ -1832,6 +1850,8 @@ def _srt_to_ass(
     for (st, en, txt) in cues:
         t1 = _ass_time(st)
         t2 = _ass_time(en)
+        if stl == "shorts":
+            txt = _strip_leading_dashes_for_shorts(txt)
         safe_txt = _escape_ass_text(txt)
         events.append(f"Dialogue: 0,{t1},{t2},Default,,0,0,0,,{safe_txt}")
 
