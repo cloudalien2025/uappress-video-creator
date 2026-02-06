@@ -1483,9 +1483,11 @@ def build_srt_from_script(
     total_seconds: float,
     min_caption_s: float = 0.85,
     max_caption_s: float = 2.80,
+    max_words: int = 6,
+    max_chars: int = 44,
 ) -> str:
     """Create SRT text by distributing caption chunks across total_seconds."""
-    chunks = _split_text_for_captions(script_text)
+    chunks = _split_text_for_captions(script_text, max_words=int(max_words), max_chars=int(max_chars))
     if not chunks:
         return ""
 
@@ -1586,7 +1588,7 @@ def burn_subtitles_to_mp4(
     # Alignment: 2 = bottom center, 5 = middle center
     # MarginV helps avoid UI overlays (esp. Shorts).
     if stl == "shorts":
-        force = "FontName=DejaVu Sans,FontSize=42,Outline=3,Shadow=1,Alignment=2,MarginV=180"
+        force = "FontName=DejaVu Sans,FontSize=32,Outline=2,Shadow=1,Alignment=2,MarginV=140"
     else:
         force = "FontName=DejaVu Sans,FontSize=34,Outline=2,Shadow=1,Alignment=2,MarginV=64"
 
@@ -1761,7 +1763,28 @@ def render_segment_mp4(
         except Exception:
             total_for_srt = 1.0
 
-        srt_text = build_srt_from_script(script_text, total_seconds=total_for_srt).strip()
+        
+        # Caption density tuning:
+        # 9:16 + Shorts style needs smaller chunks to prevent right-edge clipping.
+        # We derive this from output aspect, not from model calls.
+        is_vertical = False
+        try:
+            is_vertical = int(height) > int(width)
+        except Exception:
+            is_vertical = False
+
+        stl = _subtitle_style_resolved(subtitle_style, width=int(width), height=int(height))
+        if is_vertical and stl == "shorts":
+            cap_max_words = 5
+            cap_max_chars = 28
+        elif is_vertical:
+            cap_max_words = 6
+            cap_max_chars = 34
+        else:
+            cap_max_words = 6
+            cap_max_chars = 44
+
+        srt_text = build_srt_from_script(script_text, total_seconds=total_for_srt, max_words=cap_max_words, max_chars=cap_max_chars).strip()
         if not srt_text:
             raise RuntimeError("Subtitles requested, but SRT generation produced empty output.")
 
