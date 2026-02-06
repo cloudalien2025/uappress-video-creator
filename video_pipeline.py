@@ -1404,6 +1404,30 @@ def validate_mp4(path: str, *, require_audio: bool = True, min_bytes: int = 50_0
 
 # ----------------------------
 # Subtitles (Burn-in) — helpers
+
+
+def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
+    """Normalize subtitle style strings to one of: 'shorts', 'standard'.
+
+    Accepts app.py UI values:
+      - 'Auto'
+      - 'Shorts (big, center)'
+      - 'Standard (bottom)'
+
+    Also accepts:
+      - 'shorts' / 'standard' / 'auto' (any casing)
+
+    Auto selects 'shorts' for vertical outputs (height > width), otherwise 'standard'.
+    """
+    s = (style or "auto").strip().lower()
+    if s in ("auto", ""):
+        return "shorts" if int(height) > int(width) else "standard"
+    if s.startswith("short"):
+        return "shorts"
+    if s.startswith("stand"):
+        return "standard"
+    # Unknown -> safe default based on aspect
+    return "shorts" if int(height) > int(width) else "standard"
 # ----------------------------
 
 def _split_text_for_captions(text: str, *, max_words: int = 6, max_chars: int = 44) -> List[str]:
@@ -1797,13 +1821,7 @@ def render_segment_mp4(
             srt_path.write_text(srt_text, encoding="utf-8")
 
         tmp_out = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
-        style_norm = (subtitle_style or "Auto").strip().lower()
-        if style_norm.startswith("short"):
-            style_norm = "shorts"
-        elif style_norm.startswith("standard"):
-            style_norm = "standard"
-        else:
-            style_norm = "auto"
+        style_norm = _subtitle_style_resolved(subtitle_style, width=int(width), height=int(height))
 
         burn_subtitles_to_mp4(
             src_mp4=out_path_p,
