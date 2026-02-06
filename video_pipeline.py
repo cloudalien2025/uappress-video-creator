@@ -19,7 +19,7 @@
 #                        min_scene_seconds=..., max_scene_seconds=...) -> None
 #
 # Notes:
-# - No subtitles/logos; no stitching.
+# - Optional burned-in subtitles supported; no logos; no stitching.
 # - Pipeline order: images -> scene clips -> concatenate -> mux audio (no black video).
 # - Audio-driven timing + end buffer ~0.5–0.75s (default 0.65s).
 # - Optional branding functions/classes exist for app.py detection:
@@ -1286,6 +1286,77 @@ def mux_audio_to_video(
     - Avoid black frames (tpad clones last frame for buffer).
     """
     v = Path(video_path)
+
+    # Optional: burn subtitles into the final MP4 (post-mux).
+    # This keeps the core locked order intact:
+    # images → scene clips → concatenate → mux audio
+    # then (optional) subtitles burn.
+    if bool(burn_subtitles):
+        # Load narration script (required)
+        script_path = str(pair.get("script_path") or pair.get("script_file") or pair.get("script") or "").strip()
+        script_text = ""
+        try:
+            if script_path and Path(script_path).exists():
+                script_text = Path(script_path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            script_text = ""
+
+        # Build SRT aligned to video duration (audio + small end buffer)
+        try:
+            total_for_srt = float(audio_seconds or 0.0) + float(_DEFAULT_END_BUFFER)
+            if total_for_srt <= 0.5:
+                total_for_srt = float(ffprobe_duration_seconds(out_path_p) or 0.0) or 1.0
+        except Exception:
+            total_for_srt = 1.0
+
+        srt_text = build_srt_from_script(script_text, total_seconds=total_for_srt)
+        if srt_text.strip():
+            srt_path = out_path_p.with_suffix(".srt")
+            try:
+                srt_path.write_text(srt_text, encoding="utf-8")
+            except Exception:
+                # If we can't write next to MP4, write into temp next to extract_dir
+                srt_path = Path(extract_dir_p) / "_subs" / (out_path_p.stem + ".srt")
+                srt_path.parent.mkdir(parents=True, exist_ok=True)
+                srt_path.write_text(srt_text, encoding="utf-8")
+
+            # Burn subtitles to a temp file then swap in place (atomic-ish)
+            tmp_out = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
+            style_norm = (subtitle_style or "Auto").strip().lower()
+            if style_norm.startswith("short"):
+                style_norm = "shorts"
+            elif style_norm.startswith("standard"):
+                style_norm = "standard"
+            else:
+                style_norm = "auto"
+
+            try:
+                burn_subtitles_to_mp4(
+                    src_mp4=out_path_p,
+                    srt_path=srt_path,
+                    dst_mp4=tmp_out,
+                    style=style_norm,
+                    width=int(width),
+                    height=int(height),
+                )
+                # Replace original
+                try:
+                    out_path_p.unlink()
+                except Exception:
+                    pass
+                tmp_out.replace(out_path_p)
+            except Exception:
+                # If burn fails, keep original MP4 and keep SRT for debugging.
+                pass
+
+            # If user doesn't want sidecar SRT, remove it after burn.
+            if not bool(export_srt):
+                try:
+                    if srt_path.exists():
+                        srt_path.unlink()
+                except Exception:
+                    pass
+
     a = Path(audio_path)
     out = Path(out_mp4_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1393,6 +1464,227 @@ def validate_mp4(path: str, *, require_audio: bool = True, min_bytes: int = 50_0
         return False, f"error:{type(e).__name__}:{e}"
 
 
+
+# ----------------------------
+# Subtitles (Burn-in) — helpers
+# ----------------------------
+
+def _split_text_for_captions(text: str, *, max_words: int = 6, max_chars: int = 44) -> List[str]:
+    """Split narration text into short, readable caption chunks.
+
+    This is intentionally heuristic (no extra model calls).
+    Goal: 'Shorts-style' readability, not verbatim transcription.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+    # Normalize whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Sentence-ish split
+    parts = re.split(r"(?<=[\.\!\?])\s+", t)
+    chunks: List[str] = []
+
+    for sent in parts:
+        s = sent.strip()
+        if not s:
+            continue
+        # Break long sentences by commas/semicolons first
+        subparts = re.split(r"(?<=[,;:])\s+", s)
+        for sp in subparts:
+            sp = sp.strip()
+            if not sp:
+                continue
+            words = sp.split()
+            if not words:
+                continue
+
+            cur: List[str] = []
+            for w in words:
+                cur.append(w)
+                candidate = " ".join(cur)
+                if len(cur) >= int(max_words) or len(candidate) >= int(max_chars):
+                    chunks.append(candidate.strip())
+                    cur = []
+            if cur:
+                chunks.append(" ".join(cur).strip())
+
+    # Final cleanup: enforce max_chars by hard wrap
+    final: List[str] = []
+    for c in chunks:
+        c = (c or "").strip()
+        if not c:
+            continue
+        if len(c) <= int(max_chars):
+            final.append(c)
+        else:
+            # Hard wrap at nearest space
+            while len(c) > int(max_chars):
+                cut = c.rfind(" ", 0, int(max_chars))
+                if cut <= 0:
+                    cut = int(max_chars)
+                final.append(c[:cut].strip())
+                c = c[cut:].strip()
+            if c:
+                final.append(c)
+    return final
+
+
+def _format_srt_time(seconds: float) -> str:
+    s = max(0.0, float(seconds))
+    ms = int(round((s - int(s)) * 1000.0))
+    total = int(s)
+    hh = total // 3600
+    mm = (total % 3600) // 60
+    ss = total % 60
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+
+def build_srt_from_script(
+    script_text: str,
+    *,
+    total_seconds: float,
+    min_caption_s: float = 0.85,
+    max_caption_s: float = 2.80,
+) -> str:
+    """Create SRT text by distributing caption chunks across total_seconds."""
+    chunks = _split_text_for_captions(script_text)
+    if not chunks:
+        return ""
+
+    total_seconds = max(0.5, float(total_seconds))
+    n = len(chunks)
+
+    # Weight by word count (better pacing than equal slices)
+    weights = []
+    for c in chunks:
+        w = max(1, len(c.split()))
+        weights.append(w)
+    wsum = float(sum(weights))
+
+    # Raw durations
+    durs = [(total_seconds * (w / wsum)) for w in weights]
+
+    # Clamp + renormalize to keep within total
+    min_s = float(min_caption_s)
+    max_s = float(max_caption_s)
+    durs = [clamp_float(d, min_s, max_s) for d in durs]
+
+    # Renormalize to fit total_seconds
+    scale = total_seconds / max(0.001, sum(durs))
+    durs = [d * scale for d in durs]
+
+    # Build SRT entries
+    lines: List[str] = []
+    t = 0.0
+    for i, (c, d) in enumerate(zip(chunks, durs), start=1):
+        start = t
+        end = t + max(0.30, float(d))
+        # Prevent overshoot
+        if end > total_seconds:
+            end = total_seconds
+        if end - start < 0.25:
+            end = min(total_seconds, start + 0.25)
+
+        lines.append(str(i))
+        lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
+        lines.append(c)
+        lines.append("")  # blank line
+        t = end
+
+        if t >= total_seconds - 0.02:
+            break
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _ffmpeg_filter_escape(path: str) -> str:
+    """Escape a filesystem path for ffmpeg filter arguments."""
+    p = str(path)
+    p = p.replace("\\", "\\\\")
+    p = p.replace(":", "\\:")
+    p = p.replace("'", "\\'")
+    return p
+
+
+def burn_subtitles_to_mp4(
+    *,
+    src_mp4: Union[str, Path],
+    srt_path: Union[str, Path],
+    dst_mp4: Union[str, Path],
+    style: str = "auto",
+    width: int = 1920,
+    height: int = 1080,
+) -> Path:
+    """Burn subtitles into an MP4 using ffmpeg+libass.
+
+    style:
+      - 'auto' (Shorts style for vertical, Standard for horizontal)
+      - 'shorts' (big, center-ish)
+      - 'standard' (bottom)
+    """
+    src = Path(src_mp4)
+    srt = Path(srt_path)
+    dst = Path(dst_mp4)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if not src.exists():
+        raise FileNotFoundError(str(src))
+    if not srt.exists():
+        raise FileNotFoundError(str(srt))
+
+    h = int(height)
+    w = int(width)
+    is_vertical = h > w
+
+    stl = (style or "auto").strip().lower()
+    if stl == "auto":
+        stl = "shorts" if is_vertical else "standard"
+    if stl.startswith("short"):
+        stl = "shorts"
+    if stl not in ("shorts", "standard"):
+        stl = "standard"
+
+    # ASS force_style values:
+    # Alignment: 2 = bottom center, 5 = middle center
+    # MarginV helps avoid UI overlays (esp. Shorts).
+    if stl == "shorts":
+        force = "FontName=DejaVu Sans,FontSize=56,Outline=3,Shadow=1,Alignment=5,MarginV=140"
+    else:
+        force = "FontName=DejaVu Sans,FontSize=34,Outline=2,Shadow=1,Alignment=2,MarginV=64"
+
+    vf = f"subtitles='{_ffmpeg_filter_escape(str(srt))}':force_style='{force}'"
+
+    ff = which_ffmpeg()
+    cmd = [
+        ff,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(dst),
+    ]
+    run_ffmpeg(cmd)
+
+    if not dst.exists() or dst.stat().st_size < 4096:
+        raise RuntimeError("Subtitle burn failed (output missing or too small).")
+    return dst
+
+
 # ----------------------------
 # The app.py-compatible segment renderer
 # ----------------------------
@@ -1409,7 +1701,10 @@ def render_segment_mp4(
     zoom_strength: float,
     max_scenes: int,
     min_scene_seconds: int,
-    max_scene_seconds: int,
+        max_scene_seconds: int,
+    burn_subtitles: bool = False,
+    subtitle_style: str = "Auto",
+    export_srt: bool = False,
 ) -> None:
     """Render one segment MP4 (images → scene clips → concatenate → mux audio).
 
