@@ -1709,6 +1709,135 @@ def _ffmpeg_filter_escape(path: str) -> str:
     return p
 
 
+def _parse_srt(srt_text: str) -> List[Tuple[float, float, str]]:
+    """Parse SRT into a list of (start_s, end_s, text)."""
+    out: List[Tuple[float, float, str]] = []
+    if not srt_text:
+        return out
+
+    def _ts_to_s(ts: str) -> float:
+        # 00:00:01,234
+        ts = (ts or "").strip()
+        m = re.match(r"^(\d+):(\d+):(\d+)[,\.]?(\d+)?$", ts)
+        if not m:
+            return 0.0
+        hh = int(m.group(1)); mm = int(m.group(2)); ss = int(m.group(3))
+        ms = int((m.group(4) or "0").ljust(3, "0")[:3])
+        return hh*3600 + mm*60 + ss + ms/1000.0
+
+    # Split by blank lines into cue blocks
+    blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
+    for b in blocks:
+        lines = [ln.rstrip() for ln in b.splitlines() if ln.strip() != ""]
+        if len(lines) < 2:
+            continue
+        # Optional numeric index on first line
+        if re.match(r"^\d+$", lines[0].strip()):
+            lines = lines[1:]
+        if not lines:
+            continue
+        timing = lines[0]
+        m = re.match(r"^(.*?)\s*-->\s*(.*)$", timing)
+        if not m:
+            continue
+        start_s = _ts_to_s(m.group(1).strip())
+        end_s = _ts_to_s(m.group(2).strip().split()[0])
+        txt = "\\N".join([ln.strip() for ln in lines[1:]])
+        txt = txt.strip()
+        if not txt:
+            continue
+        if end_s <= start_s:
+            end_s = start_s + 0.40
+        out.append((start_s, end_s, txt))
+    return out
+
+
+def _ass_time(t: float) -> str:
+    # h:mm:ss.cc (centiseconds)
+    if t < 0:
+        t = 0.0
+    cs = int(round(t * 100.0))
+    hh = cs // (3600 * 100)
+    cs -= hh * 3600 * 100
+    mm = cs // (60 * 100)
+    cs -= mm * 60 * 100
+    ss = cs // 100
+    cs -= ss * 100
+    return f"{hh}:{mm:02d}:{ss:02d}.{cs:02d}"
+
+
+def _escape_ass_text(s: str) -> str:
+    # ASS special chars: { } and backslashes
+    s = s.replace("\\", r"\\")
+    s = s.replace("{", r"\{")
+    s = s.replace("}", r"\}")
+    return s
+
+
+def _srt_to_ass(
+    *,
+    srt_text: str,
+    width: int,
+    height: int,
+    style: str,
+) -> str:
+    """Convert SRT -> ASS with deterministic PlayRes + safe placement.
+
+    This avoids libass scaling quirks some ffmpeg builds exhibit with the subtitles= filter
+    (e.g., default PlayRes 384x288 causing gigantic text and top placement in 9:16).
+    """
+    w = int(width); h = int(height)
+    stl = _subtitle_style_resolved(style, width=w, height=h)
+
+    # Safe sizing
+    if stl == "shorts":
+        # Big, but never "title at top". Keep in lower third safe area.
+        fs = 64 if h >= 1900 else (52 if h >= 1600 else 44)
+        margin_v = int(h * 0.12)
+        margin_v = max(int(h * 0.10), min(margin_v, int(h * 0.18)))
+        margin_lr = int(w * 0.07)
+        margin_lr = max(int(w * 0.05), min(margin_lr, int(w * 0.10)))
+        outline = 4
+        shadow = 1
+    else:
+        fs = 34 if h >= 900 else 30
+        margin_v = max(70, int(h * 0.07))
+        margin_lr = max(60, int(w * 0.05))
+        outline = 3
+        shadow = 1
+
+    # ASS header
+    header = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {w}",
+        f"PlayResY: {h}",
+        "ScaledBorderAndShadow: yes",
+        "WrapStyle: 2",
+        "YCbCr Matrix: TV.601",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    ]
+
+    # Alignment 2 = bottom-center. Deterministic. Never top.
+    style_line = (
+        f"Style: Default,DejaVu Sans,{fs},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,{outline},{shadow},2,{margin_lr},{margin_lr},{margin_v},1"
+    )
+    header.append(style_line)
+    header += ["", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+
+    cues = _parse_srt(srt_text)
+    events: List[str] = []
+    for (st, en, txt) in cues:
+        t1 = _ass_time(st)
+        t2 = _ass_time(en)
+        safe_txt = _escape_ass_text(txt)
+        events.append(f"Dialogue: 0,{t1},{t2},Default,,0,0,0,,{safe_txt}")
+
+    return "\n".join(header + events) + "\n"
+
+
 def burn_subtitles_to_mp4(
     *,
     src_mp4: Union[str, Path],
@@ -1718,12 +1847,12 @@ def burn_subtitles_to_mp4(
     width: int = 1920,
     height: int = 1080,
 ) -> Path:
-    """Burn subtitles into an MP4 using ffmpeg+libass.
+    """Burn subtitles into an MP4 using ffmpeg + libass (ASS path, deterministic).
 
-    style:
-      - 'auto' (Shorts style for vertical, Standard for horizontal)
-      - 'shorts' (large, lower-third safe)
-      - 'standard' (bottom safe)
+    IMPORTANT:
+    We convert the SRT to an ASS file with explicit PlayResX/Y and safe placement,
+    then render using the `ass=` filter. This prevents ffmpeg builds that ignore
+    `subtitles=original_size=...` from producing huge/top-clipped captions in 9:16.
     """
     src = Path(src_mp4)
     srt = Path(srt_path)
@@ -1738,41 +1867,14 @@ def burn_subtitles_to_mp4(
     w = int(width)
     h = int(height)
 
-    stl = _subtitle_style_resolved(style, width=w, height=h)
+    # Convert to ASS with deterministic style
+    srt_text = srt.read_text(encoding="utf-8", errors="ignore")
+    ass_text = _srt_to_ass(srt_text=srt_text, width=w, height=h, style=str(style or "auto"))
 
-    # IMPORTANT:
-    # - For Shorts, we prefer LOWER-THIRD (Alignment=2) with a generous vertical margin.
-    #   Many players overlay UI controls near the bottom; raising the baseline prevents apparent "cutoff".
-    # - Use proportional margins so 720x1280 and 1080x1920 both behave.
-    # - original_size pins libass script resolution to the actual video to avoid scaling surprises.
-    if stl == "shorts":
-        # Shorts-safe: always bottom-center with conservative safe-area margins.
-        # Never top/true-center (Shorts UI + overscan will clip).
-        fs = 54 if h >= 1900 else (44 if h >= 1600 else 38)
-        # Lower-third safe area. Clamp to a sane band to prevent drift.
-        margin_v = int(h * 0.11)  # ~211px at 1920h
-        margin_v = max(int(h * 0.08), min(margin_v, int(h * 0.16)))
-        margin_lr = int(w * 0.06)
-        margin_lr = max(int(w * 0.04), min(margin_lr, int(w * 0.08)))
-        force = (
-            f"FontName=DejaVu Sans,FontSize={fs},Outline=3,Shadow=1,"
-            f"Alignment=2,WrapStyle=2,MarginV={margin_v},MarginL={margin_lr},MarginR={margin_lr}"
-        )
-    else:
+    tmp_ass = dst.with_suffix(".tmp.ass")
+    tmp_ass.write_text(ass_text, encoding="utf-8")
 
-        fs = 30 if h >= 900 else 26
-        margin_v = max(60, int(h * 0.06))
-        margin_lr = max(50, int(w * 0.04))
-        force = (
-            f"FontName=DejaVu Sans,FontSize={fs},Outline=2,Shadow=1,"
-            f"Alignment=2,WrapStyle=2,MarginV={margin_v},MarginL={margin_lr},MarginR={margin_lr}"
-        )
-
-    vf = (
-        f"subtitles='{_ffmpeg_filter_escape(str(srt))}':"
-        f"original_size={w}x{h}:"
-        f"force_style='{force}'"
-    )
+    vf = f"ass='{_ffmpeg_filter_escape(str(tmp_ass))}'"
 
     ff = which_ffmpeg()
     cmd = [
@@ -1799,502 +1901,16 @@ def burn_subtitles_to_mp4(
     ]
     run_ffmpeg(cmd)
 
-    if not dst.exists() or dst.stat().st_size < 4096:
-        raise RuntimeError("Subtitle burn failed (output missing or too small).")
-    return dst
-
-# ----------------------------
-# The app.py-compatible segment renderer
-# ----------------------------
-
-def render_segment_mp4(
-    *,
-    pair: Dict[str, Any],
-    extract_dir: str,
-    out_path: str,
-    api_key: str,
-    fps: int,
-    width: int,
-    height: int,
-    zoom_strength: float,
-    max_scenes: int,
-    min_scene_seconds: int,
-        max_scene_seconds: int,
-    burn_subtitles: bool = False,
-    subtitle_style: str = "Auto",
-    export_srt: bool = False,
-) -> None:
-    """Render one segment MP4 (images → scene clips → concatenate → mux audio).
-
-    LOCKED ORDER:
-      images → scene clips → concatenate → mux audio
-
-    TIMING (STRICT):
-      - Audio-driven scene timing (total video follows audio)
-      - End buffer strictly 0.50–0.75s (default 0.65s) applied in mux step
-      - min_scene_seconds is guidance for scene count selection only (never forces video longer than audio)
-    """
-    extract_dir_p = Path(extract_dir)
-    out_path_p = Path(out_path)
-    out_path_p.parent.mkdir(parents=True, exist_ok=True)
-
-    audio_path = str(pair.get("audio_path") or pair.get("audio_file") or pair.get("audio") or "").strip()
-    if not audio_path:
-        raise RuntimeError("pair has no audio_path; cannot render segment.")
-    audio_p = Path(audio_path)
-    if not audio_p.exists():
-        raise FileNotFoundError(str(audio_p))
-
-    audio_seconds = float(ffprobe_duration_seconds(audio_p) or 0.0)
-
-    # Scene pacing parameters (min is guidance only; max used to avoid overly-long scenes)
-    min_s = clamp_int(int(min_scene_seconds), 1, 600)
-    max_s = clamp_int(int(max_scene_seconds), min_s, 600)
-    max_scenes_i = clamp_int(int(max_scenes), 1, 120)
-
-    # Choose scene count (no token cost): keep per-scene near mid, but guarantee per-scene <= max_s when possible.
-    if audio_seconds <= 0.0:
-        target_scenes = clamp_int(max_scenes_i, 3, max_scenes_i)
-    else:
-        mid = (float(min_s) + float(max_s)) / 2.0
-        approx = int(max(1, round(audio_seconds / max(1.0, mid))))
-
-        lower = int(max(1, math.ceil(audio_seconds / float(max_s))))  # ensures per-scene <= max_s when feasible
-        target_scenes = clamp_int(approx, lower, max_scenes_i)
-
-        # If guidance-min would imply fewer scenes, allow fewer (but never below 1),
-        # WITHOUT enforcing longer-than-audio total duration.
-        # (We only use min_s to avoid creating tiny scenes when audio is short.)
-        max_reasonable = int(max(1, math.floor(audio_seconds / float(min_s)))) if min_s > 0 else max_scenes_i
-        target_scenes = min(target_scenes, max_scenes_i)
-        if max_reasonable >= 1:
-            target_scenes = min(target_scenes, max_scenes_i)
-            # If our target creates very short scenes (<~min), reduce count (down to 1).
-            if (audio_seconds / float(target_scenes)) < float(min_s) and max_reasonable < target_scenes:
-                target_scenes = max(1, max_reasonable)
-
-        target_scenes = clamp_int(target_scenes, 1, max_scenes_i)
-
-    images = _generate_segment_images(
-        api_key=str(api_key),
-        extract_dir=extract_dir_p,
-        pair=pair,
-        width=int(width),
-        height=int(height),
-        max_scenes=int(target_scenes),
-    )
-    if not images:
-        raise RuntimeError("Image generation produced zero images (unexpected).")
-
-    # True audio-driven per-scene duration (no upward clamp).
-    if audio_seconds <= 0.0:
-        per = 5.0
-    else:
-        per = max(0.05, audio_seconds / float(len(images)))
-
-    scene_seconds = [float(per) for _ in images]
-
-    seg_slug = safe_slug(str(pair.get("title_guess") or segment_label(pair) or "segment"), max_len=48)
-    clips_dir = ensure_dir(out_path_p.parent / f"_{seg_slug}_clips")
-
-    clip_paths: List[Path] = []
-    for idx, (img, dur) in enumerate(zip(images, scene_seconds), start=1):
-        clip_out = clips_dir / f"scene_{idx:03d}.mp4"
-        clip_paths.append(
-            build_scene_clip_from_image(
-                image_path=img,
-                out_mp4_path=clip_out,
-                duration_s=float(dur),
-                width=int(width),
-                height=int(height),
-                fps=int(fps),
-                zoom_strength=float(zoom_strength),
-            )
-        )
-
-    concat_path = out_path_p.parent / f"_{seg_slug}_concat.mp4"
-    concat_video_clips(clip_paths, concat_path)
-
-    mux_audio_to_video(
-        video_path=concat_path,
-        audio_path=audio_p,
-        out_mp4_path=out_path_p,
-        end_buffer_s=_DEFAULT_END_BUFFER,
-        audio_seconds=float(audio_seconds) if audio_seconds > 0 else None,
-    )
-
-
-    # Optional: burn subtitles AFTER mux (keeps locked order intact).
-    if bool(burn_subtitles):
-        script_path = str(pair.get("script_path") or pair.get("script_file") or pair.get("script") or "").strip()
-        script_text = ""
-        if script_path and Path(script_path).exists():
-            script_text = Path(script_path).read_text(encoding="utf-8", errors="ignore")
-        script_text = (script_text or "").strip()
-
-        if not script_text:
-            raise RuntimeError("Subtitles requested, but script text is missing/empty for this segment.")
-
-        try:
-            total_for_srt = float(audio_seconds or 0.0) + float(_DEFAULT_END_BUFFER)
-            if total_for_srt <= 0.5:
-                total_for_srt = float(ffprobe_duration_seconds(out_path_p) or 0.0) or 1.0
-        except Exception:
-            total_for_srt = 1.0
-
-        
-        # Caption density tuning:
-        # 9:16 + Shorts style needs smaller chunks to prevent right-edge clipping.
-        # We derive this from output aspect, not from model calls.
-        is_vertical = False
-        try:
-            is_vertical = int(height) > int(width)
-        except Exception:
-            is_vertical = False
-
-        stl = _subtitle_style_resolved(subtitle_style, width=int(width), height=int(height))
-
-        # Caption chunking + wrapping tuned by aspect/style to prevent edge clipping.
-        if is_vertical and stl == "shorts":
-            cap_max_words = 5
-            cap_max_chars = 28
-            cap_max_line_chars = 16   # keep each line short for big center subtitles
-            cap_max_lines = 2
-        elif is_vertical:
-            cap_max_words = 6
-            cap_max_chars = 34
-            cap_max_line_chars = 20
-            cap_max_lines = 2
-        else:
-            cap_max_words = 6
-            cap_max_chars = 44
-            cap_max_line_chars = 44
-            cap_max_lines = 1
-
-        # Prefer audio-aligned subtitles when possible (fixes drift vs narration).
-        # Controlled via env var:
-        #   UAPPRESS_SUBTITLE_SYNC = 'whisper' (default) | 'script' | 'off'
-        srt_text = ""
-        sync_mode = (os.environ.get("UAPPRESS_SUBTITLE_SYNC", "whisper") or "whisper").strip().lower()
-
-        if sync_mode not in ("off", "false", "0", "none", ""):
-            if sync_mode in ("whisper", "auto"):
-                try:
-                    srt_text = build_srt_from_audio_whisper(
-                        audio_path,
-                        api_key=api_key,
-                        max_line_chars=cap_max_line_chars,
-                        max_lines=cap_max_lines,
-                    ).strip()
-                except Exception:
-                    # Whisper alignment failed; fall back to script-distribution.
-                    srt_text = ""
-
-        # Fallback: distribute captions across total duration (cheap, but not perfectly aligned).
-        if not srt_text:
-            srt_text = build_srt_from_script(
-                script_text,
-                total_seconds=total_for_srt,
-                max_words=cap_max_words,
-                max_chars=cap_max_chars,
-                max_line_chars=cap_max_line_chars,
-                max_lines=cap_max_lines,
-            ).strip()
-
-        if not srt_text:
-            raise RuntimeError("Subtitles requested, but SRT generation produced empty output.")
-
-        # Write SRT next to the MP4 (preferred). Fall back to extract_dir/_subs if needed.
-        srt_path = out_path_p.with_suffix(".srt")
-        try:
-            srt_path.write_text(srt_text, encoding="utf-8")
-        except Exception:
-            srt_path = ensure_dir(extract_dir_p / "_subs") / (out_path_p.stem + ".srt")
-            srt_path.write_text(srt_text, encoding="utf-8")
-
-        tmp_out = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
-        style_norm = (subtitle_style or "Auto").strip().lower()
-        if style_norm.startswith("short"):
-            style_norm = "shorts"
-        elif style_norm.startswith("standard"):
-            style_norm = "standard"
-        else:
-            style_norm = "auto"
-
-        burn_subtitles_to_mp4(
-            src_mp4=out_path_p,
-            srt_path=srt_path,
-            dst_mp4=tmp_out,
-            style=style_norm,
-            width=int(width),
-            height=int(height),
-        )
-
-        # Replace original (validate temp first).
-        if not tmp_out.exists() or tmp_out.stat().st_size < 50_000:
-            raise RuntimeError("Subtitle burn failed (output missing or too small).")
-
-        try:
-            out_path_p.unlink()
-        except Exception:
-            pass
-        tmp_out.replace(out_path_p)
-
-        # If user doesn't want sidecar SRT, remove it after successful burn.
-        if not bool(export_srt):
-            try:
-                if srt_path.exists():
-                    srt_path.unlink()
-            except Exception:
-                pass
-
-    # Cleanup
-    if os.environ.get("UAPPRESS_KEEP_CLIPS", "").strip() != "1":
-        try:
-            shutil.rmtree(str(clips_dir), ignore_errors=True)
-        except Exception:
-            pass
-        try:
-            if concat_path.exists():
-                concat_path.unlink()
-        except Exception:
-            pass
-
-################################################################################
-# Sora Shorts Prompt Helpers (added for UAPpress Shorts pipeline)
-################################################################################
-from dataclasses import dataclass
-from typing import Literal, Optional, Dict, Any
-
-@dataclass(frozen=True)
-class SoraStyle:
-    mode: Literal["cinematic_realism", "archival_reenactment"]
-    camera_rules: str
-    lighting_rules: str
-    grain_rules: str
-    realism_constraints: str
-
-def build_sora_house_style(mode: str = "cinematic_realism") -> SoraStyle:
-    """Return a consistent 'house style' bundle for Sora prompts."""
-    m = (mode or "cinematic_realism").strip().lower()
-    if m in ("archival", "archival_reenactment", "archival reenactment", "archival-reenactment"):
-        return SoraStyle(
-            mode="archival_reenactment",
-            camera_rules=(
-                "Tripod or slow dolly only, no handheld shake. "
-                "Lens: 35–50mm equivalent, modest depth of field. "
-                "No fast pans, no whip-zooms, no drone shots."
-            ),
-            lighting_rules=(
-                "Period-accurate practical lighting, sodium-vapor or tungsten feel, "
-                "limited dynamic range, softer contrast, restrained highlights."
-            ),
-            grain_rules=(
-                "Visible film grain, mild gate weave, slight vignetting, "
-                "subtle halation, minor dust/scratch artifacts."
-            ),
-            realism_constraints=(
-                "Documentary reenactment vibe, grounded staging, "
-                "no sci-fi glow, no fantasy aesthetics, no modern UI overlays."
-            ),
-        )
-    # default cinematic realism
-    return SoraStyle(
-        mode="cinematic_realism",
-        camera_rules=(
-            "Slow cinematic movement only: gentle push-in, slow lateral slide, "
-            "or locked-off composition. No sudden zooms or shakes. "
-            "Lens: 28–50mm equivalent, tasteful depth of field."
-        ),
-        lighting_rules=(
-            "Moody, believable lighting. Practical sources (street lamps, headlights, "
-            "hangar lights). Controlled contrast, no blown highlights."
-        ),
-        grain_rules=(
-            "Subtle grain, light texture, clean but not glossy. "
-            "No heavy stylization, no cartoon look."
-        ),
-        realism_constraints=(
-            "Cinematic realism, restrained color palette, "
-            "no text, no logos, no subtitles, no watermarks."
-        ),
-    )
-
-def build_sora_prompt(
-    segment=None,
-    *,
-    scene_text: str | None = None,
-    # Documentary-first defaults (UAPpress)
-    character: str = "a restrained documentary scene",
-    style: str = "cinematic documentary realism",
-    environment: str = "historically plausible locations, natural lighting, restrained color grade",
-    camera: str = "stable tripod or slow drift, documentary framing",
-    movement: str = "minimal motion, observational, no exaggerated action",
-    constraints: str = (
-        "No text, no logos, no subtitles, no watermarks. "
-        "No aliens, no creatures, no sci-fi effects. "
-        "No game aesthetics. Historically plausible."
-    ),
-    # Optional structured knobs (app may pass these)
-    mode: str = "cinematic_realism",
-    length_s: int | None = None,
-    aspect: str = "9:16",
-    fps: int = 30,
-    **_ignored,
-) -> str:
-    """
-    Backward-compatible Sora prompt builder.
-
-    Supports BOTH call styles:
-      1) build_sora_prompt(segment_obj)
-      2) build_sora_prompt(scene_text="...", character="...", ...)
-
-    segment may be:
-      - a dict with keys like 'visual_prompt', 'scene_prompt', 'prompt', 'text'
-      - an object with similarly-named attributes
-    """
-    # Resolve scene text
-    resolved = (scene_text or "").strip()
-
-    if not resolved and segment is not None:
-        # dict-style
-        if isinstance(segment, dict):
-            for k in ("visual_prompt", "scene_prompt", "prompt", "text", "narration", "script"):
-                v = segment.get(k)
-                if isinstance(v, str) and v.strip():
-                    resolved = v.strip()
-                    break
-        else:
-            # object-style
-            for k in ("visual_prompt", "scene_prompt", "prompt", "text", "narration", "script"):
-                v = getattr(segment, k, None)
-                if isinstance(v, str) and v.strip():
-                    resolved = v.strip()
-                    break
-
-    # If still empty, provide a safe generic fallback
-    if not resolved:
-        resolved = "A short, engaging scene that matches the narration without any on-screen text."
-
-    style_bundle = build_sora_house_style(mode=mode)
-
-    # Normalize fps/aspect/length metadata (descriptive for Sora)
+    # Cleanup temp ass (best-effort)
     try:
-        fps_i = int(fps)
+        tmp_ass.unlink()
     except Exception:
-        fps_i = 30
-    if fps_i <= 0:
-        fps_i = 30
-    asp = (aspect or "9:16").strip()
+        pass
 
-    meta = []
-    if length_s is not None:
-        try:
-            meta.append(f"Target length: {int(length_s)} seconds.")
-        except Exception:
-            pass
-    meta.append(f"Aspect ratio: {asp}.")
-    meta.append(f"Frame rate: {fps_i} fps.")
-    meta_txt = " ".join(meta)
+    if not dst.exists() or dst.stat().st_size < 50_000:
+        raise RuntimeError("Subtitle burn failed (output missing or too small).")
 
-    prompt = (
-        "Create a cinematic, documentary-style video scene.\n"
-        f"{meta_txt}\n\n"
-        f"Scene:\n{resolved}\n\n"
-        f"Style: {style}.\n"
-        f"Environment: {environment}.\n"
-        f"Camera: {camera}. {style_bundle.camera_rules}\n"
-        f"Motion: {movement}.\n"
-        f"Lighting: {style_bundle.lighting_rules}\n"
-        f"Texture: {style_bundle.grain_rules}\n"
-        f"Constraints: {constraints} {style_bundle.realism_constraints}"
-    )
-    return prompt
-
-def prepare_sora_short_job(
-    prompt_text: str,
-    *,
-    preset: str = "12s",
-    mode: str = "cinematic_realism",
-    aspect: str = "9:16",
-    fps: int = 30,
-) -> Dict[str, Any]:
-    """Return a structured payload the app can store/log for a Sora short."""
-    preset_map = {"7s": 7, "12s": 12, "18s": 18}
-    length_s = preset_map.get((preset or "12s").strip().lower(), 12)
-    full_prompt = build_sora_prompt(scene_text=prompt_text, mode=mode, length_s=length_s, aspect=aspect, fps=fps)
-    return {
-        "preset": preset,
-        "mode": mode,
-        "aspect": aspect,
-        "fps": fps,
-        "length_s": length_s,
-        "prompt": full_prompt,
-    }
-
-from dataclasses import dataclass, asdict
-
-
-def generate_all_segments_sequential(
-    *,
-    segments: List[Dict[str, Any]],
-    extract_dir: str,
-    out_dir: str,
-    overwrite: bool,
-    api_key: str,
-    fps: int,
-    width: int,
-    height: int,
-    zoom_strength: float,
-    max_scenes: int,
-    min_scene_seconds: int,
-    max_scene_seconds: int,
-) -> List[str]:
-    """Generate MP4s for all segments sequentially.
-
-    This exists mainly for backward-compat with older app.py versions that may call it.
-    The current Streamlit app typically orchestrates the loop itself.
-
-    Returns a list of output MP4 paths.
-    """
-    out_dir_p = Path(out_dir)
-    out_dir_p.mkdir(parents=True, exist_ok=True)
-
-    outputs: List[str] = []
-    for i, pair in enumerate(segments or [], start=1):
-        # Respect an explicit out_path if caller provided one in the pair dict
-        explicit = str(pair.get("out_path") or "").strip()
-        if explicit:
-            out_path_p = Path(explicit)
-            out_path_p.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            base = str(pair.get("key") or pair.get("label") or segment_label(pair) or f"segment_{i:02d}")
-            slug = safe_slug(base, max_len=80) or f"segment_{i:02d}"
-            out_path_p = out_dir_p / f"{i:02d}_{slug}.mp4"
-
-        if out_path_p.exists() and (not bool(overwrite)):
-            outputs.append(str(out_path_p))
-            continue
-
-        render_segment_mp4(
-            pair=pair,
-            extract_dir=str(extract_dir),
-            out_path=str(out_path_p),
-            api_key=str(api_key),
-            fps=int(fps),
-            width=int(width),
-            height=int(height),
-            zoom_strength=float(zoom_strength),
-            max_scenes=int(max_scenes),
-            min_scene_seconds=int(min_scene_seconds),
-            max_scene_seconds=int(max_scene_seconds),
-        )
-        outputs.append(str(out_path_p))
-
-    return outputs
-
-# Back-compat alias for older app.py calls
-_generate_all_segments_sequential = generate_all_segments_sequential
+    return dst
 
 
 def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
@@ -2313,7 +1929,7 @@ def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
     # Normalize common UI labels / aliases
     if "auto" in s:
         s = "auto"
-    elif "short" in s or "center" in s:
+    elif "short" in s or "center" in s or "lower" in s:
         s = "shorts"
     elif "standard" in s or "bottom" in s:
         s = "standard"
