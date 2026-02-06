@@ -105,46 +105,80 @@ _IMAGE_CACHE_ROOT = os.environ.get("UAPPRESS_IMAGE_CACHE_ROOT", "_image_cache_v2
 
 
 # ----------------------------
-# No-Object Visual Doctrine (UFO/UAP credibility-first)
+# Visual Bible (Positive-only, reusable across documentaries)
 # ----------------------------
-# Default: DO NOT depict a clearly defined craft/object. Visuals should show the *conditions of uncertainty*:
-# observation context, environment, instruments, personnel, documents, terrain, weather, light, and ambiguity.
+# This is a lightweight, always-on style guide. It does NOT ban motifs.
+# It provides consistent cinematic identity so scenes feel intentional.
 #
-# Optional exception (default OFF): allow only *ambiguous distant lights* with no defined edges/shape/symmetry.
-_ALLOW_WEAK_HINT = os.environ.get("UAPPRESS_ALLOW_WEAK_HINT", "0").strip() == "1"
+# Design goals:
+# - Zero extra model calls (no token burn)
+# - Short prompts (no giant constraint walls)
+# - Reusable for any documentary topic
+#
+# If you want to tune house style later, change these strings only.
 
-# Local fallback artifacts (OFF by default). If enabled, failures generate clearly-marked scene cards.
-_ALLOW_LOCAL_FALLBACK = os.environ.get("UAPPRESS_ALLOW_LOCAL_FALLBACK", "0").strip() == "1"
-
-
-_NO_OBJECT_DOCTRINE = (
-    "STRICT VISUAL DOCTRINE: Do NOT show a UFO craft, spaceship, saucer, disc, triangle, or any defined non-human vehicle. "
-    "Do NOT depict clear geometry, symmetry, metallic hulls, windows, seams/panels, landing gear, engines, beams, "
-    "or a centered 'object in the sky' composition. "
-    "Depict context only: environments and observation settings such as skies, clouds, weather, silhouettes of terrain, airfields, "
-    "radar/ATC rooms, instrument panels, witnesses from behind, declassified documents, maps, and quiet aftermath. "
-    "OBSCURED OBJECT POLICY (✅ B): ONLY when recovery/containment/handling is explicitly implied by context, "
-    "you MAY depict a non-descript tarp-covered bundle or plain covered crate as a prop. It must be indistinct and non-identifiable: "
-    "no shape language, no metallic surfaces, no hard edges, no symmetry, no windows, no engines, no craft silhouette. "
-    "ALSO: Do NOT add anomalous lights or effects in the sky (no glowing orbs, no flares, no spotlights, no searchlights) unless an incident profile explicitly allows it."
+_VISUAL_BIBLE_STYLE = (
+    "CINEMATIC VISUAL BIBLE: photorealistic documentary reenactment still. "
+    "Natural exposure, realistic materials, believable set dressing. "
+    "Restrained, tasteful color grade with subtle film grain. "
+    "Period-appropriate details when implied by context. "
+    "No on-image text, no captions, no subtitles, no logos, no watermarks."
 )
 
-_WEAK_HINT_ADDENDUM = (
-    "WEAK HINT ONLY: You MAY include faint distant lights partially obscured by clouds/haze, "
-    "not centered, no shape, no symmetry, no hard edges, no metallic surfaces, no craft-like silhouette."
-)
+# Concrete, neutral anchors that prevent generic / repetitive outputs.
+# Anchors are POSITIVE (what to show), not bans (what to avoid).
+_ANCHORS_BY_TYPE: dict[str, list[str]] = {
+    "ESTABLISHING": [
+        "a guarded base gate with signage and a small guard booth",
+        "a quiet airfield perimeter fence line at dusk",
+        "a two-lane road leading to a restricted facility, overcast sky",
+        "an exterior hangar area with service lights and parked vehicles",
+    ],
+    "DOCUMENT": [
+        "a tabletop evidence layout: folders, stamped paperwork, and a map with marked coordinates",
+        "a close view of archival documents on a desk beside a notepad and pen",
+        "a stack of reports and photographs spread under a desk lamp, shallow depth of field",
+        "a file folder and an index card box on an archival table, documentary lighting",
+    ],
+    "PROCESS": [
+        "a radar or operations room environment with period-appropriate equipment and dim practical lighting",
+        "a logbook open to handwritten entries beside a radio handset",
+        "a wall map with pins and string, an investigator’s hand marking a location",
+        "a filing cabinet drawer open with labeled folders, calm institutional interior",
+    ],
+    "WITNESS": [
+        "a witness perspective from behind, looking out toward a distant horizon",
+        "hands holding a notebook with sketches and notes, no readable text",
+        "a silhouette at a window, observing weather and light conditions outside",
+        "a person’s hands adjusting a camera or binoculars on a table, documentary realism",
+    ],
+    "INTERIOR": [
+        "a quiet institutional corridor with practical ceiling lights",
+        "an office desk with a rotary phone, paperwork, and a desk lamp",
+        "a hangar interior with tool carts and floor markings, grounded realism",
+        "a storage room with crates and shelving, restrained lighting",
+    ],
+    "ATMOSPHERE": [
+        "a night sky with moving clouds and faint ambient light, no defined object",
+        "an empty road at night with a single streetlight and haze",
+        "low clouds over flat terrain, calm and observational",
+        "a distant airfield light line through mist, documentary b-roll mood",
+    ],
+}
 
-_SANITIZE_PATTERNS = [
-    (r"\b(disc|saucer|triangle|triangular|cigar|tic[\-\s]?tac|boomerang)\b", "anomaly"),
-    (r"\b(craft|spaceship|ufo|uap|vehicle)\b", "unidentified phenomenon"),
-    (r"\b(metallic|hull|panel(s)?|seam(s)?|rivets?|window(s)?|cockpit)\b", "indistinct"),
-    (r"\b(engine(s)?|thruster(s)?|exhaust|jet)\b", "light source"),
-    (r"\b(landing\s*gear|port(hole)?s?)\b", "details"),
-    (r"\b(beam(s)?|tractor\s*beam|laser(s)?)\b", "illumination"),
-    (r"\b(hovering|descending|ascending)\b", "moving"),
+# Shot variation wheel — cheap variety without token cost.
+_SHOT_WHEEL: list[str] = [
+    "CAMERA: wide establishing composition, eye-level camera, stable tripod framing.",
+    "CAMERA: medium documentary framing, slight push-in, natural perspective.",
+    "CAMERA: close detail composition, shallow depth of field, editorial lighting.",
+    "CAMERA: wide with foreground framing (fence line, doorway, window frame), calm composition.",
+    "CAMERA: medium from behind (observer POV), gentle lateral slide feel, grounded realism.",
+    "CAMERA: close-up of objects (maps, papers, radios, instruments), clean practical lighting.",
 ]
+
 # ----------------------------
 # Script Loading (REQUIRED)
+# ----------------------------
 # ----------------------------
 def load_segment_script(script_path: Union[str, Path]) -> str:
     """
@@ -172,7 +206,6 @@ def _sanitize_scene_context(text: str, *, max_chars: int = 380) -> str:
     """Sanitize script text snippets before embedding into image prompts.
 
     - Normalizes whitespace
-    - Applies conservative term replacements via _SANITIZE_PATTERNS
     - Enforces a hard length cap to prevent prompt bloat
 
     Keyword-only max_chars prevents call-site drift (e.g., unexpected kwargs).
@@ -181,10 +214,7 @@ def _sanitize_scene_context(text: str, *, max_chars: int = 380) -> str:
     if not s:
         return ""
     s = re.sub(r"\s+", " ", s).strip()
-    for pat, repl in _SANITIZE_PATTERNS:
-        s = re.sub(pat, repl, s, flags=re.IGNORECASE)
-
-    # Hard cap for prompt safety / token economy
+        # Hard cap for prompt safety / token economy
     try:
         mc = int(max_chars)
     except Exception:
@@ -196,10 +226,6 @@ def _sanitize_scene_context(text: str, *, max_chars: int = 380) -> str:
     if len(s) > mc:
         s = s[:mc].rstrip() + "…"
     return s
-
-def _doctrine_clause() -> str:
-    return _NO_OBJECT_DOCTRINE + (" " + _WEAK_HINT_ADDENDUM if _ALLOW_WEAK_HINT else "")
-
 
 
 def clamp_float(x: float, lo: float, hi: float) -> float:
@@ -855,27 +881,21 @@ _FREE_ROLL_SCENE_TYPES: Dict[str, str] = {
     "ATMOSPHERE": "neutral b-roll atmosphere (night sky, clouds, empty road, lights, terrain), restrained and calm",
 }
 
-_FREE_ROLL_SHOT_WHEEL: List[str] = [
-    "SHOT: wide establishing composition, eye-level camera, stable tripod framing.",
-    "SHOT: medium documentary framing, slight push-in, natural perspective.",
-    "SHOT: close detail composition, tabletop or hands/instruments, shallow depth of field.",
-    "SHOT: wide with foreground framing (fence line, doorway, window frame), calm composition.",
-    "SHOT: medium from behind (observer POV), gentle lateral slide, grounded realism.",
-    "SHOT: close-up of objects (maps, papers, radios, instruments), clean editorial lighting.",
-]
+_FREE_ROLL_SHOT_WHEEL: List[str] = _SHOT_WHEEL
 
 
 def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incident_hint: str = "") -> List[str]:
-    """Build per-scene IMAGE prompts using a **Free Roll Visual Director**.
+    """Build per-scene image prompts using a **Free Roll Visual Director** (single-pass, token-cheap).
 
-    Design goals:
-    - No extra model calls for "directing" (token-cheap): deterministic routing + shot variation.
-    - Short prompts (no giant constraint blocks).
-    - Visuals support narration without trying to literalize uncertainty into repetitive props.
+    Implements:
+    - Positive-only Visual Bible (consistent cinematic identity)
+    - Concrete visual anchors (one clear noun/setting per scene)
+    - Storyboard-card prompt structure (WHAT / CAMERA / STYLE)
 
-    Notes:
-    - We keep universal production-quality constraints only (no on-image text/logos/watermarks),
-      because those break YouTube visuals and continuity.
+    Does NOT implement:
+    - No negative/ban lists
+    - No multi-generation 'best-of'
+    - No extra model calls
     """
     text = (script_text or "").strip()
     if not text:
@@ -883,25 +903,18 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
 
     max_scenes_i = clamp_int(int(max_scenes), 1, 120)
 
-    # Paragraph beats; keep stable and avoid over-fragmentation
+    # Paragraph beats; avoid over-fragmentation
     paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     beats = [p for p in paras if len(p) >= 120] or paras
     if not beats:
         return []
 
-    # Choose N beats evenly, stable across runs
+    # Choose N beats evenly (stable across runs)
     if len(beats) <= max_scenes_i:
         idxs = list(range(len(beats)))
     else:
         step = len(beats) / float(max_scenes_i)
         idxs = [min(len(beats) - 1, int(i * step)) for i in range(max_scenes_i)]
-
-    accent = (os.environ.get("UAPPRESS_ACCENT_COLOR", "muted amber") or "muted amber").strip()
-    style_line = (
-        "STYLE: photorealistic documentary still, natural exposure, subtle film grain, restrained color grade. "
-        f"Palette: muted neutrals with subtle practical accents ({accent}). "
-        "TEXT: no on-image text, no logos, no subtitles, no watermarks."
-    )
 
     hint = (incident_hint or "").strip()
     hint_line = f"CONTEXT: {hint}." if hint else ""
@@ -909,20 +922,26 @@ def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incid
     prompts: List[str] = []
     for j, idx in enumerate(idxs):
         beat = beats[idx]
-        snippet = _sanitize_scene_context(beat, max_chars=340)
+        snippet = _sanitize_scene_context(beat, max_chars=320)
 
         scene_type = _free_roll_scene_type(beat, j)
-        scene_desc = _FREE_ROLL_SCENE_TYPES.get(scene_type, _FREE_ROLL_SCENE_TYPES["ATMOSPHERE"])
-        shot = _FREE_ROLL_SHOT_WHEEL[j % len(_FREE_ROLL_SHOT_WHEEL)]
+        anchors = _ANCHORS_BY_TYPE.get(scene_type) or _ANCHORS_BY_TYPE.get("ATMOSPHERE") or []
+        anchor = anchors[j % len(anchors)] if anchors else "a grounded documentary environment"
+
+        camera = _SHOT_WHEEL[j % len(_SHOT_WHEEL)]
+
+        # Storyboard card (short, intentional)
+        what = f"WHAT: {anchor}."
+        if snippet:
+            what += f" (Inspired by: {snippet})"
 
         prompt = (
             "Create a single photorealistic still image for a long-form investigative documentary.\n"
             + (hint_line + "\n" if hint_line else "")
-            + style_line + "\n"
-            + f"SCENE TYPE: {scene_type}. Depict: {scene_desc}.\n"
-            + shot + "\n"
-            + f"Beat context: {snippet}\n"
-            + "Deliver: grounded realism, documentary framing, coherent environment details."
+            + what + "\n"
+            + camera + "\n"
+            + "STYLE: " + _VISUAL_BIBLE_STYLE + "\n"
+            + "Deliver: coherent environment details, grounded realism, believable staging."
         )
         prompts.append(prompt)
 
@@ -1091,10 +1110,6 @@ def build_scene_clip_from_image(
         "+faststart",
         str(out),
     ]
-    if target_dur is not None:
-        # Hard trim to audio-driven duration + buffer (prevents overlong video).
-        cmd.insert(-1, f"{target_dur:.3f}")
-        cmd.insert(-1, "-t")
     run_ffmpeg(cmd)
 
     if (not out.exists()) or out.stat().st_size < 4096:
@@ -1146,10 +1161,6 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
         "+faststart",
         str(out),
     ]
-    if target_dur is not None:
-        # Hard trim to audio-driven duration + buffer (prevents overlong video).
-        cmd.insert(-1, f"{target_dur:.3f}")
-        cmd.insert(-1, "-t")
     run_ffmpeg(cmd)
 
     try:
@@ -1232,10 +1243,6 @@ def mux_audio_to_video(
         "+faststart",
         str(out),
     ]
-    if target_dur is not None:
-        # Hard trim to audio-driven duration + buffer (prevents overlong video).
-        cmd.insert(-1, f"{target_dur:.3f}")
-        cmd.insert(-1, "-t")
     run_ffmpeg(cmd)
 
     if not out.exists() or out.stat().st_size < 2048:
@@ -1309,14 +1316,15 @@ def render_segment_mp4(
     min_scene_seconds: int,
     max_scene_seconds: int,
 ) -> None:
-    """
-    Locked pipeline:
-      generate images -> build scene clips -> concatenate -> mux audio
+    """Render one segment MP4 (images → scene clips → concatenate → mux audio).
 
-    Audio-driven timing:
-      - distribute audio duration across scenes
-      - clamp per-scene into [min_scene_seconds, max_scene_seconds]
-      - add ~0.5–0.75s end buffer (default 0.65)
+    LOCKED ORDER:
+      images → scene clips → concatenate → mux audio
+
+    TIMING (STRICT):
+      - Audio-driven scene timing (total video follows audio)
+      - End buffer strictly 0.50–0.75s (default 0.65s) applied in mux step
+      - min_scene_seconds is guidance for scene count selection only (never forces video longer than audio)
     """
     extract_dir_p = Path(extract_dir)
     out_path_p = Path(out_path)
@@ -1329,27 +1337,35 @@ def render_segment_mp4(
     if not audio_p.exists():
         raise FileNotFoundError(str(audio_p))
 
-    audio_seconds = ffprobe_duration_seconds(audio_p)
+    audio_seconds = float(ffprobe_duration_seconds(audio_p) or 0.0)
 
-    # Choose a scene count for pacing (audio-driven, but safe for user-provided bounds).
-    # IMPORTANT: 'min_scene_seconds' is treated as a *soft* guidance only.
-    # We will not clamp per-scene upward in a way that makes total video exceed the audio duration.
+    # Scene pacing parameters (min is guidance only; max used to avoid overly-long scenes)
+    min_s = clamp_int(int(min_scene_seconds), 1, 600)
+    max_s = clamp_int(int(max_scene_seconds), min_s, 600)
+    max_scenes_i = clamp_int(int(max_scenes), 1, 120)
 
-    if audio_seconds <= 0:
-        target_scenes = clamp_int(int(max_scenes), 3, int(max_scenes))
+    # Choose scene count (no token cost): keep per-scene near mid, but guarantee per-scene <= max_s when possible.
+    if audio_seconds <= 0.0:
+        target_scenes = clamp_int(max_scenes_i, 3, max_scenes_i)
     else:
-        # Start from a mid pacing guess.
         mid = (float(min_s) + float(max_s)) / 2.0
         approx = int(max(1, round(audio_seconds / max(1.0, mid))))
-        target_scenes = clamp_int(approx, 3, int(max_scenes))
 
-        # If per-scene would exceed max_s, increase scene count so we don't under-run video.
-        try:
-            if float(audio_seconds) / float(target_scenes) > float(max_s):
-                # ceil(audio/max_s)
-                target_scenes = clamp_int(int((float(audio_seconds) + float(max_s) - 1e-9) // float(max_s)) + 1, 3, int(max_scenes))
-        except Exception:
-            pass
+        lower = int(max(1, math.ceil(audio_seconds / float(max_s))))  # ensures per-scene <= max_s when feasible
+        target_scenes = clamp_int(approx, lower, max_scenes_i)
+
+        # If guidance-min would imply fewer scenes, allow fewer (but never below 1),
+        # WITHOUT enforcing longer-than-audio total duration.
+        # (We only use min_s to avoid creating tiny scenes when audio is short.)
+        max_reasonable = int(max(1, math.floor(audio_seconds / float(min_s)))) if min_s > 0 else max_scenes_i
+        target_scenes = min(target_scenes, max_scenes_i)
+        if max_reasonable >= 1:
+            target_scenes = min(target_scenes, max_scenes_i)
+            # If our target creates very short scenes (<~min), reduce count (down to 1).
+            if (audio_seconds / float(target_scenes)) < float(min_s) and max_reasonable < target_scenes:
+                target_scenes = max(1, max_reasonable)
+
+        target_scenes = clamp_int(target_scenes, 1, max_scenes_i)
 
     images = _generate_segment_images(
         api_key=str(api_key),
@@ -1358,21 +1374,16 @@ def render_segment_mp4(
         width=int(width),
         height=int(height),
         max_scenes=int(target_scenes),
-        )
+    )
     if not images:
         raise RuntimeError("Image generation produced zero images (unexpected).")
 
-    min_s = clamp_int(int(min_scene_seconds), 1, 600)
-    max_s = clamp_int(int(max_scene_seconds), min_s, 600)
-
-    if audio_seconds <= 0:
+    # True audio-driven per-scene duration (no upward clamp).
+    if audio_seconds <= 0.0:
         per = 5.0
     else:
-        # True audio-driven pacing: distribute exactly across scenes (no upward clamp that would lengthen video).
-        per = max(0.05, float(audio_seconds) / float(len(images)))
-        # Safety: if per is unreasonably large due to a low image count, cap to max_s.
-        if per > float(max_s):
-            per = float(max_s)
+        per = max(0.05, audio_seconds / float(len(images)))
+
     scene_seconds = [float(per) for _ in images]
 
     seg_slug = safe_slug(str(pair.get("title_guess") or segment_label(pair) or "segment"), max_len=48)
@@ -1401,12 +1412,18 @@ def render_segment_mp4(
         audio_path=audio_p,
         out_mp4_path=out_path_p,
         end_buffer_s=_DEFAULT_END_BUFFER,
-        audio_seconds=float(audio_seconds) if audio_seconds else None,
+        audio_seconds=float(audio_seconds) if audio_seconds > 0 else None,
     )
 
+    # Cleanup
     if os.environ.get("UAPPRESS_KEEP_CLIPS", "").strip() != "1":
         try:
             shutil.rmtree(str(clips_dir), ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            if concat_path.exists():
+                concat_path.unlink()
         except Exception:
             pass
         try:
