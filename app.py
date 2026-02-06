@@ -104,7 +104,7 @@ if "bonus_uploaded_mp4s" not in st.session_state:
 
 # Subtitles (burn-in) state
 if "burn_subtitles" not in st.session_state:
-    st.session_state["burn_subtitles"] = False
+    st.session_state["burn_subtitles"] = True
 if "subtitle_style" not in st.session_state:
     st.session_state["subtitle_style"] = "Auto"
 if "export_srt" not in st.session_state:
