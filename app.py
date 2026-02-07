@@ -56,9 +56,7 @@ def _ss_init() -> None:
 
         # scene timing knobs
         "target_scene_sec": 4.0,  # used to compute scene count
-        "min_scene_sec": 1.0,
-        "max_scene_sec": 12.0,
-        "max_scenes": 14,
+                "max_scenes": 14,
 
         # zoom
         "zoom_strength": 0.0,
@@ -233,13 +231,13 @@ def _subtitle_style_for_ui(w: int, h: int) -> Dict[str, Any]:
     size = st.session_state["subs_size"]
     # scale font size with height; tuned for Shorts readability without clown letters
     if size == "Small":
-        font_px = max(28, int(h * 0.040))
+        font_px = max(24, int(h * 0.030))
     elif size == "Large":
-        font_px = max(36, int(h * 0.055))
+        font_px = max(30, int(h * 0.038))
     else:
-        font_px = max(32, int(h * 0.047))
+        font_px = max(28, int(h * 0.034))
 
-    margin_v = max(18, int(h * (st.session_state["subs_safe_margin"] / 100.0)))
+    margin_v = max(16, int(h * (st.session_state["subs_safe_margin"] / 100.0)))
     # Alignment=2 (bottom-center)
     return {
         "font_name": "DejaVu Sans",
@@ -321,23 +319,16 @@ with st.sidebar:
     st.session_state["target_scene_sec"] = st.slider(
         "Target seconds per scene (auto scene count)",
         min_value=1.0,
-        max_value=20.0,
+        max_value=12.0,
         value=float(st.session_state["target_scene_sec"]),
         step=0.5,
     )
-    # min/max clamp, rerun-safe
-    minv = float(st.session_state["min_scene_sec"])
-    maxv = float(st.session_state["max_scene_sec"])
-    minv = st.slider("Min seconds per scene", 0.5, 30.0, float(minv), 0.5)
-    maxv = st.slider("Max seconds per scene", 1.0, 120.0, float(max(maxv, minv)), 0.5)
-    if maxv < minv:
-        maxv = minv
-    st.session_state["min_scene_sec"] = float(minv)
-    st.session_state["max_scene_sec"] = float(maxv)
+    st.session_state["max_scenes"] = st.slider("Max scenes per segment", 2, 80, int(st.session_state["max_scenes"]), 1)
 
-    st.session_state["max_scenes"] = st.slider("Max scenes per segment", 1, 60, int(st.session_state["max_scenes"]), 1)
+    st.caption("Note: GODMODE will *always* cover full audio duration. If your caps would truncate audio, the engine auto-increases scene count (and logs it).")
 
     st.header("🧷 Subtitles")
+
     st.session_state["burn_subs"] = st.checkbox("Burn‑in subtitles (recommended)", value=bool(st.session_state["burn_subs"]))
     st.session_state["subs_size"] = st.selectbox("Subtitle size", ["Small", "Medium", "Large"], index=["Small", "Medium", "Large"].index(st.session_state["subs_size"]))
     st.session_state["subs_safe_margin"] = st.slider("Safe bottom margin (%)", 2, 14, int(st.session_state["subs_safe_margin"]), 1)
@@ -468,9 +459,7 @@ if go:
                 height=h,
                 max_scenes=int(st.session_state["max_scenes"]),
                 target_scene_seconds=float(st.session_state["target_scene_sec"]),
-                min_scene_seconds=float(st.session_state["min_scene_sec"]),
-                max_scene_seconds=float(st.session_state["max_scene_sec"]),
-                zoom_strength=float(st.session_state["zoom_strength"]),
+                                zoom_strength=float(st.session_state["zoom_strength"]),
                 burn_subtitles=bool(st.session_state["burn_subs"]),
                 subtitle_style=sub_style,
             )
