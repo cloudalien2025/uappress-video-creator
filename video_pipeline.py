@@ -286,6 +286,23 @@ def which_ffmpeg() -> str:
         except Exception:
             pass
     return "ffmpeg"
+def _preset_intermediate() -> str:
+    # Intermediate scene clips: favor speed.
+    return (
+        os.environ.get("UAPPRESS_X264_PRESET_INTERMEDIATE", "").strip()
+        or os.environ.get("UAPPRESS_X264_PRESET", "").strip()
+        or "ultrafast"
+    )
+
+
+def _preset_final() -> str:
+    # Final renders (mux/burn): balance speed and quality.
+    return (
+        os.environ.get("UAPPRESS_X264_PRESET_FINAL", "").strip()
+        or os.environ.get("UAPPRESS_X264_PRESET", "").strip()
+        or "veryfast"
+    )
+
 
 
 def which_ffprobe() -> Optional[str]:
@@ -1129,6 +1146,43 @@ def _generate_segment_images(
     # Ensure we return exactly 'desired' items when possible.
     return final[:desired]
 
+# ------------------------------------------------------------
+# Persistent clip cache (content-addressed, Streamlit rerun-safe)
+# ------------------------------------------------------------
+
+def _clip_cache_root() -> Path:
+    # Stable across reruns within Streamlit Cloud session.
+    # User can override via env var.
+    root = os.environ.get("UAPPRESS_CLIP_CACHE_ROOT", "").strip()
+    if root:
+        p = Path(root).expanduser()
+    else:
+        p = Path("~/.cache/uappress/clip_cache_v1").expanduser()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _hash_file_prefix(path: Path, nbytes: int = 65536) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        chunk = f.read(int(nbytes))
+        h.update(chunk)
+    try:
+        h.update(str(path.stat().st_size).encode("utf-8"))
+    except Exception:
+        pass
+    return h.hexdigest()
+
+
+def _cache_path_for_key(key: str) -> Path:
+    root = _clip_cache_root()
+    # shard to avoid too many files in one directory
+    shard = key[:2]
+    d = root / shard
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{key}.mp4"
+
+
 def _clip_cache_key(
     *,
     image_path: Union[str, Path],
@@ -1138,17 +1192,39 @@ def _clip_cache_key(
     fps: int,
     zoom_strength: float,
 ) -> str:
-    """Deterministic cache key for a scene clip (skips FFmpeg on reruns)."""
+    """Deterministic cache key for a scene clip.
+
+    Requirements:
+      - content-stable (does not depend on temp paths/mtimes)
+      - safe across Streamlit reruns
+      - cheap to compute (hash first N bytes + size)
+    """
     p = Path(image_path)
     try:
-        st = p.stat()
-        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
-        sig = f"{str(p.resolve())}|{st.st_size}|{mtime_ns}"
+        img_sig = _hash_file_prefix(p, nbytes=int(os.environ.get("UAPPRESS_CACHE_HASH_BYTES", "65536")))
     except Exception:
-        sig = f"{str(p)}|na"
-    sig += f"|dur={float(duration_s):.4f}|w={int(width)}|h={int(height)}|fps={int(fps)}|z={float(zoom_strength):.4f}"
-    return _stable_hash(sig, 16)
+        img_sig = _stable_hash(str(p), 16)
 
+    sig = (
+        f"img={img_sig}"
+        f"|dur={float(duration_s):.4f}"
+        f"|w={int(width)}|h={int(height)}|fps={int(fps)}"
+        f"|z={float(zoom_strength):.4f}"
+        f"|fmt=yuv420p|v=1"
+    )
+    return _stable_hash(sig, 24)
+
+
+def _is_valid_clip_mp4(p: Path) -> bool:
+    # Stronger than size-only: verify a real video stream exists.
+    try:
+        ok, _ = validate_mp4(p, require_audio=False, min_bytes=50_000)
+        return bool(ok)
+    except Exception:
+        try:
+            return p.is_file() and p.stat().st_size > 50_000
+        except Exception:
+            return False
 
 def _is_valid_clip_mp4(p: Path) -> bool:
     try:
@@ -1233,7 +1309,7 @@ def build_scene_clip_from_image(
         "-c:v",
         "libx264",
         "-preset",
-        os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
+        (_preset_final()),
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -1254,11 +1330,13 @@ def build_scene_clip_from_image(
     return out
 
 def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Union[str, Path]) -> Path:
-    """
-    Concatenate scene clips in order.
+    """Concatenate scene clips in order.
 
-    We re-encode into a consistent H.264 stream to avoid concat/copy edge cases
-    across ffmpeg builds (Streamlit Cloud).
+    Performance:
+      1) Try concat demuxer + stream copy (-c copy) when possible (fast, no re-encode).
+      2) Fallback to re-encode (ultrafast) for maximum compatibility.
+
+    This dramatically speeds up Shorts reruns when clips are cached and already consistent.
     """
     out = Path(out_mp4_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1269,12 +1347,49 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
         raise RuntimeError("No valid scene clips to concatenate.")
 
     list_file = out.parent / f"_{out.stem}_concat_list.txt"
+
     def _esc(p: Path) -> str:
         # ffmpeg concat demuxer single-quote escaping: ' -> '\''
         return str(p).replace("'", "'\\''")
+
     list_file.write_text("".join(["file '" + _esc(c) + "'\n" for c in clips]), encoding="utf-8")
 
     ff = which_ffmpeg()
+
+    # 1) Fast path: stream copy
+    cmd_copy = [
+        ff,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(out),
+    ]
+
+    try:
+        run_ffmpeg(cmd_copy)
+        ok, why = validate_mp4(out, require_audio=False, min_bytes=50_000)
+        if ok:
+            print("[UAPpress] CONCAT: stream copy OK")
+            return out
+        print(f"[UAPpress] CONCAT: stream copy invalid -> fallback ({why})")
+    except Exception as e:
+        print(f"[UAPpress] CONCAT: stream copy failed -> fallback ({type(e).__name__})")
+
+    # 2) Fallback: re-encode for maximum compatibility
+    preset = os.environ.get("UAPPRESS_X264_PRESET_INTERMEDIATE", "").strip() or os.environ.get("UAPPRESS_X264_PRESET", "").strip() or "ultrafast"
     cmd = [
         ff,
         "-y",
@@ -1290,7 +1405,7 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
         "-c:v",
         "libx264",
         "-preset",
-        "ultrafast",
+        preset,
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -1310,11 +1425,12 @@ def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Uni
     except Exception:
         pass
 
-    if not out.exists() or out.stat().st_size < 2048:
-        raise RuntimeError("Concatenation failed (output missing or too small).")
+    ok, why = validate_mp4(out, require_audio=False, min_bytes=50_000)
+    if not ok:
+        raise RuntimeError(f"Concatenation failed (invalid output): {why}")
 
+    print("[UAPpress] CONCAT: re-encode OK")
     return out
-
 
 def mux_audio_to_video(
     *,
@@ -1374,7 +1490,8 @@ def mux_audio_to_video(
         "-c:v",
         "libx264",
         "-preset",
-        "ultrafast",
+        
+        _preset_final(),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -1793,31 +1910,70 @@ def _ass_time(t: float) -> str:
     return f"{hh}:{mm:02d}:{ss:02d}.{cs:02d}"
 
 
-def _escape_ass_text(s: str) -> str:
-    # ASS special chars: { } and backslashes
-    s = s.replace("\\", r"\\")
-    s = s.replace("{", r"\{")
-    s = s.replace("}", r"\}")
+# ------------------------------------------------------------
+# Subtitles: strict ASS sanitation (no visible stray backslashes)
+# ------------------------------------------------------------
+
+_SUBTITLE_SANITIZER_TESTED = False
+
+
+def _sanitize_ass_text(text: str) -> str:
+    """Return ASS-safe text with a strict backslash policy.
+
+    Guarantees:
+      - Only "\\N" is preserved (ASS newline token).
+      - All other backslashes are removed.
+      - Curly braces are escaped so they cannot start ASS override tags.
+      - Idempotent (safe to call multiple times).
+    """
+    s = str(text or "")
+
+    # Normalize line breaks
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Protect exactly \N (single backslash, not preceded by another backslash)
+    sentinel = "__UAP_ASS_NL__"
+    try:
+        s = re.sub(r"(?<!\\)\\N", sentinel, s)
+    except Exception:
+        s = s.replace("\\N", sentinel)
+
+    # Remove all remaining backslashes (kills balloon\, \X, \\N, etc.)
+    s = s.replace("\\", "")
+
+    # Restore \N token
+    s = s.replace(sentinel, r"\N")
+
+    # Escape braces (ASS override tags)
+    # Escape after removing stray backslashes so we don't double-escape.
+    s = s.replace("{", r"\{").replace("}", r"\}")
+
     return s
 
 
+def _subtitle_sanitizer_selftest() -> None:
+    """Small guard to prevent regressions (no external libs)."""
+    global _SUBTITLE_SANITIZER_TESTED
+    if _SUBTITLE_SANITIZER_TESTED:
+        return
 
-def _strip_leading_dashes_for_shorts(text: str) -> str:
-    """Remove leading em/en dashes (— / –) from each caption line for Shorts.
+    def _t(inp: str, expected: str) -> None:
+        out = _sanitize_ass_text(inp)
+        assert out == expected, f"subtitle sanitizer failed: {inp!r} -> {out!r} (expected {expected!r})"
+        # Idempotence
+        out2 = _sanitize_ass_text(out)
+        assert out2 == out, f"subtitle sanitizer not idempotent: {out!r} -> {out2!r}"
 
-    These are common in documentary scripts (e.g., "— after interviews") but read like a stray slash
-    at large subtitle sizes in 9:16.
-    """
-    try:
-        lines = []
-        for ln in str(text or "").splitlines():
-            ln2 = re.sub(r"^\s*[—–]\s*", "", ln)
-            lines.append(ln2)
-        return "\n".join(lines)
-    except Exception:
-        return str(text or "")
+    _t("balloon\\", "balloon")
+    _t(r"line1\Nline2", r"line1\Nline2")
+    _t(r"hello\\Nworld \X end\\", "helloNworld X end")
+
+    _SUBTITLE_SANITIZER_TESTED = True
 
 
+def _escape_ass_text(s: str) -> str:
+    # Backward-compatible wrapper used by older code paths
+    return _sanitize_ass_text(s)
 
 def _srt_to_ass(
     *,
@@ -1906,6 +2062,9 @@ def burn_subtitles_to_mp4(
     dst = Path(dst_mp4)
     dst.parent.mkdir(parents=True, exist_ok=True)
 
+    # Guard against visible stray backslashes in burned subtitles
+    _subtitle_sanitizer_selftest()
+
     if not src.exists():
         raise FileNotFoundError(str(src))
     if not srt.exists():
@@ -1937,7 +2096,7 @@ def burn_subtitles_to_mp4(
         "-c:v",
         "libx264",
         "-preset",
-        os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
+        _preset_intermediate(),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -2121,13 +2280,11 @@ def render_segment_mp4(
     images = images[:n_use]
     durs = durs[:n_use]
 
-    # Clip directory (segment-scoped)
-    extract_dir_p = Path(extract_dir)
-    clips_dir = ensure_dir(extract_dir_p / "_clips" / safe_slug(segment_label(pair), max_len=60))
+        # Clip caching (persistent, content-addressed)
+    # NOTE: cache is stable across Streamlit reruns and does not depend on temp paths/mtimes.
     clip_paths: List[Path] = []
 
     for idx, (img, dur) in enumerate(zip(images, durs), start=1):
-        # Clip caching: if an identical clip already exists, reuse it to skip FFmpeg on reruns.
         ck = _clip_cache_key(
             image_path=img,
             duration_s=float(dur),
@@ -2136,31 +2293,48 @@ def render_segment_mp4(
             fps=int(fps),
             zoom_strength=float(zoom_strength),
         )
-        clip_out = clips_dir / f"clip_{idx:03d}_{ck}.mp4"
-        if not _is_valid_clip_mp4(clip_out):
-            build_scene_clip_from_image(
+        cache_mp4 = _cache_path_for_key(ck)
 
+        if _is_valid_clip_mp4(cache_mp4):
+            print(f"[UAPpress] CACHE HIT clip {idx:02d}: {cache_mp4.name}")
+            clip_paths.append(cache_mp4)
+            continue
+
+        print(f"[UAPpress] RENDER clip {idx:02d}: {cache_mp4.name}")
+        # Render to a temp file first, then atomically move into cache.
+        tmp = cache_mp4.with_suffix(".tmp.mp4")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+        build_scene_clip_from_image(
             image_path=img,
-            out_mp4_path=clip_out,
+            out_mp4_path=tmp,
             duration_s=float(dur),
             width=int(width),
             height=int(height),
             fps=int(fps),
             zoom_strength=float(zoom_strength),
         )
-        clip_paths.append(clip_out)
 
-    if not clip_paths:
-        raise RuntimeError("No scene clips were produced.")
+        if not _is_valid_clip_mp4(tmp):
+            raise RuntimeError(f"Scene clip render produced invalid MP4: {tmp}")
 
-    # 3) concatenate
-    concat_path = out_path_p.with_name(out_path_p.stem + "_concat.mp4")
-    concat_video_clips(clip_paths, concat_path)
-    ok, why = validate_mp4(str(concat_path), require_audio=False)
-    if not ok:
-        raise RuntimeError(f"Concat MP4 validation failed: {why}")
+        try:
+            tmp.replace(cache_mp4)
+        except Exception:
+            # Fallback: copy then delete (cross-device)
+            shutil.copyfile(tmp, cache_mp4)
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
-    # 4) mux audio (adds strict end buffer internally)
+        clip_paths.append(cache_mp4)
+
+# 4) mux audio (adds strict end buffer internally)
     mux_path = out_path_p.with_name(out_path_p.stem + "_mux.mp4")
     mux_audio_to_video(
         video_path=concat_path,
