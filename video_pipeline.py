@@ -1129,6 +1129,33 @@ def _generate_segment_images(
     # Ensure we return exactly 'desired' items when possible.
     return final[:desired]
 
+def _clip_cache_key(
+    *,
+    image_path: Union[str, Path],
+    duration_s: float,
+    width: int,
+    height: int,
+    fps: int,
+    zoom_strength: float,
+) -> str:
+    """Deterministic cache key for a scene clip (skips FFmpeg on reruns)."""
+    p = Path(image_path)
+    try:
+        st = p.stat()
+        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+        sig = f"{str(p.resolve())}|{st.st_size}|{mtime_ns}"
+    except Exception:
+        sig = f"{str(p)}|na"
+    sig += f"|dur={float(duration_s):.4f}|w={int(width)}|h={int(height)}|fps={int(fps)}|z={float(zoom_strength):.4f}"
+    return _stable_hash(sig, 16)
+
+
+def _is_valid_clip_mp4(p: Path) -> bool:
+    try:
+        return p.is_file() and p.stat().st_size > 50_000
+    except Exception:
+        return False
+
 def _ensure_even(x: int) -> int:
     x = int(x)
     return x if x % 2 == 0 else x - 1 if x > 1 else 2
@@ -1171,8 +1198,8 @@ def build_scene_clip_from_image(
         zs = 3.0
 
     frames = max(2, int(round(duration * fps_i)))
-    sw = _ensure_even(int(w * 1.45))
-    sh = _ensure_even(int(h * 1.45))
+    sw = _ensure_even(int(w * 1.20))
+    sh = _ensure_even(int(h * 1.20))
 
     # zoom_strength is interpreted as the FINAL max zoom factor (e.g., 1.01–1.06).
     zmax = clamp_float(float(zs), 1.0, 1.20)
@@ -1181,7 +1208,7 @@ def build_scene_clip_from_image(
     yexpr = "ih/2-(ih/zoom/2)"
 
     vf = (
-        f"scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
+        f"scale={sw}:{sh},"
         f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':d={frames}:s={w}x{h}:fps={fps_i},"
         f"format=yuv420p"
     )
@@ -1206,7 +1233,7 @@ def build_scene_clip_from_image(
         "-c:v",
         "libx264",
         "-preset",
-        os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
+        os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -1767,40 +1794,12 @@ def _ass_time(t: float) -> str:
 
 
 def _escape_ass_text(s: str) -> str:
-    """Escape + sanitize text for ASS subtitles.
-
-    Policy (strict, to prevent visible backslashes in burned captions):
-      - Preserve ASS hard newline token: \\N
-      - Treat literal newlines and literal \\n as \\N
-      - Remove ALL other backslashes (e.g., stray '\\ ' from Whisper or stitching)
-      - Escape '{' and '}' so they cannot be interpreted as ASS override tags
-
-    This function is intentionally conservative: subtitles should never show a literal backslash.
-    """
-    placeholder = "\uE000ASS_NEWLINE\uE000"
-    s = str(s or "")
-
-    # Normalize newlines
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = s.replace("\n", r"\N")
-
-    # Whisper / upstream sometimes emits a literal sequence \n
-    s = s.replace(r"\n", r"\N")
-
-    # Preserve \N before stripping backslashes.
-    s = s.replace(r"\N", placeholder)
-
-    # Strip any remaining backslashes (prevents visible '\\' in output)
-    if "\\" in s:
-        s = s.replace("\\", "")
-
-    # Escape braces so they cannot start ASS override blocks
+    # ASS special chars: { } and backslashes
+    s = s.replace("\\", r"\\")
     s = s.replace("{", r"\{")
     s = s.replace("}", r"\}")
-
-    # Restore newline token
-    s = s.replace(placeholder, r"\N")
     return s
+
 
 
 def _strip_leading_dashes_for_shorts(text: str) -> str:
@@ -1938,7 +1937,7 @@ def burn_subtitles_to_mp4(
         "-c:v",
         "libx264",
         "-preset",
-        os.environ.get("UAPPRESS_X264_PRESET", "veryfast"),
+        os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -2128,8 +2127,19 @@ def render_segment_mp4(
     clip_paths: List[Path] = []
 
     for idx, (img, dur) in enumerate(zip(images, durs), start=1):
-        clip_out = clips_dir / f"clip_{idx:03d}.mp4"
-        build_scene_clip_from_image(
+        # Clip caching: if an identical clip already exists, reuse it to skip FFmpeg on reruns.
+        ck = _clip_cache_key(
+            image_path=img,
+            duration_s=float(dur),
+            width=int(width),
+            height=int(height),
+            fps=int(fps),
+            zoom_strength=float(zoom_strength),
+        )
+        clip_out = clips_dir / f"clip_{idx:03d}_{ck}.mp4"
+        if not _is_valid_clip_mp4(clip_out):
+            build_scene_clip_from_image(
+
             image_path=img,
             out_mp4_path=clip_out,
             duration_s=float(dur),
