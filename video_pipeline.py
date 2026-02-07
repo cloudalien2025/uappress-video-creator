@@ -1767,24 +1767,40 @@ def _ass_time(t: float) -> str:
 
 
 def _escape_ass_text(s: str) -> str:
-    """Escape text for ASS while preserving ASS newline token \\N.
+    """Escape + sanitize text for ASS subtitles.
 
-    We must NOT escape \\N (newline) because libass interprets it as a hard line break.
+    Policy (strict, to prevent visible backslashes in burned captions):
+      - Preserve ASS hard newline token: \\N
+      - Treat literal newlines and literal \\n as \\N
+      - Remove ALL other backslashes (e.g., stray '\\ ' from Whisper or stitching)
+      - Escape '{' and '}' so they cannot be interpreted as ASS override tags
+
+    This function is intentionally conservative: subtitles should never show a literal backslash.
     """
     placeholder = "\uE000ASS_NEWLINE\uE000"
     s = str(s or "")
-    # Preserve ASS newline token before escaping backslashes.
-    s = s.replace("\\N", placeholder)
 
-    # ASS special chars: { } and backslashes
-    s = s.replace("\\", r"\\")
-    s = s.replace("{", r"\\{")
-    s = s.replace("}", r"\\}")
+    # Normalize newlines
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\n", r"\N")
+
+    # Whisper / upstream sometimes emits a literal sequence \n
+    s = s.replace(r"\n", r"\N")
+
+    # Preserve \N before stripping backslashes.
+    s = s.replace(r"\N", placeholder)
+
+    # Strip any remaining backslashes (prevents visible '\\' in output)
+    if "\\" in s:
+        s = s.replace("\\", "")
+
+    # Escape braces so they cannot start ASS override blocks
+    s = s.replace("{", r"\{")
+    s = s.replace("}", r"\}")
 
     # Restore newline token
-    s = s.replace(placeholder, r"\\N")
+    s = s.replace(placeholder, r"\N")
     return s
-
 
 
 def _strip_leading_dashes_for_shorts(text: str) -> str:
