@@ -990,11 +990,25 @@ with colA:
         key="overwrite_mp4s",
     )
 with colB:
+
+    # Default FPS: 30 for long-form, 24 for Shorts (smoother + faster renders).
+    mode_now = st.session_state.get("video_mode", "Long-form (16:9)")
+    default_fps = 24 if str(mode_now).startswith("Shorts") else 30
+
+    # If the user hasn't explicitly changed FPS yet, keep it aligned to mode on reruns.
+    if "fps_value" not in st.session_state:
+        st.session_state["fps_value"] = int(default_fps)
+    else:
+        try:
+            st.session_state["fps_value"] = int(max(12, min(60, int(st.session_state["fps_value"]))))
+        except Exception:
+            st.session_state["fps_value"] = int(default_fps)
+
     fps = st.number_input(
         "FPS",
         min_value=12,
         max_value=60,
-        value=30,  # YouTube-native default
+        value=int(st.session_state.get("fps_value", default_fps)),
         step=1,
         disabled=st.session_state["is_generating"],
         key="fps_value",
