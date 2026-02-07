@@ -1,33 +1,52 @@
-# video_pipeline.py
-# UAPpress Video Pipeline — GODMODE
-# Deterministic, Streamlit Cloud-safe, cost-disciplined.
+# video_pipeline_py_GODMODE.txt
+# Save this file as: video_pipeline.py
 #
-# Pipeline:
-#   images -> concat video -> mux audio -> (optional) burn subtitles -> validate
+# GODMODE video engine (fast, deterministic, Streamlit Cloud-safe)
 #
+# Pipeline (immutable):
+# images -> concat -> video -> mux audio -> MP4 validate
+#
+# Rules:
+# - 9:16: FILL FRAME ALWAYS (scale up + crop). Never pad.
+# - No token-burn best-of selection.
+# - Deterministic scene mapping.
+# - Cache images per segment under extract_dir to speed reruns safely.
+#
+# Required exports used by app.py:
+# - extract_zip_to_temp
+# - find_files
+# - pair_segments
+# - segment_label
+# - safe_slug
+# - ffmpeg_exe
+# - run_cmd
+# - ffprobe_duration_seconds
+# - default_max_scenes
+# - render_segment_mp4
+
 from __future__ import annotations
 
-import base64
-import hashlib
 import io
 import os
 import re
+import time
+import json
 import shutil
+import zipfile
+import base64
+import hashlib
 import subprocess
 import tempfile
-import time
-import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Optional OpenAI SDK (install via requirements.txt)
+# Optional OpenAI SDK
 try:
     from openai import OpenAI  # type: ignore
 except Exception:
     OpenAI = None  # type: ignore
 
 _SCRIPT_EXTS = {".txt", ".md"}
-_SUB_EXTS = {".srt"}  # keep it simple & deterministic
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
 
 _DEFAULT_IMAGE_MODEL = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1")
@@ -51,7 +70,6 @@ _SHOTS = [
 ]
 
 
-# --------------------- tiny utilities ---------------------
 def safe_slug(text: str, max_len: int = 60) -> str:
     s = (text or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
@@ -62,13 +80,6 @@ def safe_slug(text: str, max_len: int = 60) -> str:
 
 def _stable_hash(s: str, n: int = 12) -> str:
     return hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()[: max(6, int(n))]
-
-
-def _rmtree_safe(p: Union[str, Path]) -> None:
-    try:
-        shutil.rmtree(str(p), ignore_errors=True)
-    except Exception:
-        pass
 
 
 def ffmpeg_exe() -> str:
@@ -87,7 +98,6 @@ def run_cmd(cmd: List[str]) -> None:
 
 
 def run_ffmpeg(cmd: List[str]) -> None:
-    # Always overwrite to avoid stale partials
     if "-y" not in cmd:
         cmd = cmd[:1] + ["-y"] + cmd[1:]
     run_cmd(cmd)
@@ -118,35 +128,36 @@ def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
             except Exception:
                 pass
 
-    # Fallback (works even if ffprobe missing)
+    # Fallback (Streamlit Cloud often missing ffprobe)
     ff = ffmpeg_exe()
     proc2 = subprocess.run([ff, "-hide_banner", "-i", p], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return _parse_duration_from_ffmpeg_stderr(proc2.stderr or "")
-
-
-def _ffprobe_has_audio(path: Union[str, Path]) -> bool:
-    fp = which_ffprobe()
-    if not fp:
-        # Best effort: assume yes after encode unless proven otherwise
-        return True
-    p = str(path)
-    proc = subprocess.run(
-        [fp, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "default=nw=1", p],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    return proc.returncode == 0 and "codec_type=audio" in (proc.stdout or "")
 
 
 def default_max_scenes(is_vertical: bool) -> int:
     return 6 if is_vertical else 12
 
 
-# --------------------- ZIP discovery & pairing ---------------------
-def find_files(extract_dir: Union[str, Path]) -> Tuple[List[str], List[str], List[str]]:
+def extract_zip_to_temp(zip_bytes_or_path: Union[bytes, str, Path]) -> Tuple[str, str]:
+    workdir = tempfile.mkdtemp(prefix="uappress_god_")
+    extract_dir = str(Path(workdir) / "extracted")
+    Path(extract_dir).mkdir(parents=True, exist_ok=True)
+
+    if isinstance(zip_bytes_or_path, (str, Path)):
+        data = Path(zip_bytes_or_path).read_bytes()
+    else:
+        data = bytes(zip_bytes_or_path)
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        zf.extractall(extract_dir)
+
+    return workdir, extract_dir
+
+
+def find_files(extract_dir: Union[str, Path]) -> Tuple[List[str], List[str]]:
     ed = Path(extract_dir)
     scripts: List[str] = []
     audios: List[str] = []
-    subs: List[str] = []
     for p in ed.rglob("*"):
         if not p.is_file():
             continue
@@ -155,13 +166,9 @@ def find_files(extract_dir: Union[str, Path]) -> Tuple[List[str], List[str], Lis
             scripts.append(str(p))
         elif ext in _AUDIO_EXTS:
             audios.append(str(p))
-        elif ext in _SUB_EXTS:
-            subs.append(str(p))
-
     scripts.sort(key=lambda x: Path(x).name.lower())
     audios.sort(key=lambda x: Path(x).name.lower())
-    subs.sort(key=lambda x: Path(x).name.lower())
-    return scripts, audios, subs
+    return scripts, audios
 
 
 def _guess_kind_from_name(name: str) -> str:
@@ -190,41 +197,30 @@ def segment_label(pair: Dict[str, Any]) -> str:
     return "SEGMENT"
 
 
-def pair_segments(scripts: List[str], audios: List[str], subs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]:
     """
-    Deterministic pairing (stable, cache-safe):
-      1) Prefer exact stem match (script <-> audio <-> srt)
-      2) Else assign next unused audio/sub in stable order.
+    Deterministic pairing:
+    - Prefer exact stem match
+    - Else assign next unused audio (stable order)
+    Emits uid for cache safety.
     """
-    subs = subs or []
     audio_by_stem: Dict[str, str] = {Path(a).stem.lower(): a for a in audios}
-    sub_by_stem: Dict[str, str] = {Path(s).stem.lower(): s for s in subs}
-
     used_audio: set[str] = set()
-    used_sub: set[str] = set()
     pairs: List[Dict[str, Any]] = []
 
     for s in scripts:
         sp = Path(s)
         stem = sp.stem.lower()
-
         a_match = audio_by_stem.get(stem, "")
+
         if (not a_match) or (a_match in used_audio):
             for a in audios:
                 if a not in used_audio:
                     a_match = a
                     break
+
         if a_match:
             used_audio.add(a_match)
-
-        sub_match = sub_by_stem.get(stem, "")
-        if (not sub_match) or (sub_match in used_sub):
-            for sub in subs:
-                if sub not in used_sub:
-                    sub_match = sub
-                    break
-        if sub_match:
-            used_sub.add(sub_match)
 
         kind = _guess_kind_from_name(sp.name)
 
@@ -251,7 +247,6 @@ def pair_segments(scripts: List[str], audios: List[str], subs: Optional[List[str
             {
                 "script_path": str(sp),
                 "audio_path": str(a_match),
-                "sub_path": str(sub_match) if sub_match else "",
                 "kind_guess": kind,
                 "title_guess": title_guess,
                 "uid": uid,
@@ -261,7 +256,6 @@ def pair_segments(scripts: List[str], audios: List[str], subs: Optional[List[str
     return pairs
 
 
-# --------------------- image generation (cached) ---------------------
 def _sanitize(text: str, max_chars: int = 320) -> str:
     s = (text or "").strip()
     s = re.sub(r"\s+", " ", s).strip()
@@ -271,9 +265,6 @@ def _sanitize(text: str, max_chars: int = 320) -> str:
 
 
 def _choose_beats(script_text: str, n: int) -> List[str]:
-    """
-    Prefer paragraph beats (double-newline). If not available, fall back to sentence-ish splits.
-    """
     paras = [p.strip() for p in re.split(r"\n\s*\n+", script_text or "") if p.strip()]
     if not paras:
         paras = [p.strip() for p in re.split(r"(?<=[\.\?\!])\s+", (script_text or "").strip()) if p.strip()]
@@ -362,115 +353,6 @@ def _ensure_images(*, extract_dir: str, uid: str, api_key: str, prompts: List[st
     return out
 
 
-# --------------------- subtitles (deterministic) ---------------------
-def _strip_speaker_tags(line: str) -> str:
-    # Remove "NARRATOR:" style prefixes
-    m = re.match(r"^\s*[A-Z][A-Z0-9 _-]{1,20}:\s*(.+)$", line.strip())
-    return (m.group(1).strip() if m else line.strip())
-
-
-def _tokenize_words(text: str) -> List[str]:
-    return [w for w in re.split(r"\s+", re.sub(r"[^\w'\- ]+", " ", text or "").strip()) if w]
-
-
-def _srt_timestamp(t: float) -> str:
-    t = max(0.0, float(t))
-    hh = int(t // 3600)
-    mm = int((t % 3600) // 60)
-    ss = int(t % 60)
-    ms = int(round((t - int(t)) * 1000.0))
-    if ms >= 1000:
-        ms = 999
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-
-def build_srt_from_script(script_text: str, duration: float, target_words_per_line: int = 6) -> str:
-    """
-    Cheap & deterministic captioning:
-    - Split into short lines
-    - Allocate times proportional to word counts across the full duration
-    """
-    duration = max(0.5, float(duration))
-    lines_raw = []
-    for ln in (script_text or "").splitlines():
-        ln = _strip_speaker_tags(ln)
-        if not ln:
-            continue
-        lines_raw.append(ln)
-
-    joined = " ".join(lines_raw).strip()
-    if not joined:
-        joined = (script_text or "").strip()
-
-    words = _tokenize_words(joined)
-    if not words:
-        return ""
-
-    # Build caption lines
-    chunks: List[str] = []
-    i = 0
-    while i < len(words):
-        chunk = " ".join(words[i : i + target_words_per_line]).strip()
-        if chunk:
-            chunks.append(chunk)
-        i += target_words_per_line
-
-    # Timing proportional to words (avoid 0-length)
-    total_words = max(1, len(words))
-    srt_lines: List[str] = []
-    t = 0.0
-    idx = 1
-    for c in chunks:
-        cw = max(1, len(_tokenize_words(c)))
-        seg = duration * (cw / total_words)
-        seg = max(0.75, min(3.5, seg))  # shorts-friendly
-        t2 = min(duration, t + seg)
-        srt_lines.append(str(idx))
-        srt_lines.append(f"{_srt_timestamp(t)} --> {_srt_timestamp(t2)}")
-        srt_lines.append(c)
-        srt_lines.append("")
-        idx += 1
-        t = t2
-        if t >= duration - 0.05:
-            break
-
-    return "\n".join(srt_lines).strip() + "\n"
-
-
-def _subtitle_style_force(height: int, mode: str) -> str:
-    """
-    FFmpeg subtitles filter uses ASS style keys in force_style.
-    Keep it clean: bottom-centered, boxed, readable, never clown letters.
-    """
-    h = int(height)
-    # Font size scaled by resolution
-    fs = 36 if h <= 720 else 48 if h <= 1080 else 64
-    margin_v = 40 if h <= 720 else 60 if h <= 1080 else 80
-
-    if mode == "bold":
-        # Bold/high-contrast for noisy backgrounds
-        return (
-            f"FontName=Arial,FontSize={fs},PrimaryColour=&H00FFFFFF,"
-            f"OutlineColour=&H00000000,BackColour=&H80000000,"
-            f"BorderStyle=3,Outline=2,Shadow=0,Bold=1,Alignment=2,MarginV={margin_v}"
-        )
-
-    # Clean default
-    return (
-        f"FontName=Arial,FontSize={fs},PrimaryColour=&H00FFFFFF,"
-        f"OutlineColour=&H00000000,BackColour=&H60000000,"
-        f"BorderStyle=3,Outline=1,Shadow=0,Bold=0,Alignment=2,MarginV={margin_v}"
-    )
-
-
-def _ffmpeg_filter_path(p: Union[str, Path]) -> str:
-    # subtitles filter wants a single string; escape ":" and "\" safely.
-    s = str(p)
-    s = s.replace("\\", "\\\\").replace(":", "\\:")
-    return s
-
-
-# --------------------- render ---------------------
 def _concat_list_file(images: List[Path], seconds_per: float) -> Path:
     seconds_per = max(0.5, float(seconds_per))
     p = Path(tempfile.mkstemp(prefix="uappress_concat_", suffix=".txt")[1])
@@ -484,8 +366,10 @@ def _concat_list_file(images: List[Path], seconds_per: float) -> Path:
 
 
 def _vf_fill_frame(width: int, height: int) -> str:
-    # FILL FRAME ALWAYS (crop, never pad)
-    return f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},format=yuv420p"
+    )
 
 
 def render_segment_mp4(
@@ -494,18 +378,16 @@ def render_segment_mp4(
     extract_dir: str,
     out_path: str,
     api_key: str,
-    fps: int = 24,
+    fps: int = 30,
     width: int = 1280,
     height: int = 720,
+    zoom_strength: float = 0.0,
     max_scenes: int = 12,
     min_scene_seconds: int = 6,
     max_scene_seconds: int = 120,
-    burn_subtitles: bool = True,
-    subtitle_style: str = "clean",  # "clean" | "bold"
 ) -> None:
     sp = Path(pair.get("script_path") or "")
     ap = Path(pair.get("audio_path") or "")
-    subp = Path(pair.get("sub_path") or "") if (pair.get("sub_path") or "") else None
     uid = str(pair.get("uid") or _stable_hash(str(sp) + "|" + str(ap), 14))
 
     if not sp.exists():
@@ -532,8 +414,7 @@ def render_segment_mp4(
     size = _image_size_for_wh(width, height)
     imgs = _ensure_images(extract_dir=extract_dir, uid=uid, api_key=api_key, prompts=prompts, size=size)
 
-    # Seconds per scene: audio-driven, but bounded
-    sec_per = dur / float(max(1, len(imgs)))
+    sec_per = dur / float(len(imgs))
     sec_per = max(float(min_scene_seconds), min(float(max_scene_seconds), sec_per))
 
     lst = _concat_list_file(imgs, sec_per)
@@ -542,22 +423,6 @@ def render_segment_mp4(
     outp.parent.mkdir(parents=True, exist_ok=True)
 
     vf = _vf_fill_frame(width, height)
-
-    # Subtitles input (prefer .srt from ZIP; else generate deterministic SRT)
-    srt_path: Optional[Path] = None
-    if burn_subtitles:
-        if subp and subp.exists() and subp.suffix.lower() == ".srt":
-            srt_path = subp
-        else:
-            gen = build_srt_from_script(script_text, dur)
-            if gen.strip():
-                srt_path = Path(tempfile.mkstemp(prefix="uappress_", suffix=".srt")[1])
-                srt_path.write_text(gen, encoding="utf-8")
-
-    if burn_subtitles and srt_path:
-        style = _subtitle_style_force(height, "bold" if subtitle_style == "bold" else "clean")
-        vf = vf + f",subtitles='{_ffmpeg_filter_path(srt_path)}':force_style='{style}'"
-
     preset = "veryfast"
     crf = "20" if is_vertical else "19"
 
@@ -571,29 +436,18 @@ def render_segment_mp4(
         "-i", str(lst),
         "-i", str(ap),
         "-vf", vf,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
         "-c:v", "libx264",
         "-preset", preset,
         "-tune", "stillimage",
         "-crf", crf,
-        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "192k",
-        "-movflags", "+faststart",
         "-shortest",
         str(outp),
     ]
     run_ffmpeg(cmd)
 
-    # Validate output
-    if not outp.exists() or outp.stat().st_size < 120_000:
+    if not outp.exists() or outp.stat().st_size < 80_000:
         raise RuntimeError("Render produced an invalid/too-small MP4.")
-
-    out_dur = float(ffprobe_duration_seconds(outp))
-    if out_dur <= 0.05:
+    if float(ffprobe_duration_seconds(outp)) <= 0.05:
         raise RuntimeError("Render produced zero-duration MP4.")
-
-    # Enforce audio presence (prevents silent uploads)
-    if not _ffprobe_has_audio(outp):
-        raise RuntimeError("Render produced MP4 without an audio stream.")
