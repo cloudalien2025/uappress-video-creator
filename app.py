@@ -1,226 +1,326 @@
-# app.py
-# UAPpress Video Creator — GODMODE (Ferrari UI, Streamlit-safe)
-# ZIP (scripts + audio + optional .srt) -> MP4 segments (audio-driven)
+# app_py_GODMODE.txt
+# Save this file as: app.py
 #
-# Requirements:
-# - Keep filenames: app.py, video_pipeline.py
-# - ZIP workflow: non-negotiable
-# - OpenAI used for images only (deterministic otherwise)
+# GODMODE Streamlit Orchestrator (thin shell)
+# ZIP upload (MP3 + scripts) → deterministic segment render → optional DigitalOcean Spaces auto-upload
 #
-import hashlib
+# Non-negotiables respected:
+# - ZIP-based input
+# - OpenAI as AI backbone (images)
+# - DigitalOcean Spaces output
+# - Streamlit + GitHub compatible
+#
+# Design goals:
+# - Fast iteration velocity
+# - Rerun-safe state
+# - Cost disciplined (no unnecessary API calls)
+# - Minimal UI (Ferrari: clean, purposeful)
+
+from __future__ import annotations
+
+import os
+import json
+import time
+import shutil
 import tempfile
-import zipfile
+from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import streamlit as st
-import video_pipeline as vp
 
-st.set_page_config(page_title="UAPpress — Video Creator (GODMODE)", layout="wide")
+try:
+    import video_pipeline as vp
+except Exception as e:
+    st.error(f"Failed to import video_pipeline.py: {type(e).__name__}: {e}")
+    st.stop()
 
-# ---------- helpers ----------
-def _hash_bytes(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()[:12]
+# DigitalOcean Spaces (S3-compatible)
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
 
-def _ensure_session_dirs() -> None:
-    if "workdir" not in st.session_state:
-        st.session_state.workdir = Path(tempfile.mkdtemp(prefix="uappress_vc_"))
-    if "extract_dir" not in st.session_state:
-        st.session_state.extract_dir = st.session_state.workdir / "extracted"
-        st.session_state.extract_dir.mkdir(parents=True, exist_ok=True)
-    if "out_dir" not in st.session_state:
-        st.session_state.out_dir = st.session_state.workdir / "mp4_segments"
-        st.session_state.out_dir.mkdir(parents=True, exist_ok=True)
 
-def _reset_extract_dir() -> None:
-    ed = st.session_state.extract_dir
-    try:
-        for p in ed.iterdir():
-            if p.is_dir():
-                vp._rmtree_safe(p)  # type: ignore
-            else:
-                p.unlink(missing_ok=True)  # py3.8 safe enough in cloud
-    except Exception:
-        pass
-    ed.mkdir(parents=True, exist_ok=True)
+# ----------------------------
+# Page
+# ----------------------------
+st.set_page_config(page_title="UAPpress — GODMODE", layout="wide")
 
-_ensure_session_dirs()
-
-# ---------- Ferrari skin ----------
+# ---------- Ferrari UI skin ----------
 st.markdown(
     """
-<style>
-/* Layout polish */
-.block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
-h1, h2, h3 { letter-spacing: -0.02em; }
-div[data-testid="stSidebar"] { background: #0b0e14; }
-div[data-testid="stSidebar"] * { color: #e6e6e6; }
-div[data-testid="stSidebar"] label { color: #cfd3da; }
-div[data-testid="stSidebar"] .stSelectbox div { color: #111; }
-.smallcaps { font-variant: all-small-caps; letter-spacing: .08em; opacity: .85; }
-.card {
-  border: 1px solid rgba(0,0,0,.06);
-  border-radius: 18px;
-  padding: 16px 18px;
-  background: white;
-}
-.badge {
-  display:inline-block; padding:4px 10px; border-radius:999px;
-  border:1px solid rgba(0,0,0,.10); font-size:12px; margin-right:8px;
-}
-hr { border: none; border-top: 1px solid rgba(0,0,0,.06); margin: 18px 0; }
-</style>
-""",
+    <style>
+      :root { --bg:#0b0e14; --panel:#111827; --card:#ffffff; --muted: rgba(49,51,63,.70); }
+      .block-container { padding-top: 1.25rem; padding-bottom: 2.25rem; max-width: 1200px; }
+      h1,h2,h3 { letter-spacing: -0.02em; }
+      .small-muted { color: var(--muted); font-size: 0.95rem; }
+      .pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid rgba(0,0,0,.10); background: rgba(0,0,0,.03); margin-right:6px; font-size: 12px; }
+      .card { border:1px solid rgba(0,0,0,.06); border-radius: 18px; padding: 16px 18px; background: var(--card); }
+      .card + .card { margin-top: 14px; }
+      .tight hr { border:none; border-top:1px solid rgba(0,0,0,.06); margin: 14px 0; }
+      /* Sidebar dark */
+      section[data-testid='stSidebar'] { background: var(--bg); }
+      section[data-testid='stSidebar'] * { color: #e6e6e6; }
+      section[data-testid='stSidebar'] input, section[data-testid='stSidebar'] textarea { color: #111; }
+      section[data-testid='stSidebar'] .stSelectbox div[data-baseweb='select'] { color:#111; }
+      /* Buttons */
+      div.stButton > button { border-radius: 14px; padding: .65rem .95rem; }
+      /* Expander */
+      div[data-testid='stExpander'] { border-radius: 14px; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-# ---------- Header ----------
-st.markdown('<div class="smallcaps">UAPpress</div>', unsafe_allow_html=True)
+st.markdown("<div class='small-muted'>UAPpress</div>", unsafe_allow_html=True)
 st.title("🛸 Video Creator — GODMODE")
-st.caption("ZIP → Scenes → MP4 (audio-driven). Fast reruns via cache. Minimal knobs. Maximum throughput.")
+st.markdown("<div class='small-muted'>ZIP in → MP4 out → optional Spaces upload. Audio drives duration. Subtitles default ON. Speed wins.</div>", unsafe_allow_html=True)
 
-# ---------- Sidebar ----------
 with st.sidebar:
-    st.markdown("## 🔑 API")
-    openai_key = st.text_input("OpenAI API Key", type="password", help="Used for image generation only.")
+    st.header("🔑 OpenAI")
+    st.session_state["api_key"] = st.text_input(
+        "OpenAI API Key", type="password", value=st.session_state.get("api_key", "")
+    ).strip()
 
-    st.markdown("---")
-    st.markdown("## 🎬 Output")
-    mode = st.selectbox("Format", ["Shorts / TikTok / Reels (9:16)", "Long-form (16:9)"])
-    is_vertical = "9:16" in mode
-
-    if is_vertical:
-        res = st.selectbox("Resolution", ["1080x1920", "720x1280"])
-    else:
-        res = st.selectbox("Resolution", ["1280x720", "1920x1080"])
-
-    width, height = [int(x) for x in res.split("x")]
-
-    fps = st.select_slider("FPS", options=[24, 25, 30], value=24)
-
-    st.markdown("---")
-    st.markdown("## 🧠 Scene Control")
-    max_scenes = st.slider("Max scenes (images)", min_value=1, max_value=30, value=(6 if is_vertical else 12), step=1)
-    min_scene_s = st.slider("Min seconds per scene", min_value=1, max_value=30, value=6, step=1)
-    max_scene_s = st.slider("Max seconds per scene", min_value=5, max_value=180, value=120, step=5)
-
-    # Clamp: never allow max < min (prevents 10s disasters)
-    if max_scene_s < min_scene_s:
-        max_scene_s = min_scene_s
-
-    st.markdown("---")
-    st.markdown("## 📝 Subtitles")
-    burn_subs = st.checkbox("Burn-in subtitles (recommended)", value=True)
-    subs_style = st.selectbox(
-        "Subtitle style",
-        ["Clean (default)", "Bold (high-contrast)"],
-        index=0,
-        help="Clean = documentary. Bold = louder for Shorts.",
-        disabled=(not burn_subs),
+    st.header("🎞 Output")
+    st.session_state["mode"] = st.selectbox(
+        "Mode",
+        ["Long-form (16:9)", "Shorts / TikTok / Reels (9:16)"],
+        index=0 if st.session_state.get("mode", "").startswith("Long") else 1,
     )
+    if st.session_state["mode"].startswith("Long"):
+        st.session_state["res_169"] = st.selectbox(
+            "Resolution (16:9)",
+            ["1280x720", "1920x1080"],
+            index=0 if st.session_state.get("res_169") == "1280x720" else 1,
+        )
+    else:
+        st.session_state["res_916"] = st.selectbox(
+            "Resolution (9:16)",
+            ["720x1280", "1080x1920"],
+            index=1 if st.session_state.get("res_916") == "1080x1920" else 0,
+        )
 
-# ---------- Main: ZIP upload ----------
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.subheader("1) Upload ZIP (scripts + audio + optional .srt)")
-zip_file = st.file_uploader("TTS Studio ZIP", type=["zip"], label_visibility="collapsed")
-st.markdown("</div>", unsafe_allow_html=True)
+    st.header("☁️ Spaces Upload")
+    auto_upload = st.toggle("Auto-upload to Spaces", value=True)
+    make_public = st.toggle("Public-read ACL", value=True)
+    prefix_override = st.text_input("Prefix override (optional)", value="").strip()
 
-pairs = []
-if zip_file is not None:
-    zip_bytes = zip_file.read()
-    zhash = _hash_bytes(zip_bytes)
+    st.divider()
+    if st.button("🧹 Reset / Remove ZIP"):
+        _reset_all()
+        st.rerun()
 
-    if st.session_state.get("zip_hash") != zhash:
-        st.session_state.zip_hash = zhash
-        _reset_extract_dir()
-        zpath = st.session_state.workdir / f"input_{zhash}.zip"
-        zpath.write_bytes(zip_bytes)
-        with zipfile.ZipFile(zpath) as zf:
-            zf.extractall(st.session_state.extract_dir)
 
-    scripts, audios, subs = vp.find_files(st.session_state.extract_dir)
-    pairs = vp.pair_segments(scripts, audios, subs)
+# ----------------------------
+# ZIP Upload
+# ----------------------------
+st.subheader("1) Upload ZIP (scripts + audio)")
+uploaded = st.file_uploader("TTS Studio ZIP", type=["zip"])
 
-    st.success(f"Detected {len(pairs)} segment(s).")
-    with st.expander("Show detected segments"):
-        for p in pairs:
-            st.write(
-                f"• **{vp.segment_label(p)}** — "
-                f"{Path(p['audio_path']).name if p.get('audio_path') else 'NO AUDIO'} / "
-                f"{Path(p['script_path']).name if p.get('script_path') else 'NO SCRIPT'} / "
-                f"{Path(p['sub_path']).name if p.get('sub_path') else 'no .srt'}"
-            )
+if uploaded is not None:
+    _reset_all()
+    zip_root, zip_path = _save_uploaded_zip(uploaded)
+    st.session_state["zip_root"] = zip_root
+    st.session_state["zip_path"] = zip_path
 
-# ---------- Generate ----------
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.subheader("2) Generate MP4 segments")
-colA, colB, colC = st.columns([1.4, 1, 1])
+    zip_bytes = Path(zip_path).read_bytes()
+    workdir, extract_dir = vp.extract_zip_to_temp(zip_bytes)
+    st.session_state["workdir"] = workdir
+    st.session_state["extract_dir"] = extract_dir
 
-with colA:
-    overwrite = st.checkbox("Overwrite existing MP4s", value=False)
+    scripts, audios = vp.find_files(extract_dir)
+    if not scripts:
+        st.error("No script files (.txt/.md) found in ZIP.")
+    elif not audios:
+        st.error("No audio files found in ZIP.")
+    else:
+        pairs = vp.pair_segments(scripts, audios)
 
-with colB:
-    st.write("")
-    st.write("")
-    go = st.button("🚀 Generate MP4s", use_container_width=True, disabled=(zip_file is None))
+        missing = [Path(p["script_path"]).name for p in pairs if p.get("script_path") and not p.get("audio_path")]
+        if missing:
+            st.error("Missing audio for scripts: " + ", ".join(missing))
+        else:
+            st.session_state["pairs"] = pairs
+            st.success(f"Detected {len(pairs)} segment(s).")
 
-with colC:
-    st.write("")
-    st.write("")
-    st.caption(f"Output folder: `{st.session_state.out_dir}`")
+if st.session_state.get("pairs"):
+    with st.expander("Detected segments"):
+        for i, p in enumerate(st.session_state["pairs"], start=1):
+            sp = Path(p.get("script_path") or "").name
+            ap = Path(p.get("audio_path") or "").name
+            st.write(f"{i:02d}. **{vp.segment_label(p)}** — {sp} ↔ {ap}")
 
-st.markdown("</div>", unsafe_allow_html=True)
+
+# ----------------------------
+# Generation
+# ----------------------------
+st.subheader("2) Generate MP4s")
+
+pairs = st.session_state.get("pairs") or []
+if not pairs:
+    st.info("Upload a ZIP to enable generation.")
+    st.stop()
+
+w, h = _get_resolution_wh()
+out_dir = _out_dir(st.session_state["extract_dir"])
+
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    overwrite = st.toggle("Overwrite existing", value=False)
+with c2:
+    if st.button("🛑 Stop"):
+        st.session_state["stop_requested"] = True
+        _log("🛑 Stop requested — will stop after current segment finishes.")
+with c3:
+    st.write(f"Output: **{w}x{h}** → `{out_dir}`")
+
+go = st.button("🚀 Generate All", type="primary", disabled=st.session_state.get("is_generating", False))
 
 if go:
-    if not openai_key or not openai_key.strip():
-        st.error("Enter your OpenAI API key in the sidebar.")
+    if not st.session_state.get("api_key"):
+        st.error("OpenAI API key required for image generation.")
         st.stop()
 
-    if not pairs:
-        st.error("No segments found in ZIP.")
-        st.stop()
+    st.session_state["is_generating"] = True
+    st.session_state["stop_requested"] = False
+    st.session_state["generated"] = {}
+    st.session_state["spaces_public_urls"] = []
+    st.session_state["spaces_upload_log"] = []
 
-    style = "clean" if subs_style.startswith("Clean") else "bold"
-
-    prog = st.progress(0)
+    progress = st.progress(0.0)
     status = st.empty()
+    detail = st.empty()
 
-    outputs = []
-    for i, pair in enumerate(pairs, start=1):
-        label = vp.segment_label(pair)
-        out_name = f"{i:02d}_{vp.safe_slug(label + ' ' + (pair.get('title_guess') or ''))}_{pair.get('uid','')}.mp4"
-        out_path = st.session_state.out_dir / out_name
-
-        if out_path.exists() and (not overwrite):
-            outputs.append(out_path)
-            status.info(f"[{i}/{len(pairs)}] Cached: {out_path.name}")
-            prog.progress(i / len(pairs))
-            continue
-
-        status.info(f"[{i}/{len(pairs)}] Rendering: {label}")
+    # Spaces init
+    s3 = bucket = region = public_base = None
+    job_prefix = ""
+    if auto_upload:
         try:
+            s3, bucket, region, public_base = _spaces_client_and_context()
+            job_prefix = prefix_override or _job_prefix()
+            if not job_prefix.endswith("/"):
+                job_prefix += "/"
+            st.session_state["spaces_last_prefix"] = job_prefix
+            _ulog(f"Auto-upload ON → bucket={bucket} region={region} prefix={job_prefix}")
+        except Exception as e:
+            auto_upload = False
+            _ulog(f"❌ Auto-upload disabled: {type(e).__name__}: {e}")
+            st.warning("Auto-upload disabled (Spaces init failed). See Upload Log.")
+
+    n = len(pairs)
+    for idx, pair in enumerate(pairs, start=1):
+        if st.session_state.get("stop_requested"):
+            _log("Stopped before next segment.")
+            break
+
+        out_path = _segment_out_path(out_dir, idx, pair)
+        name = Path(out_path).name
+        status.info(f"Generating {idx}/{n}: {name}")
+        detail.caption(vp.segment_label(pair))
+
+        if (not overwrite) and Path(out_path).exists():
+            st.session_state["generated"][f"{idx:02d}"] = out_path
+            _log(f"↪ skipped (exists): {name}")
+        else:
+            t0 = time.time()
             vp.render_segment_mp4(
                 pair=pair,
-                extract_dir=str(st.session_state.extract_dir),
-                out_path=str(out_path),
-                api_key=openai_key.strip(),
-                fps=int(fps),
-                width=int(width),
-                height=int(height),
-                max_scenes=int(max_scenes),
-                min_scene_seconds=int(min_scene_s),
-                max_scene_seconds=int(max_scene_s),
-                burn_subtitles=bool(burn_subs),
-                subtitle_style=style,
+                extract_dir=st.session_state["extract_dir"],
+                out_path=out_path,
+                api_key=st.session_state["api_key"],
+                fps=30,
+                width=w,
+                height=h,
+                max_scenes=vp.default_max_scenes(is_vertical=(h > w)),
+                min_scene_seconds=6,
+                max_scene_seconds=120,
+                zoom_strength=0.0,
             )
-            outputs.append(out_path)
+            dt = time.time() - t0
+            st.session_state["generated"][f"{idx:02d}"] = out_path
+            _log(f"✅ {name} in {dt:.1f}s")
+
+        # Upload
+        if auto_upload and s3 and bucket and region:
+            ok, why = _is_valid_mp4(out_path)
+            if not ok:
+                _ulog(f"⛔ skip upload (invalid {why}): {name}")
+            else:
+                try:
+                    object_key = f"{job_prefix}{name}"
+                    url = _upload_file_to_spaces(
+                        s3=s3,
+                        bucket=bucket,
+                        region=region,
+                        public_base=public_base or "",
+                        local_path=out_path,
+                        object_key=object_key,
+                        make_public=bool(make_public),
+                        skip_if_exists=True,
+                    )
+                    if url not in st.session_state["spaces_public_urls"]:
+                        st.session_state["spaces_public_urls"].append(url)
+                    _ulog(f"✅ {name} -> {url}")
+                except Exception as e:
+                    _ulog(f"❌ upload failed {name}: {type(e).__name__}: {e}")
+
+        progress.progress(min(1.0, idx / max(1, n)))
+
+    # Manifest
+    if auto_upload and s3 and bucket and region:
+        try:
+            manifest = {
+                "prefix": job_prefix,
+                "mode": st.session_state.get("mode", ""),
+                "resolution": f"{w}x{h}",
+                "files": [Path(p).name for p in st.session_state["generated"].values()],
+                "urls": st.session_state["spaces_public_urls"],
+                "updated_at": datetime.now().isoformat(),
+            }
+            mkey = f"{job_prefix}manifest.json"
+            murl = _upload_bytes_to_spaces(
+                s3=s3,
+                bucket=bucket,
+                region=region,
+                public_base=public_base or "",
+                data=json.dumps(manifest, indent=2).encode("utf-8"),
+                object_key=mkey,
+                content_type="application/json",
+                make_public=bool(make_public),
+            )
+            st.session_state["spaces_manifest_url"] = murl
+            _ulog(f"📄 manifest.json -> {murl}")
         except Exception as e:
-            st.error(f"Failed on {label}: {e}")
-            st.stop()
+            _ulog(f"❌ manifest upload failed: {type(e).__name__}: {e}")
 
-        prog.progress(i / len(pairs))
+    st.session_state["is_generating"] = False
+    status.success("Done.")
 
-    st.success("Done.")
-    st.divider()
 
-    for p in outputs:
-        st.video(str(p))
+# ----------------------------
+# Results + Logs
+# ----------------------------
+if st.session_state.get("generated"):
+    st.subheader("3) Results (local)")
+    for k, p in st.session_state["generated"].items():
+        st.write(f"**{k}** — `{Path(p).name}`")
+        st.video(p)
+
+if st.session_state.get("spaces_public_urls"):
+    st.subheader("4) Public URLs (Spaces)")
+    for u in st.session_state["spaces_public_urls"]:
+        st.write(u)
+
+if st.session_state.get("spaces_manifest_url"):
+    st.caption(f"Manifest: {st.session_state['spaces_manifest_url']}")
+
+with st.expander("Generation Log"):
+    for line in st.session_state.get("gen_log", []):
+        st.write(line)
+
+with st.expander("Upload Log"):
+    for line in st.session_state.get("spaces_upload_log", []):
+        st.write(line)
+
+st.markdown("</div>", unsafe_allow_html=True)
