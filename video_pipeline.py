@@ -1,42 +1,34 @@
-# video_pipeline_py_GODMODE.txt
-# Save this file as: video_pipeline.py
-#
-# GODMODE video engine (fast, deterministic, Streamlit Cloud-safe)
-#
-# Pipeline (immutable):
-# images -> concat -> video -> mux audio -> MP4 validate
-#
-# Rules:
-# - 9:16: FILL FRAME ALWAYS (scale up + crop). Never pad.
-# - No token-burn best-of selection.
-# - Deterministic scene mapping.
-# - Cache images per segment under extract_dir to speed reruns safely.
-#
-# Required exports used by app.py:
-# - extract_zip_to_temp
-# - find_files
-# - pair_segments
-# - segment_label
-# - safe_slug
-# - ffmpeg_exe
-# - run_cmd
-# - ffprobe_duration_seconds
-# - default_max_scenes
-# - render_segment_mp4
+# video_pipeline.py
+"""
+UAPpress — Video Pipeline (GODMODE)
+
+Immutable pipeline:
+1) Script -> scene prompts (deterministic, low-token)
+2) Images (OpenAI images API) cached per segment UID
+3) Concat images into a real H.264 MP4 (no black video)
+4) Mux narration audio (AAC) -> final MP4
+5) Optional burn-in subtitles (from script) via libass
+6) Validate output (size, duration, streams)
+
+Design:
+- CPU-first
+- Streamlit Cloud-safe (no ffprobe required; fallback parser)
+- Cache the expensive steps
+- Never upload invalid artifacts (validation helper exposed)
+"""
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import os
 import re
-import time
-import json
 import shutil
-import zipfile
-import base64
-import hashlib
 import subprocess
 import tempfile
+import time
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -52,8 +44,9 @@ _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
 _DEFAULT_IMAGE_MODEL = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1")
 _DEFAULT_IMAGE_SIZE_169 = os.environ.get("UAPPRESS_IMAGE_SIZE_169", "1536x1024")
 _DEFAULT_IMAGE_SIZE_916 = os.environ.get("UAPPRESS_IMAGE_SIZE_916", "1024x1536")
-_IMAGE_CACHE_DIRNAME = os.environ.get("UAPPRESS_IMAGE_CACHE_DIRNAME", "_images_cache_v1")
+_IMAGE_CACHE_DIRNAME = os.environ.get("UAPPRESS_IMAGE_CACHE_DIRNAME", "_images_cache_v2")
 
+# House style: realistic + cinematic documentary stills
 _VISUAL_STYLE = (
     "Photorealistic investigative documentary still. Natural light, realistic materials, "
     "cinematic composition, subtle film grain, credible staging. "
@@ -68,6 +61,17 @@ _SHOTS = [
     "Medium from behind (observer POV), faces not visible.",
     "Close-up of objects (papers, radios, maps), practical lighting.",
 ]
+
+
+# ----------------------------
+# Small utilities
+# ----------------------------
+
+def safe_rmtree(path: Union[str, Path]) -> None:
+    try:
+        shutil.rmtree(str(path), ignore_errors=True)
+    except Exception:
+        pass
 
 
 def safe_slug(text: str, max_len: int = 60) -> str:
@@ -128,18 +132,63 @@ def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
             except Exception:
                 pass
 
-    # Fallback (Streamlit Cloud often missing ffprobe)
     ff = ffmpeg_exe()
     proc2 = subprocess.run([ff, "-hide_banner", "-i", p], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return _parse_duration_from_ffmpeg_stderr(proc2.stderr or "")
 
 
-def default_max_scenes(is_vertical: bool) -> int:
-    return 6 if is_vertical else 12
+def has_audio_stream(path: Union[str, Path]) -> bool:
+    p = str(path)
+    fp = which_ffprobe()
+    if fp:
+        proc = subprocess.run([fp, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
+                               "-of", "default=nw=1:nk=1", p], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return proc.returncode == 0 and bool((proc.stdout or "").strip())
+    # fallback: naive grep
+    ff = ffmpeg_exe()
+    proc2 = subprocess.run([ff, "-hide_banner", "-i", p], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return "Audio:" in (proc2.stderr or "")
 
+
+def has_video_stream(path: Union[str, Path]) -> bool:
+    p = str(path)
+    fp = which_ffprobe()
+    if fp:
+        proc = subprocess.run([fp, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+                               "-of", "default=nw=1:nk=1", p], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return proc.returncode == 0 and bool((proc.stdout or "").strip())
+    ff = ffmpeg_exe()
+    proc2 = subprocess.run([ff, "-hide_banner", "-i", p], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return "Video:" in (proc2.stderr or "")
+
+
+def validate_mp4(path: Union[str, Path], min_bytes: int = 50_000) -> Tuple[bool, str]:
+    p = Path(path)
+    if not p.exists():
+        return False, "missing"
+    if p.stat().st_size < int(min_bytes):
+        return False, "too_small"
+    dur = float(ffprobe_duration_seconds(p))
+    if dur <= 0.05:
+        return False, "zero_duration"
+    if not has_video_stream(p):
+        return False, "no_video_stream"
+    # audio is expected in this app
+    if not has_audio_stream(p):
+        return False, "no_audio_stream"
+    return True, "ok"
+
+
+def default_max_scenes(is_vertical: bool) -> int:
+    return 10 if is_vertical else 16
+
+
+# ----------------------------
+# ZIP handling + pairing
+# ----------------------------
 
 def extract_zip_to_temp(zip_bytes_or_path: Union[bytes, str, Path]) -> Tuple[str, str]:
-    workdir = tempfile.mkdtemp(prefix="uappress_god_")
+    workdir = tempfile.mkdtemp(prefix="uappress_vc_")
     extract_dir = str(Path(workdir) / "extracted")
     Path(extract_dir).mkdir(parents=True, exist_ok=True)
 
@@ -224,22 +273,6 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
 
         kind = _guess_kind_from_name(sp.name)
 
-        title_guess = ""
-        try:
-            preview = sp.read_text(encoding="utf-8", errors="ignore").strip()
-            for line in preview.splitlines():
-                raw = line.strip()
-                if not raw:
-                    continue
-                if raw.startswith("#"):
-                    title_guess = raw.lstrip("#").strip()[:120]
-                    break
-                if raw.lower().startswith("title:"):
-                    title_guess = raw.split(":", 1)[1].strip()[:120]
-                    break
-        except Exception:
-            pass
-
         seed = f"script:{str(sp.resolve())}|audio:{str(Path(a_match).resolve()) if a_match else ''}"
         uid = _stable_hash(seed, 14)
 
@@ -248,13 +281,16 @@ def pair_segments(scripts: List[str], audios: List[str]) -> List[Dict[str, Any]]
                 "script_path": str(sp),
                 "audio_path": str(a_match),
                 "kind_guess": kind,
-                "title_guess": title_guess,
                 "uid": uid,
             }
         )
 
     return pairs
 
+
+# ----------------------------
+# Script -> prompts (deterministic)
+# ----------------------------
 
 def _sanitize(text: str, max_chars: int = 320) -> str:
     s = (text or "").strip()
@@ -264,23 +300,33 @@ def _sanitize(text: str, max_chars: int = 320) -> str:
     return s
 
 
-def _choose_beats(script_text: str, n: int) -> List[str]:
+def _split_into_beats(script_text: str) -> List[str]:
+    # Prefer paragraph beats; fallback to sentences.
     paras = [p.strip() for p in re.split(r"\n\s*\n+", script_text or "") if p.strip()]
-    if not paras:
-        paras = [p.strip() for p in re.split(r"(?<=[\.\?\!])\s+", (script_text or "").strip()) if p.strip()]
-    if not paras:
+    if paras:
+        return paras
+    s = (script_text or "").strip()
+    if not s:
+        return []
+    sents = [p.strip() for p in re.split(r"(?<=[\.\?\!])\s+", s) if p.strip()]
+    return sents if sents else [s]
+
+
+def _choose_beats(script_text: str, n: int) -> List[str]:
+    beats = _split_into_beats(script_text)
+    if not beats:
         return []
     n = max(1, int(n))
-    if len(paras) <= n:
-        return paras
-    step = len(paras) / float(n)
-    idxs = [min(len(paras) - 1, int(i * step)) for i in range(n)]
+    if len(beats) <= n:
+        return beats
+    step = len(beats) / float(n)
+    idxs = [min(len(beats) - 1, int(i * step)) for i in range(n)]
     out: List[str] = []
     last = -1
     for i in idxs:
         if i == last:
-            i = min(len(paras) - 1, i + 1)
-        out.append(paras[i])
+            i = min(len(beats) - 1, i + 1)
+        out.append(beats[i])
         last = i
     return out[:n]
 
@@ -289,20 +335,24 @@ def _image_size_for_wh(width: int, height: int) -> str:
     return _DEFAULT_IMAGE_SIZE_916 if height > width else _DEFAULT_IMAGE_SIZE_169
 
 
-def _build_prompts(script_text: str, max_scenes: int) -> List[str]:
-    beats = _choose_beats(script_text, max_scenes)
+def _build_prompts(script_text: str, n_scenes: int) -> List[str]:
+    beats = _choose_beats(script_text, n_scenes)
     prompts: List[str] = []
     for i, b in enumerate(beats):
-        snippet = _sanitize(b, 300)
+        snippet = _sanitize(b, 280)
         cam = _SHOTS[i % len(_SHOTS)]
         prompts.append(
-            "Create one image.\n"
+            "Create ONE image.\n"
             f"STYLE: {_VISUAL_STYLE}\n"
             f"CAMERA: {cam}\n"
             f"SCENE: {snippet}\n"
         )
     return prompts
 
+
+# ----------------------------
+# OpenAI images (cached)
+# ----------------------------
 
 def _openai_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
     if OpenAI is None:
@@ -332,7 +382,7 @@ def _segment_cache_dir(extract_dir: str, uid: str) -> Path:
     return root
 
 
-def _is_good_image(path: Path, min_bytes: int = 50_000) -> bool:
+def _is_good_image(path: Path, min_bytes: int = 30_000) -> bool:
     try:
         return path.exists() and path.stat().st_size >= int(min_bytes)
     except Exception:
@@ -340,10 +390,12 @@ def _is_good_image(path: Path, min_bytes: int = 50_000) -> bool:
 
 
 def _ensure_images(*, extract_dir: str, uid: str, api_key: str, prompts: List[str], size: str) -> List[Path]:
-    out: List[Path] = []
     cache = _segment_cache_dir(extract_dir, uid)
+    out: List[Path] = []
     for i, prompt in enumerate(prompts, start=1):
-        img_path = cache / f"img_{i:02d}.png"
+        # prompt-hash to avoid "polluted cache" if prompts change
+        ph = _stable_hash(prompt, 10)
+        img_path = cache / f"img_{i:02d}_{ph}.png"
         if _is_good_image(img_path):
             out.append(img_path)
             continue
@@ -353,23 +405,165 @@ def _ensure_images(*, extract_dir: str, uid: str, api_key: str, prompts: List[st
     return out
 
 
+# ----------------------------
+# Subtitles (from script) -> SRT
+# ----------------------------
+
+def _clean_sub_text(s: str) -> str:
+    s = (s or "").replace("\\", "")  # kill backslashes (recurring bug)
+    s = s.replace("\ufeff", "")
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s
+
+
+def _to_srt_timestamp(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    ms = int(round((seconds - int(seconds)) * 1000.0))
+    s = int(seconds) % 60
+    m = (int(seconds) // 60) % 60
+    h = int(seconds) // 3600
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def make_srt_from_script(script_text: str, audio_duration: float, out_srt: Union[str, Path]) -> str:
+    """
+    Deterministic subtitles: split script into short readable chunks and spread across duration.
+    """
+    text = _clean_sub_text(script_text)
+    if not text:
+        Path(out_srt).write_text("", encoding="utf-8")
+        return str(out_srt)
+
+    # Chunk by sentences, then pack into ~48 chars lines
+    sents = [t.strip() for t in re.split(r"(?<=[\.\?\!])\s+", text) if t.strip()]
+    if not sents:
+        sents = [text]
+
+    chunks: List[str] = []
+    buf = ""
+    for s in sents:
+        if not buf:
+            buf = s
+        elif len(buf) + 1 + len(s) <= 92:
+            buf = buf + " " + s
+        else:
+            chunks.append(buf)
+            buf = s
+    if buf:
+        chunks.append(buf)
+
+    # prevent tiny durations per caption
+    n = max(1, len(chunks))
+    dur = max(0.5, float(audio_duration))
+    per = max(1.2, min(5.5, dur / n))  # readable
+    # if duration is short, reduce chunk count
+    if dur / n < 1.0:
+        n2 = max(1, int(dur / 1.0))
+        chunks = chunks[:n2]
+        n = len(chunks)
+        per = dur / n
+
+    t = 0.0
+    lines: List[str] = []
+    for i, c in enumerate(chunks, start=1):
+        start = t
+        end = min(dur, t + per)
+        # clamp final
+        if i == n:
+            end = dur
+        lines.append(str(i))
+        lines.append(f"{_to_srt_timestamp(start)} --> {_to_srt_timestamp(end)}")
+        lines.append(c)
+        lines.append("")
+        t = end
+
+    Path(out_srt).write_text("\n".join(lines), encoding="utf-8")
+    return str(out_srt)
+
+
+# ----------------------------
+# FFmpeg assembly
+# ----------------------------
+
 def _concat_list_file(images: List[Path], seconds_per: float) -> Path:
-    seconds_per = max(0.5, float(seconds_per))
+    seconds_per = max(0.25, float(seconds_per))
     p = Path(tempfile.mkstemp(prefix="uappress_concat_", suffix=".txt")[1])
     lines: List[str] = []
     for img in images:
         lines.append(f"file '{img.as_posix()}'")
         lines.append(f"duration {seconds_per:.3f}")
+    # repeat last file (concat demuxer requirement)
     lines.append(f"file '{images[-1].as_posix()}'")
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return p
 
 
 def _vf_fill_frame(width: int, height: int) -> str:
-    return (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},format=yuv420p"
+    # FILL FRAME ALWAYS: scale up + crop, never pad.
+    return f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
+
+
+def _vf_subtitles(srt_path: Union[str, Path], style: Dict[str, Any]) -> str:
+    # libass style string
+    font = style.get("font_name", "DejaVu Sans")
+    size = int(style.get("font_size", 40))
+    outline = int(style.get("outline", 2))
+    shadow = int(style.get("shadow", 1))
+    border_style = int(style.get("border_style", 3))
+    alignment = int(style.get("alignment", 2))
+    margin_v = int(style.get("margin_v", 40))
+
+    # ASS color format: &HAABBGGRR (we use white + semi-black box)
+    force = (
+        f"FontName={font},"
+        f"FontSize={size},"
+        f"BorderStyle={border_style},"
+        f"Outline={outline},"
+        f"Shadow={shadow},"
+        f"PrimaryColour=&H00FFFFFF,"
+        f"BackColour=&H80000000,"
+        f"Alignment={alignment},"
+        f"MarginV={margin_v}"
     )
+    # IMPORTANT: path must be escaped for ffmpeg filtergraph
+    p = str(Path(srt_path).as_posix()).replace(":", r"\:")
+    return f"subtitles='{p}':force_style='{force}'"
+
+
+def _compute_scene_plan(
+    *,
+    audio_duration: float,
+    max_scenes: int,
+    target_scene_seconds: float,
+    min_scene_seconds: float,
+    max_scene_seconds: float,
+) -> Tuple[int, float]:
+    """
+    Decide scene count and seconds per scene to cover full audio duration,
+    respecting min/max per scene, capped by max_scenes.
+    """
+    dur = max(0.5, float(audio_duration))
+    max_scenes = max(1, int(max_scenes))
+    target = max(0.5, float(target_scene_seconds))
+    min_s = max(0.25, float(min_scene_seconds))
+    max_s = max(min_s, float(max_scene_seconds))
+
+    # initial guess
+    n = int(round(dur / target))
+    n = max(1, min(max_scenes, n))
+    sec = dur / n
+
+    # adjust to satisfy sec within [min_s, max_s]
+    if sec < min_s:
+        n = int(max(1, min(max_scenes, dur / min_s)))
+        sec = dur / n
+    elif sec > max_s:
+        n = int(max(1, min(max_scenes, dur / max_s)))
+        sec = dur / n
+
+    # final clamp
+    sec = max(min_s, min(max_s, sec))
+    return int(n), float(sec)
 
 
 def render_segment_mp4(
@@ -378,14 +572,21 @@ def render_segment_mp4(
     extract_dir: str,
     out_path: str,
     api_key: str,
-    fps: int = 30,
-    width: int = 1280,
-    height: int = 720,
-    zoom_strength: float = 0.0,
-    max_scenes: int = 12,
-    min_scene_seconds: int = 6,
-    max_scene_seconds: int = 120,
+    fps: int = 24,
+    width: int = 1080,
+    height: int = 1920,
+    zoom_strength: float = 0.0,  # reserved (0.0 means off)
+    max_scenes: int = 14,
+    target_scene_seconds: float = 4.0,
+    min_scene_seconds: float = 1.0,
+    max_scene_seconds: float = 12.0,
+    burn_subtitles: bool = True,
+    subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """
+    Render one segment MP4 with real frames + narration audio.
+    Optional: burn-in subtitles generated from script text.
+    """
     sp = Path(pair.get("script_path") or "")
     ap = Path(pair.get("audio_path") or "")
     uid = str(pair.get("uid") or _stable_hash(str(sp) + "|" + str(ap), 14))
@@ -404,50 +605,114 @@ def render_segment_mp4(
         raise RuntimeError(f"Audio duration invalid: {ap.name}")
 
     is_vertical = height > width
-    max_scenes = max(1, int(max_scenes or default_max_scenes(is_vertical)))
-    max_scenes = min(60, max_scenes)
+    fps = int(max(15, min(60, int(fps))))
 
-    prompts = _build_prompts(script_text, max_scenes)
+    # scene plan
+    n_scenes, sec_per = _compute_scene_plan(
+        audio_duration=dur,
+        max_scenes=int(max_scenes or default_max_scenes(is_vertical)),
+        target_scene_seconds=float(target_scene_seconds),
+        min_scene_seconds=float(min_scene_seconds),
+        max_scene_seconds=float(max_scene_seconds),
+    )
+
+    prompts = _build_prompts(script_text, n_scenes)
     if not prompts:
         raise RuntimeError("Unable to derive prompts from script.")
 
     size = _image_size_for_wh(width, height)
     imgs = _ensure_images(extract_dir=extract_dir, uid=uid, api_key=api_key, prompts=prompts, size=size)
 
-    sec_per = dur / float(len(imgs))
-    sec_per = max(float(min_scene_seconds), min(float(max_scene_seconds), sec_per))
-
+    # concat list
     lst = _concat_list_file(imgs, sec_per)
 
     outp = Path(out_path)
     outp.parent.mkdir(parents=True, exist_ok=True)
 
-    vf = _vf_fill_frame(width, height)
-    preset = "veryfast"
-    crf = "20" if is_vertical else "19"
+    # intermediate video without subtitles (but with audio)
+    tmp_video = outp.with_suffix(".tmp.mp4")
+    tmp_video2 = outp.with_suffix(".tmp2.mp4")
 
-    cmd = [
+    vf = _vf_fill_frame(width, height)
+
+    # Step A: images -> video stream (no audio) with explicit timebase
+    cmd_video = [
         ffmpeg_exe(),
         "-hide_banner",
         "-loglevel", "error",
-        "-r", str(int(fps)),
         "-f", "concat",
         "-safe", "0",
         "-i", str(lst),
-        "-i", str(ap),
         "-vf", vf,
+        "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", preset,
+        "-preset", "veryfast",
         "-tune", "stillimage",
-        "-crf", crf,
+        "-crf", "19" if not is_vertical else "20",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(tmp_video),
+    ]
+    run_ffmpeg(cmd_video)
+
+    # Step B: mux narration audio (guarantee audio exists)
+    # -shortest ensures video trims to audio if image-track runs longer.
+    cmd_mux = [
+        ffmpeg_exe(),
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(tmp_video),
+        "-i", str(ap),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
-        str(outp),
+        "-movflags", "+faststart",
+        str(tmp_video2),
     ]
-    run_ffmpeg(cmd)
+    run_ffmpeg(cmd_mux)
 
-    if not outp.exists() or outp.stat().st_size < 80_000:
-        raise RuntimeError("Render produced an invalid/too-small MP4.")
-    if float(ffprobe_duration_seconds(outp)) <= 0.05:
-        raise RuntimeError("Render produced zero-duration MP4.")
+    # Optional Step C: burn subtitles (keeps audio)
+    final_in = tmp_video2
+    if burn_subtitles:
+        srt_path = outp.with_suffix(".srt")
+        make_srt_from_script(script_text, dur, srt_path)
+        style = subtitle_style or {"font_name": "DejaVu Sans", "font_size": int(max(30, height * 0.047)), "margin_v": int(max(24, height * 0.06))}
+        vf2 = vf + "," + _vf_subtitles(srt_path, style)
+        cmd_sub = [
+            ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(tmp_video2),
+            "-vf", vf2,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "19" if not is_vertical else "20",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(outp),
+        ]
+        run_ffmpeg(cmd_sub)
+    else:
+        shutil.move(str(tmp_video2), str(outp))
+
+    # Cleanup temps
+    for p in [tmp_video, tmp_video2]:
+        try:
+            if Path(p).exists():
+                Path(p).unlink()
+        except Exception:
+            pass
+    try:
+        if Path(lst).exists():
+            Path(lst).unlink()
+    except Exception:
+        pass
+
+    ok, why = validate_mp4(outp)
+    if not ok:
+        raise RuntimeError(f"Render produced invalid MP4 ({why}).")
+
+
