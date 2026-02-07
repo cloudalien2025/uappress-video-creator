@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import io
 import os
 import re
@@ -116,6 +117,48 @@ def _parse_duration_from_ffmpeg_stderr(stderr_text: str) -> float:
     ss = float(m.group(3))
     return hh * 3600.0 + mm * 60.0 + ss
 
+
+
+def _decode_duration_seconds(path: Union[str, Path]) -> float:
+    """Accurate duration by decoding to null and parsing final time=. Slower but robust."""
+    ff = ffmpeg_exe()
+    p = str(path)
+    proc = subprocess.run(
+        [ff, "-hide_banner", "-loglevel", "info", "-i", p, "-vn", "-f", "null", "-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    text = proc.stderr or ""
+    # find last time=XX:YY:ZZ.xx
+    matches = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if not matches:
+        return 0.0
+    hh, mm, ss = matches[-1]
+    try:
+        return float(hh) * 3600.0 + float(mm) * 60.0 + float(ss)
+    except Exception:
+        return 0.0
+
+
+def audio_duration_seconds(path: Union[str, Path]) -> float:
+    """Best-effort duration with safety: if metadata duration looks suspiciously short, decode to confirm."""
+    p = Path(path)
+    d = float(ffprobe_duration_seconds(p))
+    try:
+        sz = p.stat().st_size
+    except Exception:
+        sz = 0
+    # Heuristic: large file but tiny reported duration => wrong header; decode for truth.
+    if d > 0 and sz > 250_000 and d < 12.0:
+        d2 = float(_decode_duration_seconds(p))
+        if d2 > d * 1.5:
+            return d2
+    if d <= 0.0 and sz > 0:
+        d2 = float(_decode_duration_seconds(p))
+        if d2 > 0:
+            return d2
+    return d
 
 def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
     p = str(path)
@@ -600,7 +643,7 @@ def render_segment_mp4(
     if not script_text:
         raise RuntimeError(f"Empty script file: {sp.name}")
 
-    dur = float(ffprobe_duration_seconds(ap))
+    dur = float(audio_duration_seconds(ap))
     if dur <= 0.1:
         raise RuntimeError(f"Audio duration invalid: {ap.name}")
 
@@ -680,7 +723,7 @@ def render_segment_mp4(
         srt_path = outp.with_suffix(".srt")
         make_srt_from_script(script_text, dur, srt_path)
         style = subtitle_style or {"font_name": "DejaVu Sans", "font_size": int(max(30, height * 0.047)), "margin_v": int(max(24, height * 0.06))}
-        vf2 = vf + "," + _vf_subtitles(srt_path, style)
+        vf2 = _vf_subtitles(srt_path, style)
         cmd_sub = [
             ffmpeg_exe(),
             "-hide_banner",
