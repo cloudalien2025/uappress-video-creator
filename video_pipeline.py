@@ -1181,7 +1181,7 @@ def build_scene_clip_from_image(
     yexpr = "ih/2-(ih/zoom/2)"
 
     vf = (
-        f"scale={sw}:{sh},"
+        f"scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
         f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':d={frames}:s={w}x{h}:fps={fps_i},"
         f"format=yuv420p"
     )
@@ -1767,10 +1767,22 @@ def _ass_time(t: float) -> str:
 
 
 def _escape_ass_text(s: str) -> str:
+    """Escape text for ASS while preserving ASS newline token \\N.
+
+    We must NOT escape \\N (newline) because libass interprets it as a hard line break.
+    """
+    placeholder = "\uE000ASS_NEWLINE\uE000"
+    s = str(s or "")
+    # Preserve ASS newline token before escaping backslashes.
+    s = s.replace("\\N", placeholder)
+
     # ASS special chars: { } and backslashes
     s = s.replace("\\", r"\\")
-    s = s.replace("{", r"\{")
-    s = s.replace("}", r"\}")
+    s = s.replace("{", r"\\{")
+    s = s.replace("}", r"\\}")
+
+    # Restore newline token
+    s = s.replace(placeholder, r"\\N")
     return s
 
 
