@@ -1,20 +1,13 @@
-# app_py_GODMODE.txt
-# Save this file as: app.py
+# app_py_GODMODE_v2.txt
+# Save as: app.py
 #
 # GODMODE Streamlit Orchestrator (thin shell)
-# ZIP upload (MP3 + scripts) → deterministic segment render → optional DigitalOcean Spaces auto-upload
+# ZIP upload (MP3 + scripts/subtitle text) → deterministic segment render → optional DigitalOcean Spaces auto-upload
 #
-# Non-negotiables respected:
-# - ZIP-based input
-# - OpenAI as AI backbone (images)
-# - DigitalOcean Spaces output
-# - Streamlit + GitHub compatible
-#
-# Design goals:
-# - Fast iteration velocity
-# - Rerun-safe state
-# - Cost disciplined (no unnecessary API calls)
-# - Minimal UI (Ferrari: clean, purposeful)
+# New in v2:
+# - Checkbox: Burn-in subtitles (default ON)
+# - Pass subtitle toggle to pipeline
+# - Improved MP4 validation (ensures audio stream exists)
 
 from __future__ import annotations
 
@@ -25,7 +18,7 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 import streamlit as st
 
@@ -41,27 +34,22 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 
 
-# ----------------------------
-# Page
-# ----------------------------
 st.set_page_config(page_title="UAPpress — GODMODE", layout="wide")
 st.title("⚡ UAPpress — GODMODE")
 st.caption("ZIP in → MP4s out → Spaces. Fast. Deterministic. Cheap.")
 
-# ----------------------------
-# Session state (rerun-safe)
-# ----------------------------
 DEFAULTS = {
     "api_key": "",
     "mode": "Long-form (16:9)",
     "res_169": "1280x720",
     "res_916": "1080x1920",
+    "burn_subtitles": True,   # default ON (per your command)
     "zip_root": "",
     "zip_path": "",
     "workdir": "",
     "extract_dir": "",
     "pairs": [],
-    "generated": {},  # idx_str -> mp4_path
+    "generated": {},          # idx_str -> mp4_path
     "gen_log": [],
     "is_generating": False,
     "stop_requested": False,
@@ -86,15 +74,12 @@ def _ulog(msg: str) -> None:
 
 
 def _reset_all() -> None:
-    # Clean extracted workdir
     try:
         wd = st.session_state.get("workdir", "")
         if wd and os.path.isdir(wd):
             shutil.rmtree(wd, ignore_errors=True)
     except Exception:
         pass
-
-    # Clean uploaded zip root
     try:
         zr = st.session_state.get("zip_root", "")
         if zr and os.path.isdir(zr):
@@ -102,7 +87,6 @@ def _reset_all() -> None:
     except Exception:
         pass
 
-    # Reset fields
     for k in ("zip_root", "zip_path", "workdir", "extract_dir"):
         st.session_state[k] = ""
     st.session_state["pairs"] = []
@@ -278,7 +262,7 @@ def _job_prefix() -> str:
     return f"uappress/godmode/{mode_slug}/{ts}/"
 
 
-def _is_valid_mp4(path: str, min_bytes: int = 80_000) -> Tuple[bool, str]:
+def _is_valid_mp4_with_audio(path: str, min_bytes: int = 80_000) -> Tuple[bool, str]:
     try:
         p = Path(path)
         if not p.exists():
@@ -288,6 +272,9 @@ def _is_valid_mp4(path: str, min_bytes: int = 80_000) -> Tuple[bool, str]:
         dur = float(vp.ffprobe_duration_seconds(str(p)))
         if dur <= 0.05:
             return False, "zero_duration"
+        # Require audio stream if burn_subtitles is on or generally for your workflow
+        if not vp.has_audio_stream(str(p)):
+            return False, "no_audio_stream"
         return True, f"ok_dur={dur:.2f}s"
     except Exception as e:
         return False, f"error:{type(e).__name__}"
@@ -321,6 +308,9 @@ with st.sidebar:
             index=1 if st.session_state.get("res_916") == "1080x1920" else 0,
         )
 
+    st.header("📝 Subtitles")
+    st.session_state["burn_subtitles"] = st.checkbox("Burn-in subtitles", value=bool(st.session_state.get("burn_subtitles", True)))
+
     st.header("☁️ Spaces Upload")
     auto_upload = st.toggle("Auto-upload to Spaces", value=True)
     make_public = st.toggle("Public-read ACL", value=True)
@@ -349,14 +339,13 @@ if uploaded is not None:
     st.session_state["workdir"] = workdir
     st.session_state["extract_dir"] = extract_dir
 
-    scripts, audios = vp.find_files(extract_dir)
+    scripts, audios, subs = vp.find_files(extract_dir)
     if not scripts:
-        st.error("No script files (.txt/.md) found in ZIP.")
+        st.error("No script files (.txt/.md/.srt) found in ZIP.")
     elif not audios:
         st.error("No audio files found in ZIP.")
     else:
-        pairs = vp.pair_segments(scripts, audios)
-
+        pairs = vp.pair_segments(scripts, audios, subs)
         missing = [Path(p["script_path"]).name for p in pairs if p.get("script_path") and not p.get("audio_path")]
         if missing:
             st.error("Missing audio for scripts: " + ", ".join(missing))
@@ -369,7 +358,8 @@ if st.session_state.get("pairs"):
         for i, p in enumerate(st.session_state["pairs"], start=1):
             sp = Path(p.get("script_path") or "").name
             ap = Path(p.get("audio_path") or "").name
-            st.write(f"{i:02d}. **{vp.segment_label(p)}** — {sp} ↔ {ap}")
+            sr = Path(p.get("subtitle_path") or "").name if p.get("subtitle_path") else "(auto)"
+            st.write(f"{i:02d}. **{vp.segment_label(p)}** — {sp} ↔ {ap} — subtitles: {sr}")
 
 
 # ----------------------------
@@ -429,6 +419,8 @@ if go:
             st.warning("Auto-upload disabled (Spaces init failed). See Upload Log.")
 
     n = len(pairs)
+    burn_subs = bool(st.session_state.get("burn_subtitles", True))
+
     for idx, pair in enumerate(pairs, start=1):
         if st.session_state.get("stop_requested"):
             _log("Stopped before next segment.")
@@ -456,6 +448,7 @@ if go:
                 min_scene_seconds=6,
                 max_scene_seconds=120,
                 zoom_strength=0.0,
+                burn_subtitles=burn_subs,
             )
             dt = time.time() - t0
             st.session_state["generated"][f"{idx:02d}"] = out_path
@@ -463,7 +456,7 @@ if go:
 
         # Upload
         if auto_upload and s3 and bucket and region:
-            ok, why = _is_valid_mp4(out_path)
+            ok, why = _is_valid_mp4_with_audio(out_path)
             if not ok:
                 _ulog(f"⛔ skip upload (invalid {why}): {name}")
             else:
@@ -494,6 +487,7 @@ if go:
                 "prefix": job_prefix,
                 "mode": st.session_state.get("mode", ""),
                 "resolution": f"{w}x{h}",
+                "burn_subtitles": burn_subs,
                 "files": [Path(p).name for p in st.session_state["generated"].values()],
                 "urls": st.session_state["spaces_public_urls"],
                 "updated_at": datetime.now().isoformat(),
