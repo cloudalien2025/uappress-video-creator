@@ -1,454 +1,153 @@
-# ============================================================
-# video_pipeline.py — UAPpress Video Creator
+# video_pipeline_py_GODMODE_v2.txt
+# Save as: video_pipeline.py
 #
-# SECTION 1 — Core helpers + core render primitives
-# SECTION 2 — app.py compatibility layer
+# GODMODE video engine (fast, deterministic, Streamlit Cloud-safe)
 #
-# GOAL: Fully compatible with the provided app.py (no import/syntax errors)
+# Fixes in v2:
+# - Audio sanity checks (rejects silent/un-decodable audio)
+# - Correct concat-demuxer usage to honor per-image durations
+# - Ensures audio stream is actually muxed (explicit -map)
+# - Burn-in subtitles toggle (default on in app), robust sanitization (kills visible backslashes)
 #
-# Compatibility targets (as used by app.py):
-#   - extract_zip_to_temp(zip_bytes_or_path) -> (workdir, extract_dir)
-#   - find_files(extract_dir) -> (scripts, audios)
-#   - pair_segments(scripts, audios) -> list[dict] (pair objects)
-#   - segment_label(pair) -> "INTRO" / "OUTRO" / "CHAPTER X" / "SEGMENT"
-#   - safe_slug(text, max_len=...) -> str
-#   - ffmpeg_exe() -> str
-#   - run_cmd(cmd_list) -> None
-#   - render_segment_mp4(pair=..., extract_dir=..., out_path=..., api_key=..., fps=...,
-#                        width=..., height=..., zoom_strength=..., max_scenes=...,
-#                        min_scene_seconds=..., max_scene_seconds=...) -> None
-#
-# Notes:
-# - Optional burned-in subtitles supported; no logos; no stitching.
-# - Pipeline order: images -> scene clips -> concatenate -> mux audio (no black video).
-# - Audio-driven timing + end buffer ~0.5–0.75s (default 0.65s).
-# - Optional branding functions/classes exist for app.py detection:
-#     BrandIntroOutroSpec + generate_sora_brand_intro_outro(...)
-# - 9:16 is supported via width/height passed in from app.py.
-#
-# IMPORTANT:
-# - This file keeps external dependencies optional/guarded.
-# - Image generation uses OpenAI Images API when available; falls back to local placeholders
-#   if generation fails (to avoid crashing the whole pipeline).
-#
-# FIXES INCLUDED (per your issues):
-#   1) ffprobe missing on Streamlit Cloud: duration detection now falls back to parsing ffmpeg output
-#      if ffprobe isn't available.
-#   2) Repeated images across segments: cache key collisions fixed by using a stable per-file hash
-#      in pair['base_name'], so different segments never share the same image cache folder.
-#   3) Black video symptom: placeholders are still possible if image generation fails, but:
-#      - supported image sizes are used by default (gpt-image-1 friendly)
-#      - placeholders are a bit brighter (not near-black) so failures are visually obvious
-# ============================================================
+# Pipeline (immutable):
+# images -> concat -> video -> mux audio -> (optional burn subtitles) -> validate MP4
 
 from __future__ import annotations
 
-
-import dataclasses
 import io
-import json
-import math
 import os
-import hashlib
 import re
+import time
+import json
 import shutil
+import zipfile
+import base64
+import hashlib
 import subprocess
 import tempfile
-import time
-import zipfile
-from dataclasses import dataclass
-from hashlib import sha1
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-
-# Optional deps (guarded)
-try:
-    import imageio_ffmpeg  # type: ignore
-except Exception:
-    imageio_ffmpeg = None  # type: ignore
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 try:
     from openai import OpenAI  # type: ignore
 except Exception:
     OpenAI = None  # type: ignore
 
-try:
-    from PIL import Image, ImageDraw, ImageFont  # type: ignore
-except Exception:
-    Image = None  # type: ignore
-    ImageDraw = None  # type: ignore
-    ImageFont = None  # type: ignore
-
-
-# ----------------------------
-# Constants + small utilities
-# ----------------------------
-
-_END_BUFFER_MIN = 0.50
-_END_BUFFER_MAX = 0.75
-_DEFAULT_END_BUFFER = 0.65
-
-_DEFAULT_FPS = 30
-# ZIP parsing defaults
-_SCRIPT_EXTS = {".txt", ".md"}
+_SCRIPT_EXTS = {".txt", ".md"}          # script text
+_SUB_EXTS = {".srt", ".vtt"}           # optional pre-timed subs
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
 
-
-# Image generation defaults (override via env if desired)
-# IMPORTANT: gpt-image-1 supports sizes like 1024x1024, 1536x1024, 1024x1536.
 _DEFAULT_IMAGE_MODEL = os.environ.get("UAPPRESS_IMAGE_MODEL", "gpt-image-1")
 _DEFAULT_IMAGE_SIZE_169 = os.environ.get("UAPPRESS_IMAGE_SIZE_169", "1536x1024")
 _DEFAULT_IMAGE_SIZE_916 = os.environ.get("UAPPRESS_IMAGE_SIZE_916", "1024x1536")
+_IMAGE_CACHE_DIRNAME = os.environ.get("UAPPRESS_IMAGE_CACHE_DIRNAME", "_images_cache_v2")
 
-# Cache version knob (bump if you ever want to invalidate all cached images)
-_IMAGE_CACHE_ROOT = os.environ.get("UAPPRESS_IMAGE_CACHE_ROOT", "_image_cache_v2")
-
-
-# ----------------------------
-# Visual Bible (Positive-only, reusable across documentaries)
-# ----------------------------
-# This is a lightweight, always-on style guide. It does NOT ban motifs.
-# It provides consistent cinematic identity so scenes feel intentional.
-#
-# Design goals:
-# - Zero extra model calls (no token burn)
-# - Short prompts (no giant constraint walls)
-# - Reusable for any documentary topic
-#
-# If you want to tune house style later, change these strings only.
-
-_VISUAL_BIBLE_STYLE = (
-    "CINEMATIC VISUAL BIBLE: photorealistic documentary reenactment still. "
-    "Natural exposure, realistic materials, believable set dressing. "
-    "Restrained, tasteful color grade with subtle film grain. "
-    "Period-appropriate details when implied by context. "
-    "No on-image text, no captions, no subtitles, no logos, no watermarks."
+_VISUAL_STYLE = (
+    "Photorealistic investigative documentary still. Natural light, realistic materials, "
+    "cinematic composition, subtle film grain, credible staging. "
+    "No text, no captions, no logos, no watermarks."
 )
 
-# Concrete, neutral anchors that prevent generic / repetitive outputs.
-# Anchors are POSITIVE (what to show), not bans (what to avoid).
-_ANCHORS_BY_TYPE: dict[str, list[str]] = {
-    "ESTABLISHING": [
-        "a guarded base gate with signage and a small guard booth",
-        "a quiet airfield perimeter fence line at dusk",
-        "a two-lane road leading to a restricted facility, overcast sky",
-        "an exterior hangar area with service lights and parked vehicles",
-    ],
-    "DOCUMENT": [
-        "a tabletop evidence layout: folders, stamped paperwork, and a map with marked coordinates",
-        "a close view of archival documents on a desk beside a notepad and pen",
-        "a stack of reports and photographs spread under a desk lamp, shallow depth of field",
-        "a file folder and an index card box on an archival table, documentary lighting",
-    ],
-    "PROCESS": [
-        "a radar or operations room environment with period-appropriate equipment and dim practical lighting",
-        "a logbook open to handwritten entries beside a radio handset",
-        "a wall map with pins and string, an investigator’s hand marking a location",
-        "a filing cabinet drawer open with labeled folders, calm institutional interior",
-    ],
-    "WITNESS": [
-        "a witness perspective from behind, looking out toward a distant horizon",
-        "hands holding a notebook with sketches and notes, no readable text",
-        "a silhouette at a window, observing weather and light conditions outside",
-        "a person’s hands adjusting a camera or binoculars on a table, documentary realism",
-    ],
-    "INTERIOR": [
-        "a quiet institutional corridor with practical ceiling lights",
-        "an office desk with a rotary phone, paperwork, and a desk lamp",
-        "a hangar interior with tool carts and floor markings, grounded realism",
-        "a storage room with crates and shelving, restrained lighting",
-    ],
-    "ATMOSPHERE": [
-        "a night sky with moving clouds and faint ambient light, no defined object",
-        "an empty road at night with a single streetlight and haze",
-        "low clouds over flat terrain, calm and observational",
-        "a distant airfield light line through mist, documentary b-roll mood",
-    ],
-}
-
-# Shot variation wheel — cheap variety without token cost.
-_SHOT_WHEEL: list[str] = [
-    "CAMERA: wide establishing composition, eye-level camera, stable tripod framing.",
-    "CAMERA: medium documentary framing, slight push-in, natural perspective.",
-    "CAMERA: close detail composition, shallow depth of field, editorial lighting.",
-    "CAMERA: wide with foreground framing (fence line, doorway, window frame), calm composition.",
-    "CAMERA: medium from behind (observer POV), gentle lateral slide feel, grounded realism.",
-    "CAMERA: close-up of objects (maps, papers, radios, instruments), clean practical lighting.",
+_SHOTS = [
+    "Wide establishing frame, eye-level, stable tripod feel.",
+    "Medium documentary framing, natural perspective.",
+    "Close detail shot, shallow depth of field.",
+    "Wide with foreground framing (fence/window/doorway).",
+    "Medium from behind (observer POV), faces not visible.",
+    "Close-up of objects (papers, radios, maps), practical lighting.",
 ]
 
+
 # ----------------------------
-# Script Loading (REQUIRED)
+# Small helpers
 # ----------------------------
-# ----------------------------
-def load_segment_script(script_path: Union[str, Path]) -> str:
-    """
-    REQUIRED: Load narration script for a segment.
-
-    Option A contract:
-      - The extracted ZIP MUST contain a .txt script file for each segment.
-      - Scripts may live in subfolders inside the ZIP. We therefore load using the
-        exact script_path discovered during extraction, not by reconstructing a
-        root-level '<segment_id>.txt' path.
-
-    We hard-fail if missing or empty to prevent silent fallback visuals.
-    """
-    sp = Path(script_path)
-    if not sp.exists():
-        raise RuntimeError(
-            f"Missing required script file: {sp.name}. "
-            "The ZIP must include a .txt script file for each segment."
-        )
-    text = sp.read_text(encoding="utf-8", errors="ignore").strip()
-    if not text:
-        raise RuntimeError(f"Script file is empty: {sp.name}")
-    return text
-def _sanitize_scene_context(text: str, max_chars: int = 380, **_ignored: Any) -> str:
-    """Sanitize script text snippets before embedding into image prompts.
-
-    - Normalizes whitespace
-    - Enforces a hard length cap to prevent prompt bloat
-    - Accepts extra kwargs defensively to prevent call-site drift (Streamlit reruns / older call sites)
-    """
-    s = (text or "").strip()
-    if not s:
-        return ""
-    s = re.sub(r"\s+", " ", s).strip()
-
-    try:
-        mc = int(max_chars)
-    except Exception:
-        mc = 380
-    if mc < 40:
-        mc = 40
-    if mc > 2000:
-        mc = 2000
-
-    if len(s) > mc:
-        s = s[:mc].rstrip() + "…"
-    return s
-
-
-def clamp_float(x: float, lo: float, hi: float) -> float:
-    if x < lo:
-        return lo
-    if x > hi:
-        return hi
-    return x
-
-
-def clamp_int(x: int, lo: int, hi: int) -> int:
-    if x < lo:
-        return lo
-    if x > hi:
-        return hi
-    return x
-
-
-def sanitize_filename(name: str, keep: str = r"[^a-zA-Z0-9._-]+") -> str:
-    name = (name or "").strip().replace(" ", "_")
-    name = re.sub(keep, "", name)
-    return name or "unnamed"
-
-
 def safe_slug(text: str, max_len: int = 60) -> str:
-    """
-    app.py uses this to build file slugs.
-    """
     s = (text or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = s.strip("-")
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     if not s:
         s = "untitled"
-    return s[:max_len].strip("-") or "untitled"
+    return (s[:max_len].strip("-") or "untitled")
 
 
 def _stable_hash(s: str, n: int = 12) -> str:
-    """
-    Stable short hash for cache keys (prevents collisions across segments).
-    """
-    h = sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
-    return h[: max(6, int(n))]
-
-
-def ensure_dir(p: Union[str, Path]) -> Path:
-    path = Path(p)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def which_ffmpeg() -> str:
-    exe = shutil.which("ffmpeg")
-    if exe:
-        return exe
-    if imageio_ffmpeg is not None:
-        try:
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            pass
-    return "ffmpeg"
-
-
-def which_ffprobe() -> Optional[str]:
-    exe = shutil.which("ffprobe")
-    if exe:
-        return exe
-    # Streamlit Cloud often doesn't have ffprobe. Return None so we can fall back.
-    return None
-
-
-def run_cmd(cmd: List[str]) -> None:
-    """
-    app.py expects vp.run_cmd(...) for ffmpeg utility calls in Bonus exporter.
-    """
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
-        tail = (proc.stderr or "").strip()[-4000:]
-        raise RuntimeError(f"Command failed (code {proc.returncode}). Tail:\n{tail}")
+    return hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()[: max(6, int(n))]
 
 
 def ffmpeg_exe() -> str:
-    """
-    app.py expects vp.ffmpeg_exe()
-    """
-    return which_ffmpeg()
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def which_ffprobe() -> Optional[str]:
+    return shutil.which("ffprobe") or None
+
+
+def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 def run_ffmpeg(cmd: List[str]) -> None:
-    """
-    Internal: run ffmpeg and raise readable error.
-    """
     if "-y" not in cmd:
         cmd = cmd[:1] + ["-y"] + cmd[1:]
-    run_cmd(cmd)
+    rc, out, err = run_cmd(cmd)
+    if rc != 0:
+        tail = (err or "").strip()[-4000:]
+        raise RuntimeError(f"FFmpeg failed (code {rc}). Tail:\n{tail}")
 
 
 def _parse_duration_from_ffmpeg_stderr(stderr_text: str) -> float:
-    """
-    Parse: Duration: 00:01:23.45 from ffmpeg -i output.
-    Returns seconds or 0.0 if not found.
-    """
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr_text or "")
     if not m:
         return 0.0
-    try:
-        hh = float(m.group(1))
-        mm = float(m.group(2))
-        ss = float(m.group(3))
-        return hh * 3600.0 + mm * 60.0 + ss
-    except Exception:
-        return 0.0
+    hh = float(m.group(1))
+    mm = float(m.group(2))
+    ss = float(m.group(3))
+    return hh * 3600.0 + mm * 60.0 + ss
 
 
 def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
-    """
-    Return media duration seconds.
-
-    Primary: ffprobe if installed.
-    Fallback: ffmpeg -i <file> parse Duration line (works on Streamlit Cloud where ffprobe is missing).
-    """
     p = str(path)
-
-    ffprobe = which_ffprobe()
-    if ffprobe:
-        proc = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                p,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    fp = which_ffprobe()
+    if fp:
+        rc, out, err = run_cmd(
+            [fp, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", p]
         )
-        if proc.returncode == 0:
+        if rc == 0:
             try:
-                return float((proc.stdout or "").strip())
+                return float((out or "").strip())
             except Exception:
                 pass
-
-    # Fallback: ffmpeg -i parse stderr
-    ffmpeg = which_ffmpeg()
-    proc2 = subprocess.run(
-        [ffmpeg, "-hide_banner", "-i", p],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc2.returncode != 0:
-        # ffmpeg returns non-zero on -i without output often; stderr still contains Duration.
-        pass
-    return _parse_duration_from_ffmpeg_stderr(proc2.stderr or "")
+    # Fallback
+    ff = ffmpeg_exe()
+    rc, out, err = run_cmd([ff, "-hide_banner", "-i", p])
+    return _parse_duration_from_ffmpeg_stderr(err or "")
 
 
-def clamp_scene_seconds(value: float, min_scene_s: float, max_scene_s: float) -> float:
-    """
-    For Streamlit slider/session_state stability: clamp into [min_scene_s, max_scene_s]
-    """
-    min_scene_s = float(min_scene_s)
-    max_scene_s = float(max_scene_s)
-    if max_scene_s < min_scene_s:
-        max_scene_s = min_scene_s
-    return clamp_float(float(value), min_scene_s, max_scene_s)
+def has_audio_stream(path: Union[str, Path]) -> bool:
+    p = str(path)
+    fp = which_ffprobe()
+    if fp:
+        rc, out, err = run_cmd([fp, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", p])
+        if rc == 0:
+            return bool((out or "").strip())
+    # fallback parse
+    ff = ffmpeg_exe()
+    rc, out, err = run_cmd([ff, "-hide_banner", "-i", p])
+    return bool(re.search(r"Audio:\s", err or ""))
+
+
+def default_max_scenes(is_vertical: bool) -> int:
+    return 6 if is_vertical else 12
 
 
 # ----------------------------
-# Branding API (app.py compat)
+# ZIP workflow
 # ----------------------------
-
-
-
-def _write_bytes_to_file(data: Any, out_path: Path) -> Path:
-    """
-    Writes bytes / bytearray / stream-like .read() to a file.
-    """
-    if isinstance(data, (bytes, bytearray)):
-        out_path.write_bytes(bytes(data))
-        return out_path
-    if hasattr(data, "read"):
-        out_path.write_bytes(data.read())
-        return out_path
-    raise RuntimeError("Download returned unsupported type (expected bytes or stream-like).")
-
-
-def _download_openai_video_content(client: Any, content_id: str, out_path: Path) -> Path:
-    """
-    app.py wraps client.videos.content(video_id) to call the appropriate download.
-    That wrapper returns bytes/stream in most SDK shapes. We write it to disk here.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        data = client.videos.content(str(content_id))
-        return _write_bytes_to_file(data, out_path)
-    except Exception:
-        pass
-
-    try:
-        if hasattr(client.videos, "download_content"):
-            data = client.videos.download_content(str(content_id))
-            return _write_bytes_to_file(data, out_path)
-    except Exception:
-        pass
-
-    raise RuntimeError("Unable to download Sora content with current OpenAI client shape.")
-
-
-
-
 def extract_zip_to_temp(zip_bytes_or_path: Union[bytes, str, Path]) -> Tuple[str, str]:
-    """
-    app.py expects: workdir, extract_dir
-    workdir: temp folder root
-    extract_dir: extracted contents folder
-    """
-    workdir = tempfile.mkdtemp(prefix="uappress_vc_")
+    workdir = tempfile.mkdtemp(prefix="uappress_god_")
     extract_dir = str(Path(workdir) / "extracted")
-    ensure_dir(extract_dir)
+    Path(extract_dir).mkdir(parents=True, exist_ok=True)
 
     if isinstance(zip_bytes_or_path, (str, Path)):
         data = Path(zip_bytes_or_path).read_bytes()
@@ -458,26 +157,15 @@ def extract_zip_to_temp(zip_bytes_or_path: Union[bytes, str, Path]) -> Tuple[str
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         zf.extractall(extract_dir)
 
-    return (workdir, extract_dir)
+    return workdir, extract_dir
 
 
 def find_files(extract_dir: Union[str, Path]) -> Tuple[List[str], List[str], List[str]]:
-    """
-    Discover files inside the extracted ZIP.
-
-    Returns:
-      scripts: narration/script text files (e.g., .txt, .md)
-      audios:  audio files (e.g., .mp3, .wav, .m4a)
-      subs:    existing subtitle files (.srt/.vtt/.ass)
-
-    Back-compat: app.py may accept either 2-tuple or 3-tuple. This pipeline always returns 3.
-    """
-    extract_dir = Path(extract_dir)
+    ed = Path(extract_dir)
     scripts: List[str] = []
     audios: List[str] = []
     subs: List[str] = []
-
-    for p in extract_dir.rglob("*"):
+    for p in ed.rglob("*"):
         if not p.is_file():
             continue
         ext = p.suffix.lower()
@@ -485,22 +173,13 @@ def find_files(extract_dir: Union[str, Path]) -> Tuple[List[str], List[str], Lis
             scripts.append(str(p))
         elif ext in _AUDIO_EXTS:
             audios.append(str(p))
-        elif ext in {".srt", ".vtt", ".ass"}:
+        elif ext in _SUB_EXTS:
             subs.append(str(p))
-
     scripts.sort(key=lambda x: Path(x).name.lower())
     audios.sort(key=lambda x: Path(x).name.lower())
     subs.sort(key=lambda x: Path(x).name.lower())
     return scripts, audios, subs
 
-def _leading_number(stem: str) -> Optional[int]:
-    m = re.match(r"^\s*0*(\d{1,4})[\s_\-\.]*", (stem or ""))
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
 
 def _guess_kind_from_name(name: str) -> str:
     n = (name or "").lower()
@@ -511,166 +190,16 @@ def _guess_kind_from_name(name: str) -> str:
     m = re.search(r"(chapter|ch)[\s_\-]*0*(\d+)", n)
     if m:
         return f"CHAPTER {int(m.group(2))}"
-    m2 = re.search(r"\b0*(\d{1,2})\b", n)
-    if m2 and ("chapter" in n or "ch_" in n or n.startswith("ch")):
-        return f"CHAPTER {int(m2.group(1))}"
     return "SEGMENT"
 
 
-def _guess_chapter_no(kind: str) -> Optional[int]:
-    m = re.search(r"chapter\s+(\d+)", kind.lower())
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
-def _read_text_preview(path: Union[str, Path], max_chars: int = 2400) -> str:
-    p = Path(path)
-    try:
-        if p.suffix.lower() == ".json":
-            obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
-            if isinstance(obj, dict) and "text" in obj:
-                s = str(obj.get("text") or "")
-            else:
-                s = json.dumps(obj, ensure_ascii=False)
-        else:
-            s = p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        s = ""
-    s = (s or "").strip()
-    if len(s) > max_chars:
-        s = s[:max_chars].rstrip() + "…"
-    return s
-
-
-def pair_segments(scripts: List[str], audios: List[str], subs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """
-    Create deterministic (script,audio,subtitle) pairs.
-
-    Matching rules (in order):
-      1) Exact stem match (case-insensitive): "01_intro.txt" ↔ "01_intro.mp3"
-      2) Leading number match: "01_intro" ↔ any audio starting with "01_"
-      3) Fallback by sorted order (last resort)
-
-    Safety:
-      - If a paired audio is < 1.0s, raise (prevents “0.08s silent” outputs).
-    """
-    subs = list(subs or [])
-
-    audio_by_stem: Dict[str, str] = {Path(a).stem.lower(): a for a in audios}
-    sub_by_stem: Dict[str, str] = {Path(s).stem.lower(): s for s in subs}
-
-    audio_by_num: Dict[int, List[str]] = {}
-    for a in audios:
-        n = _leading_number(Path(a).stem)
-        if n is not None:
-            audio_by_num.setdefault(n, []).append(a)
-    for k in list(audio_by_num.keys()):
-        audio_by_num[k].sort(key=lambda x: Path(x).name.lower())
-
-    sub_by_num: Dict[int, List[str]] = {}
-    for s in subs:
-        n = _leading_number(Path(s).stem)
-        if n is not None:
-            sub_by_num.setdefault(n, []).append(s)
-    for k in list(sub_by_num.keys()):
-        sub_by_num[k].sort(key=lambda x: Path(x).name.lower())
-
-    pairs: List[Dict[str, Any]] = []
-    used_audios: set[str] = set()
-
-    for sp in scripts:
-        sp_p = Path(sp)
-        stem = sp_p.stem.lower()
-
-        kind = _guess_kind_from_name(sp_p.name)
-        chapter_no = None
-        m = re.search(r"(chapter|ch)[\s_\-]*0*(\d+)", stem)
-        if m:
-            try:
-                chapter_no = int(m.group(2))
-            except Exception:
-                chapter_no = None
-
-        # --- audio match ---
-        audio_path = audio_by_stem.get(stem)
-        if not audio_path:
-            n = _leading_number(sp_p.stem)
-            if n is not None:
-                cand = [a for a in audio_by_num.get(n, []) if a not in used_audios]
-                audio_path = cand[0] if cand else None
-
-        if not audio_path:
-            for a in audios:
-                if a not in used_audios:
-                    audio_path = a
-                    break
-
-        if not audio_path:
-            raise RuntimeError(f"No audio found to pair with script: {sp_p.name}")
-
-        used_audios.add(audio_path)
-
-        # --- subtitle match (optional) ---
-        sub_path = sub_by_stem.get(stem)
-        if not sub_path:
-            n = _leading_number(sp_p.stem)
-            if n is not None:
-                cand_s = sub_by_num.get(n, [])
-                sub_path = cand_s[0] if cand_s else None
-
-        # --- guard against tiny/incorrect audio ---
-        dur = float(ffprobe_duration_seconds(audio_path))
-        if dur < 1.0:
-            raise RuntimeError(
-                f"Paired audio is too short ({dur:.2f}s).\n"
-                f"Script: {sp_p.name}\nAudio: {Path(audio_path).name}\n"
-                "This usually means pairing went wrong or the ZIP contains a bad audio file."
-            )
-
-        base_sig = f"{sp_p.resolve()}|{Path(audio_path).resolve()}|{Path(audio_path).stat().st_size}"
-        base_name = safe_slug(sp_p.stem, max_len=60) + "_" + _stable_hash(base_sig, 10)
-
-        pairs.append(
-            {
-                "script_path": str(sp_p),
-                "audio_path": str(audio_path),
-                "sub_path": str(sub_path) if sub_path else "",
-                "kind_guess": kind,
-                "chapter_no": chapter_no,
-                "title_guess": sp_p.stem.replace("_", " ").replace("-", " ").strip(),
-                "base_name": base_name,
-                "key": safe_slug(sp_p.stem, max_len=40) or base_name,
-                "label": f"{kind}: {sp_p.stem}",
-            }
-        )
-
-    return pairs
-
 def segment_label(pair: Dict[str, Any]) -> str:
-    """
-    app.py expects one of:
-      INTRO / OUTRO / CHAPTER <n> / SEGMENT
-    """
     kind = str(pair.get("kind_guess") or "").strip().upper()
     if kind.startswith("CHAPTER"):
-        n = pair.get("chapter_no")
-        if n is None:
-            m = re.search(r"CHAPTER\s+(\d+)", kind)
-            if m:
-                n = int(m.group(1))
-        if n is not None:
-            return f"CHAPTER {int(n)}"
-        return "CHAPTER"
+        return kind
     if kind in ("INTRO", "OUTRO"):
         return kind
-
-    sp = str(pair.get("script_path") or "")
-    ap = str(pair.get("audio_path") or "")
-    combo = (sp + " " + ap).lower()
+    combo = (str(pair.get("script_path") or "") + " " + str(pair.get("audio_path") or "")).lower()
     if "intro" in combo:
         return "INTRO"
     if "outro" in combo:
@@ -678,1648 +207,421 @@ def segment_label(pair: Dict[str, Any]) -> str:
     return "SEGMENT"
 
 
-# ----------------------------
-# Image generation (segment-scoped)
-# ----------------------------
-
-def _image_size_for_mode(width: int, height: int) -> str:
-    if height > width:
-        return _DEFAULT_IMAGE_SIZE_916
-    return _DEFAULT_IMAGE_SIZE_169
-
-
-
-def _make_scene_card_image(
-    path: Path,
-    width: int,
-    height: int,
-    *,
-    headline: str,
-    body: str = "",
-    footer: str = "UAPpress",
-) -> None:
-    """Local, deterministic fallback 'scene card' image.
-
-    Prevents blank/black videos when OpenAI image generation is unavailable.
-    Output is documentary-styled and readable.
+def pair_segments(scripts: List[str], audios: List[str], subs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Minimal valid PNG fallback if Pillow isn't available.
-    if Image is None:
-        # Write a simple binary PPM (P6) so ffmpeg can still read a full-size, non-black image
-        # without requiring Pillow. (Avoids 'black screen' symptom when image gen fails.)
-        w = max(640, int(width))
-        h = max(360, int(height))
-        bg = (245, 245, 242)  # light paper
-        border = (30, 30, 30)
-
-        header = f"P6\n{w} {h}\n255\n".encode("ascii")
-        pixels = bytearray()
-
-        # Simple border box + solid background
-        border_thick = max(6, min(18, int(min(w, h) * 0.02)))
-        for y in range(h):
-            for x in range(w):
-                if (
-                    x < border_thick
-                    or x >= w - border_thick
-                    or y < border_thick
-                    or y >= h - border_thick
-                ):
-                    pixels.extend(border)
-                else:
-                    pixels.extend(bg)
-
-        # Ensure extension is .ppm for clarity
-        if path.suffix.lower() != ".ppm":
-            path = path.with_suffix(".ppm")
-
-        path.write_bytes(header + bytes(pixels))
-        return
-
-    w = max(640, int(width))
-    h = max(360, int(height))
-
-    # Light paper background (not black)
-    img = Image.new("RGB", (w, h), color=(245, 245, 242))
-    draw = ImageDraw.Draw(img)
-
-    pad = 18
-    draw.rectangle([(pad, pad), (w - pad, h - pad)], outline=(30, 30, 30), width=4)
-
-    try:
-        font_h = ImageFont.truetype("DejaVuSans.ttf", 46)
-        font_b = ImageFont.truetype("DejaVuSans.ttf", 28)
-        font_f = ImageFont.truetype("DejaVuSans.ttf", 24)
-    except Exception:
-        font_h = ImageFont.load_default()
-        font_b = ImageFont.load_default()
-        font_f = ImageFont.load_default()
-
-    x = pad + 26
-    y = pad + 26
-    head = (headline or "").strip()
-    if len(head) > 90:
-        head = head[:87] + "..."
-    draw.text((x, y), head, fill=(10, 10, 10), font=font_h)
-
-    y_div = y + 72
-    draw.line([(x, y_div), (w - pad - 26, y_div)], fill=(60, 60, 60), width=2)
-
-    y_text = y_div + 24
-    body_txt = (body or "").strip()
-    if body_txt:
-        max_chars = 95
-        out_lines = []
-        for para in body_txt.splitlines():
-            para = para.strip()
-            if not para:
-                continue
-            while len(para) > max_chars:
-                cut = para.rfind(" ", 0, max_chars)
-                if cut == -1:
-                    cut = max_chars
-                out_lines.append(para[:cut].strip())
-                para = para[cut:].strip()
-            if para:
-                out_lines.append(para)
-
-        out_lines = out_lines[:10]
-        for ln in out_lines:
-            draw.text((x, y_text), ln, fill=(20, 20, 20), font=font_b)
-            y_text += 34
-
-    footer_txt = (footer or "").strip()
-    draw.text((x, h - pad - 42), footer_txt, fill=(80, 80, 80), font=font_f)
-
-    img.save(path, format="PNG")
-
-
-
-# ----------------------------
-# Image generation utilities
-# ----------------------------
-def _openai_generate_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
-    """Generate a single photorealistic image via OpenAI Images API (prompt-only).
-
-    Streamlit Cloud reliability rules:
-    - Always pass api_key explicitly to the OpenAI client.
-    - Do NOT pass response_format; default b64_json output avoids SDK/version mismatches.
-    - Retry a couple times to ride out transient failures.
+    Deterministic pairing:
+    - Prefer exact stem match for audio and subtitles
+    - Else assign next unused audio (stable order)
     """
-    if OpenAI is None:
-        raise RuntimeError("OpenAI SDK not available in this environment.")
+    subs = subs or []
+    audio_by_stem: Dict[str, str] = {Path(a).stem.lower(): a for a in audios}
+    subs_by_stem: Dict[str, str] = {Path(s).stem.lower(): s for s in subs}
+    used_audio: set[str] = set()
+    pairs: List[Dict[str, Any]] = []
 
-    api_key = (api_key or "").strip()
-    if not api_key:
-        raise RuntimeError("Missing OpenAI API key (api_key is empty).")
+    for s in scripts:
+        sp = Path(s)
+        stem = sp.stem.lower()
 
-    client = OpenAI(api_key=str(api_key))
+        a_match = audio_by_stem.get(stem, "")
+        if (not a_match) or (a_match in used_audio):
+            for a in audios:
+                if a not in used_audio:
+                    a_match = a
+                    break
+        if a_match:
+            used_audio.add(a_match)
 
-    # Try a small fallback ladder for robustness.
-    models_to_try = [
-        _DEFAULT_IMAGE_MODEL,
-        (os.environ.get("UAPPRESS_IMAGE_MODEL_FALLBACK", "") or "").strip(),
-    ]
-    models_to_try = [m for m in models_to_try if m]
+        sub_match = subs_by_stem.get(stem, "")
 
-    last_err: Exception | None = None
+        kind = _guess_kind_from_name(sp.name)
 
-    for model in models_to_try:
-        for attempt in range(1, 3):
-            try:
-                r = client.images.generate(
-                    model=str(model),
-                    prompt=str(prompt),
-                    size=str(size),
-                )
-                # SDK returns b64_json by default for Images API.
-                b64 = r.data[0].b64_json
-                if not b64:
-                    raise RuntimeError("Images API returned empty b64_json.")
-                import base64
-                return base64.b64decode(b64)
-            except Exception as e:
-                last_err = e
-                # brief backoff for transient issues
-                time.sleep(0.35 * attempt)
+        title_guess = ""
+        try:
+            preview = sp.read_text(encoding="utf-8", errors="ignore").strip()
+            for line in preview.splitlines():
+                raw = line.strip()
+                if not raw:
+                    continue
+                if raw.startswith("#"):
+                    title_guess = raw.lstrip("#").strip()[:120]
+                    break
+                if raw.lower().startswith("title:"):
+                    title_guess = raw.split(":", 1)[1].strip()[:120]
+                    break
+        except Exception:
+            pass
 
-    raise RuntimeError(f"Images API failed after retries. Last error: {last_err}")
+        seed = f"script:{str(sp.resolve())}|audio:{str(Path(a_match).resolve()) if a_match else ''}"
+        uid = _stable_hash(seed, 14)
 
-def _free_roll_scene_type(beat: str, j: int) -> str:
-    """Cheap deterministic 'Visual Director' router.
-
-    No extra model calls. Uses keyword scoring + rotation to choose a scene type.
-    """
-    b = (beat or "").lower()
-
-    score: Dict[str, int] = {k: 0 for k in _FREE_ROLL_SCENE_TYPES.keys()}
-
-    def add(scene_type: str, pts: int) -> None:
-        if scene_type in score:
-            score[scene_type] += int(pts)
-
-    # Evidence / paperwork
-    if re.search(r"\b(memo|memorandum|report|file|files|document|documents|declassified|classification|classified|telegram|teletype|dispatch|archive|archival|newspaper|headline|foia|record|records)\b", b):
-        add("DOCUMENT", 6)
-    if re.search(r"\b(interview|testimony|witness|witnesses|statement|said|recalled|reported|account)\b", b):
-        add("WITNESS", 5)
-    if re.search(r"\b(radar|scope|blip|atc|tower|controller|logbook|logs|transcript|tape|audio|frequency|comms|communications)\b", b):
-        add("PROCESS", 6)
-
-    # Places / environments
-    if re.search(r"\b(base|airfield|runway|hangar|gate|perimeter|fence|checkpoint|security|guard|patrol)\b", b):
-        add("ESTABLISHING", 4)
-    if re.search(r"\b(corridor|office|briefing|conference|warehouse|storage|archive room|file room|hangar interior|barracks)\b", b):
-        add("INTERIOR", 4)
-    if re.search(r"\b(night|dusk|dawn|storm|cloud|fog|rain|wind|haze|desert|forest|field|coast|ocean|mountain)\b", b):
-        add("ATMOSPHERE", 3)
-
-    # If beat is very abstract, bias toward ATMOSPHERE/PROCESS
-    if len(b) < 180:
-        add("ATMOSPHERE", 1)
-        add("PROCESS", 1)
-
-    # Pick best-scoring; if tie/low, rotate deterministically.
-    best_type = None
-    best_val = -10
-    for k, v in score.items():
-        if v > best_val:
-            best_val = v
-            best_type = k
-
-    if not best_type or best_val <= 0:
-        keys = list(_FREE_ROLL_SCENE_TYPES.keys())
-        return keys[j % len(keys)]
-
-    return best_type
-
-
-_FREE_ROLL_SCENE_TYPES: Dict[str, str] = {
-    "ESTABLISHING": "an exterior establishing shot of the location (base, road, gate, airfield, landscape)",
-    "DOCUMENT": "archival evidence on a desk (papers, folders, photographs, maps), documentary tabletop composition",
-    "PROCESS": "investigation process visuals (radar room, logbooks, maps with markings, radios, filing systems)",
-    "WITNESS": "a human perspective without identifiable faces (silhouette, hands, notebook, looking toward distance)",
-    "INTERIOR": "institutional interiors (corridors, offices, hangar interior, storage rooms), grounded realism",
-    "ATMOSPHERE": "neutral b-roll atmosphere (night sky, clouds, empty road, lights, terrain), restrained and calm",
-}
-
-# ----------------------------
-# Editorial Beat Routing (Intent Layer)
-# ----------------------------
-# Zero-token, deterministic "why this shot" layer.
-# This is NOT a ban-list. It is a positive editorial purpose signal used to
-# shape what is shown, so visuals feel intentional and documentary-grade.
-
-_EDITORIAL_BEATS: Dict[str, str] = {
-    "ESTABLISH": "Orient the viewer with place, time-of-day, and institutional context.",
-    "EVIDENCE": "Show credible artifacts that support claims: documents, photos, files, maps, records.",
-    "PROCESS": "Show how information is produced or analyzed: radar scopes, logbooks, maps, radios, investigative work.",
-    "HUMAN": "Show the human stake without identities: silhouettes, hands, notebooks, observers, quiet tension.",
-    "DOUBT": "Show uncertainty and limits: missing pages, redactions, empty archives, conflicting notes, unresolved spaces.",
-}
-
-# Editorial anchors (positive, reusable). Used preferentially when beat is clear.
-_ANCHORS_BY_BEAT: Dict[str, List[str]] = {
-    "ESTABLISH": [
-        "a guarded base gate with period-appropriate signage and a small guard booth",
-        "a quiet airfield perimeter at dusk with service lights and distant hangars",
-        "a rural two-lane road approaching a restricted facility under overcast skies",
-        "a wide establishing view of an institutional compound boundary and access road",
-    ],
-    "EVIDENCE": [
-        "a tabletop evidence layout: folders, stamped paperwork, and a map with marked coordinates",
-        "archival documents spread on a desk under a practical lamp, with a notepad and pen nearby",
-        "a close view of a file folder beside photographs and a clipped report, shallow depth of field",
-        "a stack of reports and an index card box on an archival table, documentary lighting",
-    ],
-    "PROCESS": [
-        "a radar or operations room environment with period-appropriate equipment and dim practical lighting",
-        "a logbook open to handwritten entries beside a radio handset and frequency notes",
-        "a wall map with pins and string, an investigator’s hand marking a location",
-        "a filing cabinet drawer open with labeled folders in a calm institutional interior",
-    ],
-    "HUMAN": [
-        "a witness perspective from behind, looking out toward distant lights, face not visible",
-        "hands holding a notebook with handwritten notes, interior practical lighting",
-        "a lone figure silhouette in an office doorway, quiet tension, no identifiable features",
-        "a seated interviewer’s viewpoint across a table with papers and a recorder, faces out of frame",
-    ],
-    "DOUBT": [
-        "a document with heavy redactions on a desk, clipped alongside an incomplete memo",
-        "an empty archive room with open drawers and missing folders, subdued institutional lighting",
-        "a torn or partially missing page on a table beside a logbook, unresolved mood",
-        "a corkboard of conflicting notes and timelines, some gaps left blank, investigative atmosphere",
-    ],
-}
-
-def _editorial_beat(beat: str, j: int) -> str:
-    """Deterministic editorial intent router (no tokens, no extra model calls)."""
-    b = (beat or "").lower()
-    score: Dict[str, int] = {k: 0 for k in _EDITORIAL_BEATS.keys()}
-
-    def add(k: str, pts: int) -> None:
-        if k in score:
-            score[k] += int(pts)
-
-    # Evidence signals
-    if re.search(r"\b(memo|memorandum|report|file|files|document|documents|declassified|classified|telegram|teletype|dispatch|archive|archival|newspaper|headline|foia|record|records|photograph|photo|photos|map|maps)\b", b):
-        add("EVIDENCE", 6)
-
-    # Process signals
-    if re.search(r"\b(radar|scope|blip|atc|tower|controller|logbook|logs|transcript|tape|audio|frequency|comms|communications|analysis|analyze|investigation|investigators|timeline|triangulate)\b", b):
-        add("PROCESS", 6)
-
-    # Human signals
-    if re.search(r"\b(witness|witnesses|testimony|interview|statement|recalled|reported|saw|heard|felt|fear|panic|confused|startled)\b", b):
-        add("HUMAN", 5)
-
-    # Doubt/uncertainty signals
-    if re.search(r"\b(uncertain|unclear|unknown|disputed|contradict|contradiction|incomplete|missing|redacted|withheld|classified|unverified|rumor|speculation|alleged|cannot confirm|no record)\b", b):
-        add("DOUBT", 5)
-
-    # Establishing signals
-    if re.search(r"\b(base|airfield|runway|hangar|gate|perimeter|fence|checkpoint|security|corridor|office|briefing|conference|warehouse|archive room|file room|barracks)\b", b):
-        add("ESTABLISH", 3)
-
-    # If beat is very short/abstract, bias to ESTABLISH/DOUBT.
-    if len(b) < 180:
-        add("ESTABLISH", 1)
-        add("DOUBT", 1)
-
-    best = max(score.items(), key=lambda kv: kv[1])
-    if best[1] <= 0:
-        # Rotate deterministically if nothing triggers
-        keys = list(_EDITORIAL_BEATS.keys())
-        return keys[j % len(keys)]
-    return best[0]
-
-_FREE_ROLL_SHOT_WHEEL: List[str] = _SHOT_WHEEL
-
-
-def _build_scene_prompts_from_script(script_text: str, max_scenes: int, *, incident_hint: str = "") -> List[str]:
-    """Build per-scene image prompts using a **Free Roll Visual Director** (single-pass, token-cheap).
-
-    Implements:
-    - Positive-only Visual Bible (consistent cinematic identity)
-    - Concrete visual anchors (one clear noun/setting per scene)
-    - Storyboard-card prompt structure (WHAT / CAMERA / STYLE)
-
-    Does NOT implement:
-    - No negative/ban lists
-    - No multi-generation 'best-of'
-    - No extra model calls
-    """
-    text = (script_text or "").strip()
-    if not text:
-        return []
-
-    max_scenes_i = clamp_int(int(max_scenes), 1, 120)
-
-    # Paragraph beats; avoid over-fragmentation
-    paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
-    beats = [p for p in paras if len(p) >= 120] or paras
-    if not beats:
-        return []
-
-    # Choose N beats evenly (stable across runs)
-    if len(beats) <= max_scenes_i:
-        idxs = list(range(len(beats)))
-    else:
-        step = len(beats) / float(max_scenes_i)
-        idxs = [min(len(beats) - 1, int(i * step)) for i in range(max_scenes_i)]
-
-    hint = (incident_hint or "").strip()
-    hint_line = f"CONTEXT: {hint}." if hint else ""
-
-    prompts: List[str] = []
-    for j, idx in enumerate(idxs):
-        beat = beats[idx]
-        snippet = _sanitize_scene_context(beat, max_chars=320)
-
-        scene_type = _free_roll_scene_type(beat, j)
-        beat_kind = _editorial_beat(beat, j)
-        beat_desc = _EDITORIAL_BEATS.get(beat_kind, "")
-
-        # Prefer editorial anchors when available; fall back to scene-type anchors.
-        anchors = _ANCHORS_BY_BEAT.get(beat_kind) or _ANCHORS_BY_TYPE.get(scene_type) or _ANCHORS_BY_TYPE.get("ATMOSPHERE") or []
-        anchor = anchors[j % len(anchors)] if anchors else "a grounded documentary environment"
-
-        camera = _SHOT_WHEEL[j % len(_SHOT_WHEEL)]
-
-        # Storyboard card (short, intentional)
-        what = f"WHAT: {anchor}."
-        if snippet:
-            what += f" (Inspired by: {snippet})"
-
-        prompt = (
-            "Create a single photorealistic still image for a long-form investigative documentary.\n"
-            + (hint_line + "\n" if hint_line else "")
-            + (f"EDITORIAL BEAT: {beat_kind} — {beat_desc}\n" if beat_kind else "")
-            + what + "\n"
-            + camera + "\n"
-            + "STYLE: " + _VISUAL_BIBLE_STYLE + "\n"
-            + "Deliver: coherent environment details, grounded realism, believable staging."
+        pairs.append(
+            {
+                "script_path": str(sp),
+                "audio_path": str(a_match),
+                "subtitle_path": str(sub_match) if sub_match else "",
+                "kind_guess": kind,
+                "title_guess": title_guess,
+                "uid": uid,
+            }
         )
-        prompts.append(prompt)
 
+    return pairs
+
+
+# ----------------------------
+# Prompt + images
+# ----------------------------
+def _sanitize(text: str, max_chars: int = 320) -> str:
+    s = (text or "").strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_chars:
+        s = s[:max_chars].rstrip() + "…"
+    return s
+
+
+def _choose_beats(script_text: str, n: int) -> List[str]:
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", script_text or "") if p.strip()]
+    if not paras:
+        paras = [p.strip() for p in re.split(r"(?<=[\.\?\!])\s+", (script_text or "").strip()) if p.strip()]
+    if not paras:
+        return []
+    n = max(1, int(n))
+    if len(paras) <= n:
+        return paras
+    step = len(paras) / float(n)
+    idxs = [min(len(paras) - 1, int(i * step)) for i in range(n)]
+    out: List[str] = []
+    last = -1
+    for i in idxs:
+        if i == last:
+            i = min(len(paras) - 1, i + 1)
+        out.append(paras[i])
+        last = i
+    return out[:n]
+
+
+def _image_size_for_wh(width: int, height: int) -> str:
+    return _DEFAULT_IMAGE_SIZE_916 if height > width else _DEFAULT_IMAGE_SIZE_169
+
+
+def _build_prompts(script_text: str, max_scenes: int) -> List[str]:
+    beats = _choose_beats(script_text, max_scenes)
+    prompts: List[str] = []
+    for i, b in enumerate(beats):
+        snippet = _sanitize(b, 300)
+        cam = _SHOTS[i % len(_SHOTS)]
+        prompts.append(
+            "Create one image.\n"
+            f"STYLE: {_VISUAL_STYLE}\n"
+            f"CAMERA: {cam}\n"
+            f"SCENE: {snippet}\n"
+        )
     return prompts
 
-def _segment_image_dir(extract_dir: Union[str, Path], pair: Dict[str, Any]) -> Path:
-    """
-    Segment-scoped image directory to prevent cross-segment reuse.
-    base_name is already collision-safe (hashed) from pair_segments().
-    """
-    extract_dir = Path(extract_dir)
-    base = safe_slug(str(pair.get("base_name") or "segment"), max_len=80)
-    label = segment_label(pair).lower().replace(" ", "_")
-    return ensure_dir(extract_dir / _IMAGE_CACHE_ROOT / f"{label}_{base}")
 
+def _openai_image_bytes(api_key: str, prompt: str, size: str) -> bytes:
+    if OpenAI is None:
+        raise RuntimeError("OpenAI SDK not available. Add 'openai' to requirements.txt.")
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise RuntimeError("OpenAI API key is empty.")
+    client = OpenAI(api_key=api_key)
 
-def _generate_segment_images(
-    *,
-    api_key: str,
-    extract_dir: Union[str, Path],
-    pair: Dict[str, Any],
-    width: int,
-    height: int,
-    max_scenes: int,
-) -> List[Path]:
-    """Generate (or reuse cached) images for this segment.
-
-    IMPORTANT CACHE BEHAVIOR (bugfix):
-    - If SOME cached images exist, we **do not** stop early.
-    - We return cached images only when we already have the target count.
-    - Otherwise we generate the remaining scenes to reach the target count.
-
-    This prevents the 'one scene stretched across the whole segment' failure mode.
-    """
-    img_dir = Path(_segment_image_dir(extract_dir, pair))
-    img_dir.mkdir(parents=True, exist_ok=True)
-
-    desired = clamp_int(int(max_scenes), 1, 120)
-    size = _image_size_for_mode(int(width), int(height))
-
-    def _is_valid_img(p: Path) -> bool:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 3):
         try:
-            return p.is_file() and p.stat().st_size > 1024 and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".ppm")
-        except Exception:
-            return False
+            r = client.images.generate(model=_DEFAULT_IMAGE_MODEL, prompt=prompt, size=size)
+            b64 = r.data[0].b64_json
+            if not b64:
+                raise RuntimeError("Images API returned empty b64_json.")
+            return base64.b64decode(b64)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.25 * attempt)
+    raise RuntimeError(f"Images API failed: {last_err}")
 
-    existing = sorted([p for p in img_dir.glob("scene_*.*") if _is_valid_img(p)])
 
-    # If we already have enough cached images, reuse them (deterministic order).
-    if len(existing) >= desired:
-        return existing[:desired]
+def _segment_cache_dir(extract_dir: str, uid: str) -> Path:
+    root = Path(extract_dir) / _IMAGE_CACHE_DIRNAME / uid
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
-    # Script must exist in the extracted ZIP as <segment_id>.txt (hard-fail if missing).
-    script_path = str(pair.get("script_path") or pair.get("script_file") or pair.get("script") or "").strip()
-    if not script_path or not os.path.isfile(script_path):
-        raise FileNotFoundError(
-            f"Missing script for segment. Expected a .txt for this segment inside the ZIP. Got: {script_path}"
-        )
 
-    script_text = Path(script_path).read_text(encoding="utf-8", errors="ignore")
-
-    # Best-effort hint to keep scenes coherent (e.g., 'Roswell', 'Rendlesham', etc.)
-    incident_hint = (pair.get("label") or pair.get("id") or "").strip()
-
-    prompts = _build_scene_prompts_from_script(script_text, desired, incident_hint=incident_hint)
-    if not prompts:
-        # Extremely defensive fallback — should not happen if script_text exists.
-        prompts = ["Photorealistic documentary still, grounded military/archival context, no text, no logos."] * desired
-
-    # Generate missing scenes only.
-    for i in range(len(existing), desired):
-        prompt = prompts[min(i, len(prompts) - 1)]
-        img_bytes = _openai_generate_image_bytes(
-            api_key=api_key,
-            prompt=prompt,
-            size=size,
-        )
-        out_path = img_dir / f"scene_{i+1:02d}.png"
-        _write_bytes_to_file(img_bytes, out_path)
-
-    final = sorted([p for p in img_dir.glob("scene_*.*") if _is_valid_img(p)])
-    # Ensure we return exactly 'desired' items when possible.
-    return final[:desired]
-
-def _clip_cache_key(
-    *,
-    image_path: Union[str, Path],
-    duration_s: float,
-    width: int,
-    height: int,
-    fps: int,
-    zoom_strength: float,
-) -> str:
-    """Deterministic cache key for a scene clip (skips FFmpeg on reruns)."""
-    p = Path(image_path)
+def _is_good_image(path: Path, min_bytes: int = 50_000) -> bool:
     try:
-        st = p.stat()
-        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
-        sig = f"{str(p.resolve())}|{st.st_size}|{mtime_ns}"
-    except Exception:
-        sig = f"{str(p)}|na"
-    sig += f"|dur={float(duration_s):.4f}|w={int(width)}|h={int(height)}|fps={int(fps)}|z={float(zoom_strength):.4f}"
-    return _stable_hash(sig, 16)
-
-
-def _is_valid_clip_mp4(p: Path) -> bool:
-    try:
-        return p.is_file() and p.stat().st_size > 50_000
+        return path.exists() and path.stat().st_size >= int(min_bytes)
     except Exception:
         return False
 
-def _ensure_even(x: int) -> int:
-    x = int(x)
-    return x if x % 2 == 0 else x - 1 if x > 1 else 2
 
-
-
-def build_scene_clip_from_image(
-    *,
-    image_path: Union[str, Path],
-    out_mp4_path: Union[str, Path],
-    duration_s: float,
-    width: int,
-    height: int,
-    fps: int,
-    zoom_strength: float,
-) -> Path:
-    """
-    Create a real H.264 MP4 scene clip from a still image using FFmpeg zoompan.
-
-    - No black video: always renders frames from the image.
-    - Deterministic duration: uses -t and a fixed frame count.
-    - Streamlit Cloud safe: creates parent dirs and validates output file size.
-    """
-    img = Path(image_path)
-    out = Path(out_mp4_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    if not img.exists():
-        raise FileNotFoundError(str(img))
-
-    duration = max(0.05, float(duration_s))
-    fps_i = clamp_int(int(fps), 6, 60)
-    w = _ensure_even(clamp_int(int(width), 320, 3840))
-    h = _ensure_even(clamp_int(int(height), 320, 3840))
-
-    zs = float(zoom_strength)
-    if zs < 0:
-        zs = 0.0
-    if zs > 3.0:
-        zs = 3.0
-
-    frames = max(2, int(round(duration * fps_i)))
-    sw = _ensure_even(int(w * 1.20))
-    sh = _ensure_even(int(h * 1.20))
-
-    # zoom_strength is interpreted as the FINAL max zoom factor (e.g., 1.01–1.06).
-    zmax = clamp_float(float(zs), 1.0, 1.20)
-    zexpr = f"min(1+(({zmax}-1)*on/{frames}),{zmax})"
-    xexpr = "iw/2-(iw/zoom/2)"
-    yexpr = "ih/2-(ih/zoom/2)"
-
-    vf = (
-        f"scale={sw}:{sh},"
-        f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':d={frames}:s={w}x{h}:fps={fps_i},"
-        f"format=yuv420p"
-    )
-
-    ff = which_ffmpeg()
-    cmd = [
-        ff,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-loop",
-        "1",
-        "-i",
-        str(img),
-        "-vf",
-        vf,
-        "-t",
-        f"{duration:.3f}",
-        "-r",
-        str(fps_i),
-        "-c:v",
-        "libx264",
-        "-preset",
-        os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-muxdelay",
-        "0",
-        "-muxpreload",
-        "0",
-        "-avoid_negative_ts",
-        "make_zero",
-        str(out),
-    ]
-    run_ffmpeg(cmd)
-
-    if (not out.exists()) or out.stat().st_size < 4096:
-        raise RuntimeError("Scene clip render failed (output missing or too small).")
-
+def _ensure_images(*, extract_dir: str, uid: str, api_key: str, prompts: List[str], size: str) -> List[Path]:
+    out: List[Path] = []
+    cache = _segment_cache_dir(extract_dir, uid)
+    for i, prompt in enumerate(prompts, start=1):
+        img_path = cache / f"img_{i:02d}.png"
+        if _is_good_image(img_path):
+            out.append(img_path)
+            continue
+        data = _openai_image_bytes(api_key, prompt, size)
+        img_path.write_bytes(data)
+        out.append(img_path)
     return out
-
-def concat_video_clips(clip_paths: Sequence[Union[str, Path]], out_mp4_path: Union[str, Path]) -> Path:
-    """
-    Concatenate scene clips in order.
-
-    We re-encode into a consistent H.264 stream to avoid concat/copy edge cases
-    across ffmpeg builds (Streamlit Cloud).
-    """
-    out = Path(out_mp4_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    clips = [Path(p) for p in clip_paths]
-    clips = [c for c in clips if c.exists() and c.stat().st_size > 1024]
-    if not clips:
-        raise RuntimeError("No valid scene clips to concatenate.")
-
-    list_file = out.parent / f"_{out.stem}_concat_list.txt"
-    def _esc(p: Path) -> str:
-        # ffmpeg concat demuxer single-quote escaping: ' -> '\''
-        return str(p).replace("'", "'\\''")
-    list_file.write_text("".join(["file '" + _esc(c) + "'\n" for c in clips]), encoding="utf-8")
-
-    ff = which_ffmpeg()
-    cmd = [
-        ff,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(list_file),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-muxdelay",
-        "0",
-        "-muxpreload",
-        "0",
-        "-avoid_negative_ts",
-        "make_zero",
-        str(out),
-    ]
-    run_ffmpeg(cmd)
-
-    try:
-        list_file.unlink()
-    except Exception:
-        pass
-
-    if not out.exists() or out.stat().st_size < 2048:
-        raise RuntimeError("Concatenation failed (output missing or too small).")
-
-    return out
-
-
-def mux_audio_to_video(
-    *,
-    video_path: Union[str, Path],
-    audio_path: Union[str, Path],
-    out_mp4_path: Union[str, Path],
-    end_buffer_s: float = _DEFAULT_END_BUFFER,
-    audio_seconds: Optional[float] = None,
-) -> Path:
-    """
-    Mux audio onto the concatenated video.
-
-    Requirements:
-    - Keep the pipeline order (mux is the last step).
-    - Apply a small end buffer (0.5–0.75s) deterministically.
-    - Avoid black frames (tpad clones last frame for buffer).
-    """
-    v = Path(video_path)
-    a = Path(audio_path)
-    out = Path(out_mp4_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    if not v.exists():
-        raise FileNotFoundError(str(v))
-    if not a.exists():
-        raise FileNotFoundError(str(a))
-
-    buf = clamp_float(float(end_buffer_s or _DEFAULT_END_BUFFER), _END_BUFFER_MIN, _END_BUFFER_MAX)
-    target_dur = None
-    try:
-        if audio_seconds is not None:
-            ad = float(audio_seconds)
-            if ad > 0:
-                target_dur = ad + buf
-    except Exception:
-        target_dur = None
-
-    ff = which_ffmpeg()
-    # tpad extends video by cloning last frame; apad extends audio with silence for exactly buf seconds.
-    filt = f"[0:v]tpad=stop_mode=clone:stop_duration={buf:.3f},setpts=PTS-STARTPTS[v];[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,apad=pad_dur={buf:.3f}[a]"
-    cmd = [
-        ff,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(v),
-        "-i",
-        str(a),
-        "-filter_complex",
-        filt,
-        "-map",
-        "[v]",
-        "-map",
-        "[a]",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        os.environ.get("UAPPRESS_AAC_BITRATE", "192k"),
-        "-movflags",
-        "+faststart",
-        "-muxdelay",
-        "0",
-        "-muxpreload",
-        "0",
-        "-avoid_negative_ts",
-        "make_zero",
-        str(out),
-    ]
-    run_ffmpeg(cmd)
-
-    if not out.exists() or out.stat().st_size < 2048:
-        raise RuntimeError("Mux failed (output missing or too small).")
-
-    return out
-
-
-
-def validate_mp4(path: str, *, require_audio: bool = True, min_bytes: int = 50_000) -> Tuple[bool, str]:
-    """Validate an MP4 for upload gating.
-
-    Checks:
-    - exists and non-trivial size
-    - duration > 0
-    - contains a video stream
-    - contains an audio stream if require_audio=True
-    """
-    try:
-        p = Path(path)
-        if not p.exists():
-            return False, "missing"
-        if p.stat().st_size < int(min_bytes):
-            return False, f"too_small<{min_bytes}B"
-
-        # Duration (ffprobe if available; otherwise ffmpeg -i parse)
-        dur = 0.0
-        try:
-            dur = float(ffprobe_duration_seconds(p))
-        except Exception:
-            dur = 0.0
-        if dur <= 0.05:
-            return False, "zero_duration"
-
-        ff = which_ffmpeg()
-        proc = subprocess.run(
-            [ff, "-hide_banner", "-i", str(p)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        info = (proc.stderr or "") + "\n" + (proc.stdout or "")
-        has_video = "Video:" in info
-        has_audio = "Audio:" in info
-
-        if not has_video:
-            return False, "no_video_stream"
-        if require_audio and (not has_audio):
-            return False, "no_audio_stream"
-
-        return True, f"ok_dur={dur:.2f}s"
-    except Exception as e:
-        return False, f"error:{type(e).__name__}:{e}"
-
 
 
 # ----------------------------
-# Subtitles (Burn-in) — helpers
+# Subtitles (safe)
 # ----------------------------
-
-def _normalize_caption_text(t: str) -> str:
-    """Normalize text for subtitle legibility + libass wrapping.
-
-    Key fix for 'cutoff' in Shorts:
-    - libass will NOT wrap long tokens that contain no spaces (e.g., 'stories—after').
-      We normalize dash-like characters to include spaces so line breaks can occur.
+def _sanitize_caption_text(s: str) -> str:
     """
-    s = (t or "").strip()
-    if not s:
-        return ""
-    # Normalize dash variants to spaced em dash
-    s = s.replace("\u2014", " — ").replace("\u2013", " — ").replace("\u2212", " — ")
-    # Common punctuation spacing to encourage wraps
-    s = s.replace("/", " / ")
+    Kill the class of bugs you've hit:
+    - visible backslashes
+    - odd escape sequences
+    Keep it deterministic.
+    """
+    s = (s or "")
+    s = s.replace("\\", " ")     # double slash -> space
+    s = s.replace("\", " ")       # single slash -> space
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def _split_text_for_captions(text: str, *, max_words: int = 6, max_chars: int = 44) -> List[str]:
-    """Split narration text into short, readable caption chunks.
+def _format_srt_time(t: float) -> str:
+    t = max(0.0, float(t))
+    ms = int(round((t - int(t)) * 1000.0))
+    s = int(t) % 60
+    m = (int(t) // 60) % 60
+    h = int(t) // 3600
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    Heuristic (no extra model calls). Optimized for Shorts readability.
 
-    IMPORTANT:
-    - We normalize dash characters to include spaces, otherwise libass may not wrap
-      and text can get clipped off-screen (e.g., 'stories—after').
+def _build_srt_from_text(text: str, duration: float, max_lines: int = 2) -> str:
     """
-    t = _normalize_caption_text(text)
-    if not t:
-        return []
-
-    # Sentence-ish split
-    parts = re.split(r"(?<=[\.\!\?])\s+", t)
-    chunks: List[str] = []
-
-    for sent in parts:
-        s = sent.strip()
-        if not s:
-            continue
-
-        # Break long sentences by commas/semicolons first
-        subparts = re.split(r"(?<=[,;:])\s+", s)
-        for sp in subparts:
-            sp = sp.strip()
-            if not sp:
-                continue
-
-            words = sp.split()
-            if not words:
-                continue
-
-            cur: List[str] = []
-            for w in words:
-                cur.append(w)
-                candidate = " ".join(cur)
-                if len(cur) >= int(max_words) or len(candidate) >= int(max_chars):
-                    chunks.append(candidate.strip())
-                    cur = []
-            if cur:
-                chunks.append(" ".join(cur).strip())
-
-    # Final cleanup: enforce max_chars by hard wrap at spaces (fallback to hard split)
-    final: List[str] = []
-    mc = int(max_chars)
-    for c in chunks:
-        c = (c or "").strip()
-        if not c:
-            continue
-        if len(c) <= mc:
-            final.append(c)
-            continue
-
-        # Prefer splitting at spaces
-        while len(c) > mc:
-            cut = c.rfind(" ", 0, mc)
-            if cut <= 0:
-                cut = mc
-            final.append(c[:cut].strip())
-            c = c[cut:].strip()
-        if c:
-            final.append(c)
-
-    return final
-
-def _format_srt_time(seconds: float) -> str:
-    s = max(0.0, float(seconds))
-    ms = int(round((s - int(s)) * 1000.0))
-    total = int(s)
-    hh = total // 3600
-    mm = (total % 3600) // 60
-    ss = total % 60
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-
-def _wrap_caption_lines(c: str, *, max_line_chars: int, max_lines: int = 2) -> str:
-    """Insert line breaks so captions stay inside safe margins.
-
-    libass wrapping is space-dependent; we proactively insert '\n' to:
-    - keep lines short (especially for 9:16 big subtitles)
-    - avoid right-edge clipping on long tokens / hyphenated phrases
+    Cheap, deterministic SRT from plain text:
+    - splits by sentences-ish
+    - distributes across duration
     """
-    s = _normalize_caption_text(c)
-    s = re.sub(r"\s+", " ", s).strip()
-    if not s:
+    raw = _sanitize_caption_text(text)
+    parts = [p.strip() for p in re.split(r"(?<=[\.\?\!])\s+", raw) if p.strip()]
+    if not parts:
+        parts = [raw] if raw else []
+    if not parts:
         return ""
 
-    mlc = max(10, int(max_line_chars))
-    ml = max(1, int(max_lines))
+    # compress if too many cues
+    max_cues = min(140, max(12, int(duration / 1.2)))
+    if len(parts) > max_cues:
+        step = len(parts) / float(max_cues)
+        parts = [parts[min(len(parts) - 1, int(i * step))] for i in range(max_cues)]
 
-    # Already short enough
-    if len(s) <= mlc:
-        return s
-
-    lines: List[str] = []
-    remaining = s
-
-    while remaining and len(lines) < ml:
-        if len(remaining) <= mlc:
-            lines.append(remaining.strip())
-            remaining = ""
-            break
-
-        # Prefer break at last space within limit
-        cut = remaining.rfind(" ", 0, mlc + 1)
-        if cut <= 0:
-            # Try break at em dash (now spaced) or punctuation
-            dash = remaining.find(" — ")
-            if 0 < dash < (mlc + 1):
-                cut = dash + 1
-            else:
-                cut = mlc
-
-        lines.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
-
-    # If we still have remaining text, append to last line with ellipsis
-    if remaining:
-        if lines:
-            lines[-1] = (lines[-1] + " " + remaining).strip()
-        else:
-            lines = [remaining.strip()]
-
-    # Final safety: if last line is still too long, truncate a bit
-    if lines and len(lines[-1]) > mlc * 2:
-        lines[-1] = lines[-1][: (mlc * 2 - 1)].rstrip() + "…"
-
-    return "\n".join(lines)
-
-
-def build_srt_from_script(
-    script_text: str,
-    *,
-    total_seconds: float,
-    min_caption_s: float = 0.85,
-    max_caption_s: float = 2.80,
-    max_words: int = 6,
-    max_chars: int = 44,
-    max_line_chars: Optional[int] = None,
-    max_lines: int = 2,
-) -> str:
-    """Create SRT text by distributing caption chunks across total_seconds."""
-    chunks = _split_text_for_captions(script_text, max_words=int(max_words), max_chars=int(max_chars))
-    if not chunks:
-        return ""
-
-    total_seconds = max(0.5, float(total_seconds))
-    n = len(chunks)
-
-    # Weight by word count (better pacing than equal slices)
-    weights = []
-    for c in chunks:
-        w = max(1, len(c.split()))
-        weights.append(w)
-    wsum = float(sum(weights))
-
-    # Raw durations
-    durs = [(total_seconds * (w / wsum)) for w in weights]
-
-    # Clamp + renormalize to keep within total
-    min_s = float(min_caption_s)
-    max_s = float(max_caption_s)
-    durs = [clamp_float(d, min_s, max_s) for d in durs]
-
-    # Renormalize to fit total_seconds
-    scale = total_seconds / max(0.001, sum(durs))
-    durs = [d * scale for d in durs]
-
-    # Line wrapping settings
-    mlc = int(max_line_chars) if max_line_chars is not None else int(max_chars)
-
-    # Build SRT entries
-    lines: List[str] = []
+    cue_dur = max(0.8, duration / float(len(parts)))
+    cues = []
     t = 0.0
-    for i, (c, d) in enumerate(zip(chunks, durs), start=1):
+    for i, p in enumerate(parts, start=1):
         start = t
-        end = t + max(0.30, float(d))
-        # Prevent overshoot
-        if end > total_seconds:
-            end = total_seconds
-        if end - start < 0.25:
-            end = min(total_seconds, start + 0.25)
-
-        cap = _wrap_caption_lines(c, max_line_chars=mlc, max_lines=int(max_lines))
-
-        lines.append(str(i))
-        lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
-        lines.append(cap)
-        lines.append("")  # blank line
+        end = min(duration, t + cue_dur)
         t = end
-
-        if t >= total_seconds - 0.02:
+        cues.append(str(i))
+        cues.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
+        cues.append(p)
+        cues.append("")
+        if t >= duration:
             break
-
-    return "\n".join(lines).strip() + "\n"
-
-
-def build_srt_from_audio_whisper(
-    audio_path: Union[str, Path],
-    *,
-    api_key: str,
-    max_line_chars: int = 20,
-    max_lines: int = 2,
-) -> str:
-    """Best-effort SRT from audio using OpenAI transcription (Whisper).
-
-    Returns empty string on failure; caller should fall back to script-distributed SRT.
-    """
-    ap = Path(audio_path)
-    if not ap.exists() or ap.stat().st_size < 1024:
-        return ""
-
-    try:
-        client = OpenAI(api_key=api_key)
-        with ap.open("rb") as f:
-            # verbose_json includes segment-level timestamps
-            tr = client.audio.transcriptions.create(
-                model=os.environ.get("UAPPRESS_WHISPER_MODEL", "whisper-1"),
-                file=f,
-                response_format="verbose_json",
-            )
-        segments = getattr(tr, "segments", None) or tr.get("segments") if isinstance(tr, dict) else None
-        if not segments:
-            return ""
-
-        lines: List[str] = []
-        idx = 1
-        for seg in segments:
-            try:
-                start = float(seg.get("start", 0.0))
-                end = float(seg.get("end", start + 0.8))
-                txt = (seg.get("text") or "").strip()
-            except Exception:
-                continue
-
-            if not txt:
-                continue
-
-            cap = _wrap_caption_lines(txt, max_line_chars=int(max_line_chars), max_lines=int(max_lines))
-            if not cap:
-                continue
-
-            # Guard tiny / invalid ranges
-            if end <= start:
-                end = start + 0.40
-
-            lines.append(str(idx))
-            lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
-            lines.append(cap)
-            lines.append("")
-            idx += 1
-
-        return "\n".join(lines).strip() + "\n"
-    except Exception:
-        return ""
+    return "\n".join(cues).strip() + "\n"
 
 
-def _ffmpeg_filter_escape(path: str) -> str:
-    """Escape a filesystem path for ffmpeg filter arguments."""
-    p = str(path)
-    p = p.replace("\\", "\\\\")
-    p = p.replace(":", "\\:")
-    p = p.replace("'", "\\'")
+def _write_subs_for_segment(extract_dir: str, uid: str, audio_path: Path, script_text: str, subtitle_path: str) -> Path:
+    cache = _segment_cache_dir(extract_dir, uid)
+    out_srt = cache / "captions.srt"
+
+    # If provided SRT/VTT exists, sanitize-copy to SRT
+    if subtitle_path:
+        sp = Path(subtitle_path)
+        if sp.exists() and sp.suffix.lower() == ".srt":
+            txt = sp.read_text(encoding="utf-8", errors="ignore")
+            txt = _sanitize_caption_text(txt)
+            out_srt.write_text(txt, encoding="utf-8")
+            return out_srt
+        if sp.exists() and sp.suffix.lower() == ".vtt":
+            txt = sp.read_text(encoding="utf-8", errors="ignore")
+            txt = re.sub(r"^WEBVTT.*\n", "", txt).strip()
+            txt = txt.replace(".", ",")  # crude VTT -> SRT millis (best-effort)
+            txt = _sanitize_caption_text(txt)
+            out_srt.write_text(txt, encoding="utf-8")
+            return out_srt
+
+    dur = float(ffprobe_duration_seconds(audio_path))
+    srt = _build_srt_from_text(script_text, dur)
+    out_srt.write_text(srt, encoding="utf-8")
+    return out_srt
+
+
+def _escape_filter_path(p: Union[str, Path]) -> str:
+    # For ffmpeg subtitles filter: escape backslashes/colons/single quotes
+    s = str(p)
+    s = s.replace("\\", "\\\\")
+    s = s.replace(":", "\\:")
+    s = s.replace("'", "\\'")
+    return s
+
+
+# ----------------------------
+# Render
+# ----------------------------
+def _concat_list_file(images: List[Path], seconds_per: float) -> Path:
+    seconds_per = max(0.5, float(seconds_per))
+    p = Path(tempfile.mkstemp(prefix="uappress_concat_", suffix=".txt")[1])
+    lines: List[str] = []
+    for img in images:
+        lines.append(f"file '{img.as_posix()}'")
+        lines.append(f"duration {seconds_per:.3f}")
+    # repeat last file to force duration application
+    lines.append(f"file '{images[-1].as_posix()}'")
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return p
 
 
-def _parse_srt(srt_text: str) -> List[Tuple[float, float, str]]:
-    """Parse SRT into a list of (start_s, end_s, text)."""
-    out: List[Tuple[float, float, str]] = []
-    if not srt_text:
-        return out
-
-    def _ts_to_s(ts: str) -> float:
-        # 00:00:01,234
-        ts = (ts or "").strip()
-        m = re.match(r"^(\d+):(\d+):(\d+)[,\.]?(\d+)?$", ts)
-        if not m:
-            return 0.0
-        hh = int(m.group(1)); mm = int(m.group(2)); ss = int(m.group(3))
-        ms = int((m.group(4) or "0").ljust(3, "0")[:3])
-        return hh*3600 + mm*60 + ss + ms/1000.0
-
-    # Split by blank lines into cue blocks
-    blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
-    for b in blocks:
-        lines = [ln.rstrip() for ln in b.splitlines() if ln.strip() != ""]
-        if len(lines) < 2:
-            continue
-        # Optional numeric index on first line
-        if re.match(r"^\d+$", lines[0].strip()):
-            lines = lines[1:]
-        if not lines:
-            continue
-        timing = lines[0]
-        m = re.match(r"^(.*?)\s*-->\s*(.*)$", timing)
-        if not m:
-            continue
-        start_s = _ts_to_s(m.group(1).strip())
-        end_s = _ts_to_s(m.group(2).strip().split()[0])
-        txt = "\\N".join([ln.strip() for ln in lines[1:]])
-        txt = txt.strip()
-        if not txt:
-            continue
-        if end_s <= start_s:
-            end_s = start_s + 0.40
-        out.append((start_s, end_s, txt))
-    return out
+def _vf_fill_frame(width: int, height: int) -> str:
+    return f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
 
 
-def _ass_time(t: float) -> str:
-    # h:mm:ss.cc (centiseconds)
-    if t < 0:
-        t = 0.0
-    cs = int(round(t * 100.0))
-    hh = cs // (3600 * 100)
-    cs -= hh * 3600 * 100
-    mm = cs // (60 * 100)
-    cs -= mm * 60 * 100
-    ss = cs // 100
-    cs -= ss * 100
-    return f"{hh}:{mm:02d}:{ss:02d}.{cs:02d}"
-
-
-def _escape_ass_text(s: str) -> str:
-    # ASS special chars: { } and backslashes
-    s = s.replace("\\", r"\\")
-    s = s.replace("{", r"\{")
-    s = s.replace("}", r"\}")
-    return s
-
-
-
-def _strip_leading_dashes_for_shorts(text: str) -> str:
-    """Remove leading em/en dashes (— / –) from each caption line for Shorts.
-
-    These are common in documentary scripts (e.g., "— after interviews") but read like a stray slash
-    at large subtitle sizes in 9:16.
-    """
-    try:
-        lines = []
-        for ln in str(text or "").splitlines():
-            ln2 = re.sub(r"^\s*[—–]\s*", "", ln)
-            lines.append(ln2)
-        return "\n".join(lines)
-    except Exception:
-        return str(text or "")
-
-
-
-def _srt_to_ass(
-    *,
-    srt_text: str,
-    width: int,
-    height: int,
-    style: str,
-) -> str:
-    """Convert SRT -> ASS with deterministic PlayRes + safe placement.
-
-    This avoids libass scaling quirks some ffmpeg builds exhibit with the subtitles= filter
-    (e.g., default PlayRes 384x288 causing gigantic text and top placement in 9:16).
-    """
-    w = int(width); h = int(height)
-    stl = _subtitle_style_resolved(style, width=w, height=h)
-
-    # Safe sizing
-    if stl == "shorts":
-        # Big, but never "title at top". Keep in lower third safe area.
-        fs = 52 if h >= 1900 else (46 if h >= 1600 else 40)
-        margin_v = int(h * 0.12)
-        margin_v = max(int(h * 0.10), min(margin_v, int(h * 0.18)))
-        margin_lr = int(w * 0.07)
-        margin_lr = max(int(w * 0.05), min(margin_lr, int(w * 0.10)))
-        outline = 4
-        shadow = 1
-    else:
-        fs = 34 if h >= 900 else 30
-        margin_v = max(70, int(h * 0.07))
-        margin_lr = max(60, int(w * 0.05))
-        outline = 3
-        shadow = 1
-
-    # ASS header
-    header = [
-        "[Script Info]",
-        "ScriptType: v4.00+",
-        f"PlayResX: {w}",
-        f"PlayResY: {h}",
-        "ScaledBorderAndShadow: yes",
-        "WrapStyle: 2",
-        "YCbCr Matrix: TV.601",
-        "",
-        "[V4+ Styles]",
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    ]
-
-    # Alignment 2 = bottom-center. Deterministic. Never top.
-    style_line = (
-        f"Style: Default,DejaVu Sans,{fs},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,{outline},{shadow},2,{margin_lr},{margin_lr},{margin_v},1"
-    )
-    header.append(style_line)
-    header += ["", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
-
-    cues = _parse_srt(srt_text)
-    events: List[str] = []
-    for (st, en, txt) in cues:
-        t1 = _ass_time(st)
-        t2 = _ass_time(en)
-        if stl == "shorts":
-            txt = _strip_leading_dashes_for_shorts(txt)
-        safe_txt = _escape_ass_text(txt)
-        events.append(f"Dialogue: 0,{t1},{t2},Default,,0,0,0,,{safe_txt}")
-
-    return "\n".join(header + events) + "\n"
-
-
-def burn_subtitles_to_mp4(
-    *,
-    src_mp4: Union[str, Path],
-    srt_path: Union[str, Path],
-    dst_mp4: Union[str, Path],
-    style: str = "auto",
-    width: int = 1920,
-    height: int = 1080,
-) -> Path:
-    """Burn subtitles into an MP4 using ffmpeg + libass (ASS path, deterministic).
-
-    IMPORTANT:
-    We convert the SRT to an ASS file with explicit PlayResX/Y and safe placement,
-    then render using the `ass=` filter. This prevents ffmpeg builds that ignore
-    `subtitles=original_size=...` from producing huge/top-clipped captions in 9:16.
-    """
-    src = Path(src_mp4)
-    srt = Path(srt_path)
-    dst = Path(dst_mp4)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-
-    if not src.exists():
-        raise FileNotFoundError(str(src))
-    if not srt.exists():
-        raise FileNotFoundError(str(srt))
-
-    w = int(width)
-    h = int(height)
-
-    # Convert to ASS with deterministic style
-    srt_text = srt.read_text(encoding="utf-8", errors="ignore")
-    ass_text = _srt_to_ass(srt_text=srt_text, width=w, height=h, style=str(style or "auto"))
-
-    tmp_ass = dst.with_suffix(".tmp.ass")
-    tmp_ass.write_text(ass_text, encoding="utf-8")
-
-    vf = f"ass={_ffmpeg_filter_escape(str(tmp_ass))}"
-
-    ff = which_ffmpeg()
-    cmd = [
-        ff,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(src),
-        "-vf",
-        vf,
-        "-c:v",
-        "libx264",
-        "-preset",
-        os.environ.get("UAPPRESS_X264_PRESET", "ultrafast"),
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(dst),
-    ]
-    run_ffmpeg(cmd)
-
-    # Cleanup temp ass (best-effort)
-    try:
-        tmp_ass.unlink()
-    except Exception:
-        pass
-
-    if not dst.exists() or dst.stat().st_size < 50_000:
-        raise RuntimeError("Subtitle burn failed (output missing or too small).")
-
-    return dst
-
-
-def _subtitle_style_resolved(style: str, *, width: int, height: int) -> str:
-    """Resolve subtitle style to 'shorts' or 'standard'.
-
-    Accepts:
-      - UI strings from app.py: 'Auto', 'Shorts (big, lower-safe)', 'Standard (bottom)'
-      - canonical tokens: 'auto', 'shorts', 'standard'
-    """
-    w = int(width)
-    h = int(height)
-    is_vertical = h > w
-
-    s = (style or "auto").strip().lower()
-
-    # Normalize common UI labels / aliases
-    if "auto" in s:
-        s = "auto"
-    elif "short" in s or "center" in s or "lower" in s:
-        s = "shorts"
-    elif "standard" in s or "bottom" in s:
-        s = "standard"
-
-    if s == "auto":
-        return "shorts" if is_vertical else "standard"
-    if s.startswith("short"):
-        return "shorts"
-    return "standard"
-
-
-# ===============================================================
-# Public segment render API (app.py expects this)
-# ===============================================================
-
-def _compute_scene_durations(
-    total_seconds: float,
-    n_scenes: int,
-    *,
-    min_scene_seconds: float,
-    max_scene_seconds: float,
-) -> List[float]:
-    """
-    Allocate scene durations that sum exactly to total_seconds, while respecting per-scene
-    min/max bounds (best-effort by reducing n_scenes if needed).
-
-    Strategy:
-      - Choose the largest n <= n_scenes such that n*min <= total <= n*max (if possible).
-      - Initialize all scenes at min, then distribute remaining seconds up to max.
-      - Any leftover fractional drift is applied to the final scene.
-    """
-    total = max(0.01, float(total_seconds))
-    n = max(1, int(n_scenes))
-    mn = max(0.05, float(min_scene_seconds))
-    mx = max(mn, float(max_scene_seconds))
-
-    # Reduce n until feasible or n == 1
-    while n > 1 and (n * mn > total or n * mx < total):
-        n -= 1
-
-    # If still infeasible (extremely short/long), clamp behavior:
-    if n * mn > total:
-        # Total is too short; return one scene of total.
-        return [total]
-    if n * mx < total:
-        # Total is too long; cap all to mx and let last one carry remainder (will exceed mx, but avoids crash).
-        base = [mx] * n
-        rem = total - (mx * n)
-        base[-1] += rem
-        return base
-
-    d = [mn] * n
-    remaining = total - (mn * n)
-
-    per_cap = mx - mn
-    i = 0
-    while remaining > 1e-6 and i < n:
-        add = min(per_cap, remaining)
-        d[i] += add
-        remaining -= add
-        i += 1
-        if i >= n and remaining > 1e-6:
-            # Wrap around distributing any leftover (rare)
-            i = 0
-            per_cap = max(0.0, per_cap)
-            if per_cap <= 1e-9:
-                break
-
-    # Apply any tiny float drift to last scene
-    drift = total - sum(d)
-    d[-1] += drift
-
-    # Safety: no negative
-    d = [max(0.05, float(x)) for x in d]
-    return d
+def _assert_audio_decodes(audio_path: Path) -> None:
+    # Ensure audio is decodable (prevents silent output)
+    ff = ffmpeg_exe()
+    rc, out, err = run_cmd([ff, "-hide_banner", "-v", "error", "-i", str(audio_path), "-f", "null", "-"])
+    if rc != 0:
+        tail = (err or "").strip()[-2000:]
+        raise RuntimeError(f"Audio decode failed for {audio_path.name}. Tail:\n{tail}")
+    dur = float(ffprobe_duration_seconds(audio_path))
+    if dur <= 0.1:
+        raise RuntimeError(f"Audio duration invalid: {audio_path.name}")
 
 
 def render_segment_mp4(
     *,
     pair: Dict[str, Any],
-    extract_dir: Union[str, Path],
-    out_path: Union[str, Path],
+    extract_dir: str,
+    out_path: str,
     api_key: str,
-    fps: int,
-    width: int,
-    height: int,
-    zoom_strength: float,
-    max_scenes: int,
-    min_scene_seconds: int,
-    max_scene_seconds: int,
-    burn_subtitles: bool = False,
-    subtitle_style: str = "Auto",
-    export_srt: bool = False,
-) -> Path:
-    """
-    Render ONE segment MP4, keeping the locked pipeline order:
-      images → scene clips → concatenate → mux audio → (optional) burn subtitles
+    fps: int = 30,
+    width: int = 1280,
+    height: int = 720,
+    zoom_strength: float = 0.0,
+    max_scenes: int = 12,
+    min_scene_seconds: int = 6,
+    max_scene_seconds: int = 120,
+    burn_subtitles: bool = True,
+) -> None:
+    sp = Path(pair.get("script_path") or "")
+    ap = Path(pair.get("audio_path") or "")
+    subp = str(pair.get("subtitle_path") or "").strip()
+    uid = str(pair.get("uid") or _stable_hash(str(sp) + "|" + str(ap), 14))
 
-    Hard requirements:
-    - No black video: scene clips are real frames from still images via zoompan.
-    - Audio-driven timing: scene durations are allocated from audio duration.
-    - End buffer: mux step pads exactly 0.50–0.75s (see mux_audio_to_video()).
-    - Output integrity: validates MP4 existence/streams; raises on failure.
-    """
-    out_path_p = Path(out_path)
-    out_path_p.parent.mkdir(parents=True, exist_ok=True)
+    if not sp.exists():
+        raise RuntimeError(f"Missing script file: {sp}")
+    if not ap.exists():
+        raise RuntimeError(f"Missing audio file: {ap}")
 
+    script_text = sp.read_text(encoding="utf-8", errors="ignore").strip()
+    if not script_text:
+        raise RuntimeError(f"Empty script file: {sp.name}")
 
-    # Ensure cleanup vars always exist (rerun/exception safe)
-    concat_path: Optional[Path] = None
-    mux_path: Optional[Path] = None
+    # Critical: validate audio decodes BEFORE building video
+    _assert_audio_decodes(ap)
 
-    pair = dict(pair or {})
-    script_path = str(pair.get("script_path") or "").strip()
-    audio_path = str(pair.get("audio_path") or "").strip()
+    dur = float(ffprobe_duration_seconds(ap))
+    is_vertical = height > width
+    max_scenes = max(1, int(max_scenes or default_max_scenes(is_vertical)))
+    max_scenes = min(60, max_scenes)
 
-    if not script_path or not Path(script_path).is_file():
-        raise FileNotFoundError(f"Segment script missing: {script_path}")
-    if not audio_path or not Path(audio_path).is_file():
-        raise FileNotFoundError(f"Segment audio missing: {audio_path}")
+    prompts = _build_prompts(script_text, max_scenes)
+    if not prompts:
+        raise RuntimeError("Unable to derive prompts from script.")
 
-    # Duration (audio-driven)
-    audio_seconds = float(ffprobe_duration_seconds(audio_path))
-    if audio_seconds <= 0:
-        raise RuntimeError(f"Could not determine audio duration for: {audio_path}")
+    size = _image_size_for_wh(width, height)
+    imgs = _ensure_images(extract_dir=extract_dir, uid=uid, api_key=api_key, prompts=prompts, size=size)
 
-    # 1) images
-    images = _generate_segment_images(
-        api_key=str(api_key),
-        extract_dir=extract_dir,
-        pair=pair,
-        width=int(width),
-        height=int(height),
-        max_scenes=int(max_scenes),
-    )
-    if not images:
-        raise RuntimeError("Image generation returned no images for this segment.")
+    sec_per = dur / float(len(imgs))
+    sec_per = max(float(min_scene_seconds), min(float(max_scene_seconds), sec_per))
 
-    # 2) scene clips (durations sum to audio_seconds)
-    durs = _compute_scene_durations(
-        audio_seconds,
-        n_scenes=min(len(images), clamp_int(int(max_scenes), 1, 120)),
-        min_scene_seconds=float(min_scene_seconds),
-        max_scene_seconds=float(max_scene_seconds),
-    )
-    n_use = min(len(images), len(durs))
-    images = images[:n_use]
-    durs = durs[:n_use]
+    lst = _concat_list_file(imgs, sec_per)
 
-    # Clip directory (segment-scoped)
-    extract_dir_p = Path(extract_dir)
-    clips_dir = ensure_dir(extract_dir_p / "_clips" / safe_slug(segment_label(pair), max_len=60))
-    clip_paths: List[Path] = []
+    outp = Path(out_path)
+    outp.parent.mkdir(parents=True, exist_ok=True)
 
-    for idx, (img, dur) in enumerate(zip(images, durs), start=1):
-        # Clip caching: if an identical clip already exists, reuse it to skip FFmpeg on reruns.
-        ck = _clip_cache_key(
-            image_path=img,
-            duration_s=float(dur),
-            width=int(width),
-            height=int(height),
-            fps=int(fps),
-            zoom_strength=float(zoom_strength),
-        )
-        clip_out = clips_dir / f"clip_{idx:03d}_{ck}.mp4"
-        if not _is_valid_clip_mp4(clip_out):
-            build_scene_clip_from_image(
+    vf = _vf_fill_frame(width, height)
+    preset = "veryfast"
+    crf = "20" if is_vertical else "19"
 
-            image_path=img,
-            out_mp4_path=clip_out,
-            duration_s=float(dur),
-            width=int(width),
-            height=int(height),
-            fps=int(fps),
-            zoom_strength=float(zoom_strength),
-        )
-        clip_paths.append(clip_out)
+    # 1) Build base mp4 with explicit stream maps (prevents "no audio" outputs)
+    tmp_base = outp.with_suffix(".base.mp4")
+    cmd = [
+        ffmpeg_exe(),
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(lst),
+        "-i", str(ap),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-vf", vf,
+        "-r", str(int(fps)),  # output fps
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-tune", "stillimage",
+        "-crf", crf,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(tmp_base),
+    ]
+    run_ffmpeg(cmd)
 
-    if not clip_paths:
-        raise RuntimeError("No scene clips were produced.")
+    if not tmp_base.exists() or tmp_base.stat().st_size < 80_000:
+        raise RuntimeError("Base render produced an invalid/too-small MP4.")
+    if not has_audio_stream(str(tmp_base)):
+        raise RuntimeError("Base render produced MP4 with NO AUDIO STREAM.")
 
-    # 3) concatenate
-    concat_path = out_path_p.with_name(out_path_p.stem + "_concat.mp4")
-    concat_video_clips(clip_paths, concat_path)
-    ok, why = validate_mp4(str(concat_path), require_audio=False)
-    if not ok:
-        raise RuntimeError(f"Concat MP4 validation failed: {why}")
-
-    # 4) mux audio (adds strict end buffer internally)
-    mux_path = out_path_p.with_name(out_path_p.stem + "_mux.mp4")
-    mux_audio_to_video(
-        video_path=concat_path,
-        audio_path=audio_path,
-        out_mp4_path=mux_path,
-        end_buffer_s=_DEFAULT_END_BUFFER,
-        audio_seconds=audio_seconds,
-    )
-    ok, why = validate_mp4(mux_path)
-    if not ok:
-        raise RuntimeError(f"Mux MP4 validation failed: {why}")
-
-    # 5) optional subtitles (burn after mux)
-    final_path = mux_path
-
+    # 2) Optional burn-in subtitles (fast second pass; deterministic)
     if burn_subtitles:
-        # Build SRT (prefer Whisper alignment unless disabled)
-        script_text = load_segment_script(script_path)
-        total_for_srt = float(audio_seconds)
+        srt_path = _write_subs_for_segment(extract_dir, uid, ap, script_text, subp)
+        # bottom-safe styling: no cutoff, no top placement
+        # font sizing scales with height
+        font_size = 46 if is_vertical and height >= 1920 else (38 if is_vertical else 28)
+        margin_v = 110 if is_vertical else 60
+        style = f"Alignment=2,MarginV={margin_v},Fontsize={font_size},Outline=2,Shadow=1"
+        filt = f"subtitles='{_escape_filter_path(srt_path)}':force_style='{style}'"
 
-        # Caption chunking based on aspect/style to avoid edge clipping.
-        stl = _subtitle_style_resolved(subtitle_style, width=int(width), height=int(height))
-        is_vertical = int(height) > int(width)
-
-        if is_vertical and stl == "shorts":
-            cap_max_words = 5
-            cap_max_chars = 28
-            cap_max_line_chars = 16
-            cap_max_lines = 2
-        elif is_vertical:
-            cap_max_words = 6
-            cap_max_chars = 34
-            cap_max_line_chars = 20
-            cap_max_lines = 2
-        else:
-            cap_max_words = 6
-            cap_max_chars = 44
-            cap_max_line_chars = 44
-            cap_max_lines = 1
-
-srt_text = ""
-# If ZIP included an explicit subtitle file for this segment, prefer it.
-zip_sub_path = str(pair.get("sub_path") or "").strip()
-if zip_sub_path and Path(zip_sub_path).is_file():
-    srt_text = Path(zip_sub_path).read_text(encoding="utf-8", errors="ignore")
-    sync_mode = "zip"
-else:
-    sync_mode = (os.environ.get("UAPPRESS_SUBTITLE_SYNC", "whisper") or "whisper").strip().lower()
-        if sync_mode not in ("off", "false", "0", "none", ""):
-            if sync_mode in ("whisper", "auto"):
-                try:
-                    srt_text = build_srt_from_audio_whisper(
-                        audio_path,
-                        api_key=str(api_key),
-                        max_line_chars=cap_max_line_chars,
-                        max_lines=cap_max_lines,
-                    ).strip()
-                except Exception:
-                    srt_text = ""
-
-        if not srt_text:
-            srt_text = build_srt_from_script(
-                script_text,
-                total_seconds=total_for_srt,
-                max_words=cap_max_words,
-                max_chars=cap_max_chars,
-                max_line_chars=cap_max_line_chars,
-                max_lines=cap_max_lines,
-            ).strip()
-
-        if not srt_text:
-            raise RuntimeError("Subtitles requested, but SRT generation produced empty output.")
-
-        # Write SRT next to output if requested, otherwise temp.
-        srt_path = out_path_p.with_suffix(".srt")
-        if export_srt:
-            srt_path.write_text(srt_text, encoding="utf-8")
-        else:
-            tmp_srt_dir = ensure_dir(extract_dir_p / "_subs")
-            srt_path = tmp_srt_dir / (out_path_p.stem + ".srt")
-            srt_path.write_text(srt_text, encoding="utf-8")
-
-        subbed_path = out_path_p.with_name(out_path_p.stem + "_subbed.mp4")
-        burn_subtitles_to_mp4(
-            src_mp4=final_path,
-            srt_path=srt_path,
-            dst_mp4=subbed_path,
-            style=str(subtitle_style or "Auto"),
-            width=int(width),
-            height=int(height),
-        )
-        ok, why = validate_mp4(subbed_path)
-        if not ok:
-            raise RuntimeError(f"Subtitle-burn MP4 validation failed: {why}")
-
-        final_path = subbed_path
-
-    # Replace destination atomically
-    if out_path_p.exists():
+        cmd2 = [
+            ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(tmp_base),
+            "-vf", filt,
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-crf", crf,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(outp),
+        ]
+        run_ffmpeg(cmd2)
         try:
-            out_path_p.unlink()
+            tmp_base.unlink(missing_ok=True)
         except Exception:
             pass
-    final_path.replace(out_path_p)
+    else:
+        tmp_base.replace(outp)
 
-    # Final validation gate
-    ok, why = validate_mp4(out_path_p)
-    if not ok:
-        raise RuntimeError(f"Final MP4 validation failed: {why}")
-
-    # Cleanup intermediate files best-effort
-    for p in (concat_path, mux_path):
-        try:
-            if not p:
-                continue
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
-
-    return out_path_p
-
-
-# Backwards-compat aliases (app.py may probe for these names)
-def render_segment_video(**kwargs):  # type: ignore
-    return render_segment_mp4(**kwargs)
-
-def render_segment(**kwargs):  # type: ignore
-    return render_segment_mp4(**kwargs)
-
-def render_mp4_segment(**kwargs):  # type: ignore
-    return render_segment_mp4(**kwargs)
-
-def make_segment_mp4(**kwargs):  # type: ignore
-    return render_segment_mp4(**kwargs)
-
-def build_segment_mp4(**kwargs):  # type: ignore
-    return render_segment_mp4(**kwargs)
-
-def create_segment_mp4(**kwargs):  # type: ignore
-    return render_segment_mp4(**kwargs)
+    # Validate final
+    if not outp.exists() or outp.stat().st_size < 80_000:
+        raise RuntimeError("Final render produced an invalid/too-small MP4.")
+    if float(ffprobe_duration_seconds(outp)) <= 0.05:
+        raise RuntimeError("Final render produced zero-duration MP4.")
+    if not has_audio_stream(str(outp)):
+        raise RuntimeError("Final render has no audio stream.")
