@@ -41,6 +41,7 @@ def _ss_init() -> None:
         "fps": 24,
         "target_scene_sec": 6.0,
         "max_scenes": 30,
+        "image_budget": 6,
         # Subs
         "burn_subs": True,
         "subs_size": "Medium",
