@@ -154,7 +154,8 @@ st.markdown(
     <style>
     .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
     [data-testid="stSidebar"] { background: linear-gradient(180deg, #0b0f16 0%, #070a0f 100%); }
-    [data-testid="stSidebar"] * { color: #e8eef7; }
+    [data-testid="stSidebar"] * { color: #EAF2FF; font-weight: 500; }
+[data-testid="stSidebar"] input, [data-testid="stSidebar"] select { background-color: #101826; color: #EAF2FF; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -184,8 +185,12 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Scenes")
+st.session_state.setdefault('image_budget', 6)
+
     st.session_state["target_scene_sec"] = st.slider("Target seconds per scene", 1.0, 12.0, float(st.session_state["target_scene_sec"]), 0.5)
-    st.session_state["max_scenes"] = st.slider("Max scenes per segment", 2, 120, int(st.session_state["max_scenes"]), 1)
+    st.session_state["max_scenes"] = st.slider("Max scenes per segment"
+st.session_state["image_budget"] = st.slider("Image budget (token control)", 2, 12, int(st.session_state.get('image_budget', 6)), 1)
+, 2, 120, int(st.session_state["max_scenes"]), 1)
     st.caption("If your cap would truncate audio, GODMODE overrides upward (audio is authority).")
 
     st.divider()
@@ -282,6 +287,7 @@ if st.button("🎬 Generate MP4s", type="primary", use_container_width=True):
         prog = st.progress(0.0)
 
         try:
+            os.environ['UAPPRESS_IMAGE_BUDGET'] = str(st.session_state['image_budget'])
             mp4_path, meta = vp.render_segment_mp4(
                 segment=seg,
                 out_dir=out_dir,
