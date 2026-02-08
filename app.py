@@ -1,12 +1,12 @@
-# app.py
+# app_GODMODE.py
 # UAPpress — Video Creator (GODMODE)
-# ZIP (scripts+audio) → Images → Clips → Concat → Mux Audio → (Optional Burn-in Subs) → MP4 → (Optional Spaces Upload)
+# ZIP (scripts+audio) → Images → Cached Clips → Concat → Mux Audio → (Optional Burn-in Subs) → MP4 → (Optional Spaces Upload)
 #
-# Design rules:
-# - Import-safe (no undefined names at import time)
+# Rules:
+# - Import-safe
 # - Streamlit rerun-safe (all session_state keys pre-initialized)
-# - Audio is authority (video must cover full narration; never truncate audio)
-# - Ferrari UI (minimal, fast, purposeful)
+# - Audio is authority
+# - Ferrari UI: minimal + purposeful + fast
 
 from __future__ import annotations
 
@@ -16,11 +16,11 @@ import tempfile
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any
 
 import streamlit as st
 
-import video_pipeline as vp
+import video_pipeline_GODMODE as vp
 
 
 # -----------------------------
@@ -34,15 +34,18 @@ st.set_page_config(page_title="UAPpress — Video Creator (GODMODE)", layout="wi
 # -----------------------------
 def _ss_init() -> None:
     defaults = {
+        # Core
         "openai_key": "",
         "mode": "Shorts / TikTok / Reels (9:16)",
         "resolution": "1080x1920",
         "fps": 24,
         "target_scene_sec": 6.0,
         "max_scenes": 30,
+        # Subs
         "burn_subs": True,
         "subs_size": "Medium",
         "subs_safe_margin": 6,  # % of height
+        # ZIP persistence
         "zip_saved_path": "",
         "extract_root": "",
         "detected_pairs": [],  # list[dict]
@@ -55,8 +58,6 @@ def _ss_init() -> None:
         "spaces_endpoint": os.environ.get("DO_SPACES_ENDPOINT", ""),  # optional override
         "spaces_key": os.environ.get("DO_SPACES_KEY", ""),
         "spaces_secret": os.environ.get("DO_SPACES_SECRET", ""),
-        # UX
-        "last_status": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -82,12 +83,7 @@ def _wh_from_resolution(res: str) -> Tuple[int, int]:
 
 
 def _subtitle_style_for_ui(w: int, h: int) -> Dict[str, Any]:
-    """
-    Returns a style dict consumed by video_pipeline._vf_subtitles()
-    Clamp is ALSO enforced inside video_pipeline for safety.
-    """
     size = st.session_state["subs_size"]
-    # Conservative sizing (no circus)
     if size == "Small":
         font_px = max(22, int(h * 0.030))
     elif size == "Large":
@@ -109,9 +105,6 @@ def _subtitle_style_for_ui(w: int, h: int) -> Dict[str, Any]:
 
 
 def _hard_reset_project() -> None:
-    """
-    Delete extracted work dirs tracked in session_state. Safe on reruns.
-    """
     for key in ("zip_saved_path", "extract_root"):
         p = st.session_state.get(key, "")
         if p:
@@ -126,13 +119,9 @@ def _hard_reset_project() -> None:
                 pass
             st.session_state[key] = ""
     st.session_state["detected_pairs"] = []
-    st.session_state["last_status"] = ""
 
 
 def _save_uploaded_zip_to_tmp(uploaded_file) -> Path:
-    """
-    Persist the uploaded ZIP to /tmp so reruns don't lose it.
-    """
     root = Path(tempfile.mkdtemp(prefix="uappress_zip_"))
     zpath = root / "input.zip"
     zpath.write_bytes(uploaded_file.getbuffer())
@@ -158,28 +147,21 @@ def _detect_segments(extract_root: Path) -> List[vp.Segment]:
 
 
 # -----------------------------
-# Ferrari UI
+# Ferrari UI (minimal, functional)
 # -----------------------------
 st.markdown(
     """
     <style>
-    /* Ferrari: reduce clutter, tighten spacing */
     .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
     [data-testid="stSidebar"] { background: linear-gradient(180deg, #0b0f16 0%, #070a0f 100%); }
     [data-testid="stSidebar"] * { color: #e8eef7; }
-    [data-testid="stSidebar"] .stSelectbox label, 
-    [data-testid="stSidebar"] .stSlider label,
-    [data-testid="stSidebar"] .stTextInput label,
-    [data-testid="stSidebar"] .stCheckbox label { color: #dfe7f3 !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-c1, c2 = st.columns([1, 3], vertical_alignment="center")
-with c2:
-    st.title("🛸 Video Creator — GODMODE")
-    st.caption("ZIP in → MP4 out → optional Spaces upload. Audio drives duration. Subtitles default ON. Speed wins.")
+st.title("🛸 UAPpress — Video Creator (GODMODE)")
+st.caption("ZIP in → MP4 out → optional Spaces upload. Audio drives duration. Real caching under /tmp for speed.")
 
 with st.sidebar:
     st.subheader("OpenAI")
@@ -192,28 +174,22 @@ with st.sidebar:
     if _vertical_mode(st.session_state["mode"]):
         res_options = ["1080x1920", "720x1280"]
         default_res = st.session_state["resolution"] if st.session_state["resolution"] in res_options else "1080x1920"
-        st.session_state["resolution"] = st.selectbox("Resolution (9:16)", res_options, index=res_options.index(default_res))
+        st.session_state["resolution"] = st.selectbox("Resolution", res_options, index=res_options.index(default_res))
     else:
         res_options = ["1920x1080", "1280x720"]
         default_res = st.session_state["resolution"] if st.session_state["resolution"] in res_options else "1920x1080"
-        st.session_state["resolution"] = st.selectbox("Resolution (16:9)", res_options, index=res_options.index(default_res))
+        st.session_state["resolution"] = st.selectbox("Resolution", res_options, index=res_options.index(default_res))
 
     st.session_state["fps"] = st.number_input("FPS", min_value=12, max_value=60, value=int(st.session_state["fps"]), step=1)
 
     st.divider()
-    st.subheader("🧩 Scenes")
-    st.session_state["target_scene_sec"] = st.slider(
-        "Target seconds per scene (auto scene count)",
-        min_value=1.0,
-        max_value=12.0,
-        value=float(st.session_state["target_scene_sec"]),
-        step=0.5,
-    )
-    st.session_state["max_scenes"] = st.slider("Max scenes per segment", 2, 80, int(st.session_state["max_scenes"]), 1)
-    st.caption("GODMODE always covers full audio duration. If caps would truncate audio, engine overrides upward (and logs it).")
+    st.subheader("Scenes")
+    st.session_state["target_scene_sec"] = st.slider("Target seconds per scene", 1.0, 12.0, float(st.session_state["target_scene_sec"]), 0.5)
+    st.session_state["max_scenes"] = st.slider("Max scenes per segment", 2, 120, int(st.session_state["max_scenes"]), 1)
+    st.caption("If your cap would truncate audio, GODMODE overrides upward (audio is authority).")
 
     st.divider()
-    st.subheader("🧷 Subtitles")
+    st.subheader("Subtitles")
     st.session_state["burn_subs"] = st.checkbox("Burn-in subtitles (recommended)", value=bool(st.session_state["burn_subs"]))
     st.session_state["subs_size"] = st.selectbox("Subtitle size", ["Small", "Medium", "Large"], index=["Small", "Medium", "Large"].index(st.session_state["subs_size"]))
     st.session_state["subs_safe_margin"] = st.slider("Bottom safe margin (%)", 2, 14, int(st.session_state["subs_safe_margin"]), 1)
@@ -222,7 +198,7 @@ with st.sidebar:
     st.subheader("☁️ Spaces Upload (optional)")
     st.session_state["spaces_enabled"] = st.toggle("Auto-upload to Spaces", value=bool(st.session_state["spaces_enabled"]))
     st.session_state["spaces_public"] = st.toggle("Public-read ACL", value=bool(st.session_state["spaces_public"]))
-    st.session_state["spaces_prefix"] = st.text_input("Prefix override (optional)", value=st.session_state["spaces_prefix"])
+    st.session_state["spaces_prefix"] = st.text_input("Prefix (optional)", value=st.session_state["spaces_prefix"])
 
     with st.expander("Spaces credentials", expanded=False):
         st.session_state["spaces_bucket"] = st.text_input("Bucket", value=st.session_state["spaces_bucket"])
@@ -232,6 +208,7 @@ with st.sidebar:
         st.session_state["spaces_secret"] = st.text_input("Secret Key", value=st.session_state["spaces_secret"], type="password")
 
     st.divider()
+    st.caption(f"Cache: `{vp.cache_root()}`")
     if st.button("🧹 Reset / Remove ZIP", use_container_width=True):
         _hard_reset_project()
         st.rerun()
@@ -254,10 +231,9 @@ if uploaded is not None:
             st.write(f"**{i}.** {seg.label}")
             st.write(f"- Script: `{seg.script_path}`")
             st.write(f"- Audio: `{seg.audio_path}`")
-
 else:
-    st.info("Upload/extract a ZIP to detect segments. (The UI is fully available without it.)")
     pairs = [vp.Segment(**d) for d in st.session_state.get("detected_pairs", [])] if st.session_state.get("detected_pairs") else []
+    st.info("Upload/extract a ZIP to detect segments.")
 
 
 st.header("2) Generate Segment MP4s")
@@ -273,21 +249,18 @@ gen_col1, gen_col2 = st.columns([1, 2], vertical_alignment="center")
 with gen_col1:
     overwrite = st.checkbox("Overwrite existing MP4s", value=True)
 with gen_col2:
-    st.caption("Segments generate sequentially (crash-safe). Each MP4 is validated before optional upload.")
+    st.caption("Sequential render (crash-safe). Each MP4 validated before optional upload.")
 
 if st.button("🎬 Generate MP4s", type="primary", use_container_width=True):
     if not st.session_state["openai_key"]:
         st.error("OpenAI API key is required.")
         st.stop()
 
-    # Output dir under /tmp (safe on Streamlit Cloud)
     out_root = Path(tempfile.mkdtemp(prefix="uappress_out_"))
     out_dir = out_root / ("mp4_segments_9x16" if vertical else "mp4_segments_16x9")
     out_dir.mkdir(parents=True, exist_ok=True)
-
     st.write(f"Segments will be saved to: `{out_dir}`")
 
-    # Configure Spaces client (optional)
     spaces_cfg = None
     if st.session_state["spaces_enabled"]:
         spaces_cfg = vp.SpacesConfig(
@@ -328,8 +301,20 @@ if st.button("🎬 Generate MP4s", type="primary", use_container_width=True):
             st.error(f"Render failed: {e}")
             continue
 
-        st.success(f"Rendered: `{mp4_path.name}`  (duration ~{meta.get('audio_duration', 0):.1f}s)")
+        if meta.get("cap_overridden"):
+            st.warning("Scene cap overridden upward to avoid truncating audio (audio is authority).")
+
+        st.success(f"Rendered: `{mp4_path.name}`  (audio ~{meta.get('audio_duration', 0):.1f}s)")
         st.video(str(mp4_path))
+
+        # Direct download (useful even with Spaces)
+        st.download_button(
+            "⬇️ Download MP4",
+            data=mp4_path.read_bytes(),
+            file_name=mp4_path.name,
+            mime="video/mp4",
+            use_container_width=True,
+        )
 
         if spaces_cfg is not None:
             try:
