@@ -185,12 +185,24 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Scenes")
-st.session_state.setdefault('image_budget', 6)
-
-    st.session_state["target_scene_sec"] = st.slider("Target seconds per scene", 1.0, 12.0, float(st.session_state["target_scene_sec"]), 0.5)
-    st.session_state["max_scenes"] = st.slider("Max scenes per segment"
-st.session_state["image_budget"] = st.slider("Image budget (token control)", 2, 12, int(st.session_state.get('image_budget', 6)), 1)
-, 2, 120, int(st.session_state["max_scenes"]), 1)
+    st.session_state["target_scene_sec"] = st.slider(
+        "Target seconds per scene",
+        1.0, 12.0,
+        float(st.session_state["target_scene_sec"]),
+        0.5,
+    )
+    st.session_state["max_scenes"] = st.slider(
+        "Max scenes per segment",
+        2, 120,
+        int(st.session_state["max_scenes"]),
+        1,
+    )
+    st.session_state["image_budget"] = st.slider(
+        "Image budget (token control)",
+        2, 12,
+        int(st.session_state.get("image_budget", 6)),
+        1,
+    )
     st.caption("If your cap would truncate audio, GODMODE overrides upward (audio is authority).")
 
     st.divider()
