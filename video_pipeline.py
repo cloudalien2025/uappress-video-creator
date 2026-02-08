@@ -273,10 +273,10 @@ def _openai_base_url() -> str:
     return os.environ.get("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
 
 
-
 def _openai_safe_size(w: int, h: int) -> str:
-    # OpenAI Images supports limited sizes; choose closest and upscale via ffmpeg
-    # Cost discipline: never fail due to size
+    # OpenAI Images supports limited sizes; choose closest and upscale/crop locally with FFmpeg.
+    # This prevents 400 errors for 1080x1920, 1920x1080, etc.
+    # NOTE: choose larger when possible for quality.
     if w >= 1024 and h >= 1024:
         return "1024x1024"
     if w >= 512 and h >= 512:
@@ -812,3 +812,69 @@ def render_segment_mp4(
     prompts_all = _scene_prompts_from_script(script_text, n_scenes, vertical)
     image_budget = int(os.environ.get('UAPPRESS_IMAGE_BUDGET', '6'))
     prompts = prompts_all[:max(1, min(len(prompts_all), image_budget))]
+    size = _openai_safe_size(width, height)
+
+    # 5) images + cached clips
+    clips: List[Path] = []
+    for i in range(n_scenes):
+        prompt = prompts[i % len(prompts)]
+        img = _ensure_image_for_scene(api_key=openai_api_key, prompt=prompt, size=size)
+        clip = _make_image_clip_cached(image_path=img, w=width, h=height, fps=fps, duration=sec_per)
+        clips.append(clip)
+        _p(0.02 + 0.62 * ((i + 1) / max(1, n_scenes)))
+
+    # 6) concat + mux + optional burn (use small temp work dir for manifests and subs)
+    work = Path(tempfile.mkdtemp(prefix="uappress_work_"))
+    try:
+        concat_mp4 = work / "concat.mp4"
+        _concat_clips(clips, concat_mp4)
+        _p(0.72)
+
+        mux_mp4 = work / "mux.mp4"
+        _mux_audio(concat_mp4, ap, mux_mp4)
+        _p(0.86)
+
+        ok, msg = validate_mp4(mux_mp4, require_audio=True)
+        if not ok:
+            raise RuntimeError(f"Invalid mux output: {msg}")
+
+        out_candidate = mux_mp4
+        if burn_subtitles:
+            srt = work / "subs.srt"
+            make_srt_from_script(script_text, dur, srt)
+            burned = work / "burned.mp4"
+            _burn_subtitles(mux_mp4, srt, burned, w=width, h=height, style=(subtitle_style or {}))
+            ok2, msg2 = validate_mp4(burned, require_audio=True)
+            if not ok2:
+                raise RuntimeError(f"Invalid subtitle output: {msg2}")
+            out_candidate = burned
+
+        _p(0.96)
+
+        # 7) finalize (atomic)
+        _atomic_write_bytes(final_mp4, out_candidate.read_bytes())
+        ok3, msg3 = validate_mp4(final_mp4, require_audio=True)
+        if not ok3:
+            raise RuntimeError(f"Final MP4 invalid: {msg3}")
+
+        _p(1.0)
+
+        meta = {
+            "audio_duration": dur,
+            "audio_duration_plus_buffer": dur_plus,
+            "end_buffer": end_buffer,
+            "scenes": n_scenes,
+            "sec_per_scene": sec_per,
+            "burn_subtitles": bool(burn_subtitles),
+            "output": str(final_mp4),
+            "cap_overridden": cap_overridden,
+            "cache_root": str(cache_root()),
+        }
+        return final_mp4, meta
+    finally:
+        # Keep cache; remove only ephemeral workdir
+        try:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+        except Exception:
+            pass
