@@ -1,4 +1,4 @@
-# video_pipeline_GODMODE.py
+# video_pipeline.py
 # GODMODE video engine for UAPpress
 #
 # Guarantees:
