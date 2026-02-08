@@ -91,7 +91,21 @@ def ffprobe_exe() -> str:
 
 
 def _run(cmd: List[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+    """Run a subprocess command and surface stderr on failure (Streamlit UI needs actionable errors)."""
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=check,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        # Keep message short but useful (avoid massive logs in UI)
+        tail = "\n".join(stderr.splitlines()[-30:]) if stderr else ""
+        cmd_str = " ".join(shlex.quote(c) for c in cmd)
+        raise RuntimeError(f"Command failed (exit {e.returncode}): {cmd_str}\n{tail}") from None
 
 
 def _quote_path(p: Union[str, Path]) -> str:
@@ -484,6 +498,10 @@ def _make_image_clip_cached(
         return out
 
     vf = _vf_fill_frame(w, h)
+    # Ensure clip cache directory exists (ffmpeg fails with exit 1 if it doesn't).
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    vf = _vf_fill_frame(w, h)
     cmd = [
         ffmpeg_exe(),
         "-hide_banner",
@@ -510,7 +528,13 @@ def _make_image_clip_cached(
 def _concat_clips(clips: List[Path], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lst = out_path.parent / f"concat_{_sha1(str(out_path))}.txt"
-    lst.write_text("\n".join([f"file {shlex.quote(str(c))}" for c in clips]) + "\n", encoding="utf-8")
+    lst.write_text(
+        "\n".join([
+            "file '{}'".format(str(c).replace("'", "'\\''"))
+            for c in clips
+        ]) + "\n",
+        encoding="utf-8",
+    )
 
     cmd = [
         ffmpeg_exe(),
