@@ -273,7 +273,18 @@ def _openai_base_url() -> str:
     return os.environ.get("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
 
 
+
+def _openai_safe_size(w: int, h: int) -> str:
+    # OpenAI Images supports limited sizes; choose closest and upscale via ffmpeg
+    # Cost discipline: never fail due to size
+    if w >= 1024 and h >= 1024:
+        return "1024x1024"
+    if w >= 512 and h >= 512:
+        return "512x512"
+    return "256x256"
+
 def _openai_image_generate_bytes(
+
     *,
     prompt: str,
     api_key: str,
@@ -433,7 +444,7 @@ def _vf_subtitles(srt_path: Path, style: Dict[str, Any]) -> str:
     font_size = int(style.get("font_size", 28))
     outline = int(style.get("outline", 2))
     shadow = int(style.get("shadow", 1))
-    border_style = int(style.get("border_style", 3))
+    border_style = int(style.get("border_style", 1))
     alignment = int(style.get("alignment", 2))
     margin_v = int(style.get("margin_v", 48))
 
@@ -798,12 +809,15 @@ def render_segment_mp4(
     _p(0.02)
 
     # 4) prompts (deterministic)
-    prompts = _scene_prompts_from_script(script_text, n_scenes, vertical)
-    size = f"{width}x{height}"
+    prompts_all = _scene_prompts_from_script(script_text, n_scenes, vertical)
+image_budget = int(os.environ.get('UAPPRESS_IMAGE_BUDGET', '6'))
+prompts = prompts_all[:max(1, min(len(prompts_all), image_budget))]
+    size = _openai_safe_size(width, height)
 
     # 5) images + cached clips
     clips: List[Path] = []
-    for i, prompt in enumerate(prompts, 1):
+    for i in range(n_scenes):
+        prompt = prompts[i % len(prompts)]
         img = _ensure_image_for_scene(api_key=openai_api_key, prompt=prompt, size=size)
         clip = _make_image_clip_cached(image_path=img, w=width, h=height, fps=fps, duration=sec_per)
         clips.append(clip)
