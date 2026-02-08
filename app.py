@@ -20,7 +20,7 @@ from typing import Tuple, List, Dict, Any
 
 import streamlit as st
 
-import video_pipeline_GODMODE as vp
+import video_pipeline as vp
 
 
 # -----------------------------
