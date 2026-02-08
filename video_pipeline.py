@@ -1,18 +1,25 @@
-# video_pipeline.py
+# video_pipeline_GODMODE.py
 # GODMODE video engine for UAPpress
 #
 # Guarantees:
 # - Import safe
 # - Deterministic ZIP pairing (script + mp3)
 # - Audio duration is AUTHORITY (never cut narration)
-# - scenes auto-computed from audio (covers full duration + small buffer)
-# - Shorts: fill frame, crop if needed, never pad
-# - Subtitles: deterministic SRT from script (no AI), burn-in optional, sane styling (no clown text)
+# - Scenes auto-computed from audio (covers full duration + small buffer)
+# - Shorts: fill the frame, crop if necessary, NEVER pad
+# - Subtitles: deterministic SRT from script (no AI), burn-in optional, sane styling
+# - Cache that actually caches (persistent under /tmp by default)
 # - Output validated (size + streams + duration)
 # - Optional DigitalOcean Spaces upload (boto3 S3 compatible)
+#
+# Cost discipline:
+# - NO GPT calls for scene prompts or subtitles (deterministic only)
+# - OpenAI used ONLY for images
+# - Aggressive reuse of images + clips across reruns
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -51,6 +58,17 @@ class SpacesConfig:
 
 
 # -----------------------------
+# Persistent cache root
+# -----------------------------
+def cache_root() -> Path:
+    # Streamlit Cloud allows /tmp; use it for real caching across reruns.
+    # You can override for local/dev: export UAPPRESS_CACHE_DIR=/path
+    root = Path(os.environ.get("UAPPRESS_CACHE_DIR", "/tmp/uappress_cache")).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+# -----------------------------
 # Utilities
 # -----------------------------
 def _safe_slug(s: str) -> str:
@@ -73,13 +91,19 @@ def ffprobe_exe() -> str:
 
 
 def _run(cmd: List[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    # Always show stderr on failure for debugging
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
 
 
 def _quote_path(p: Union[str, Path]) -> str:
     # for ffmpeg filters
     return str(p).replace("\\", "/").replace(":", "\\:")
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
 
 
 # -----------------------------
@@ -93,10 +117,8 @@ def find_files(root: Union[str, Path]) -> Tuple[List[Path], List[Path]]:
         if not p.is_file():
             continue
         ext = p.suffix.lower()
-        if ext in (".txt", ".srt"):
-            # Treat .txt as script; .srt is ignored for now (we generate deterministic SRT)
-            if ext == ".txt":
-                scripts.append(p)
+        if ext == ".txt":
+            scripts.append(p)
         elif ext in (".mp3", ".wav", ".m4a", ".aac"):
             audios.append(p)
     scripts.sort()
@@ -105,7 +127,6 @@ def find_files(root: Union[str, Path]) -> Tuple[List[Path], List[Path]]:
 
 
 def _stem_key(p: Path) -> str:
-    # Normalize segment identifier from filename
     return re.sub(r"\s+", " ", p.stem).strip().lower()
 
 
@@ -121,14 +142,10 @@ def pair_segments(scripts: List[Path], audios: List[Path]) -> List[Segment]:
 
     pairs: List[Segment] = []
 
-    # exact key intersection
     common = sorted(set(s_map.keys()) & set(a_map.keys()))
     for k in common:
-        sp = s_map[k]
-        ap = a_map[k]
-        pairs.append(Segment(label=k, script_path=str(sp), audio_path=str(ap)))
+        pairs.append(Segment(label=k, script_path=str(s_map[k]), audio_path=str(a_map[k])))
 
-    # remove already used
     used_s = {Path(seg.script_path) for seg in pairs}
     used_a = {Path(seg.audio_path) for seg in pairs}
     rem_s = [p for p in scripts if p not in used_s]
@@ -136,13 +153,10 @@ def pair_segments(scripts: List[Path], audios: List[Path]) -> List[Segment]:
 
     if not pairs and len(scripts) == 1 and len(audios) == 1:
         sp, ap = scripts[0], audios[0]
-        k = _stem_key(sp)
-        return [Segment(label=k, script_path=str(sp), audio_path=str(ap))]
+        return [Segment(label=_stem_key(sp), script_path=str(sp), audio_path=str(ap))]
 
-    # fallback: stable order pairing
     for sp, ap in zip(sorted(rem_s), sorted(rem_a)):
-        k = _stem_key(sp)
-        pairs.append(Segment(label=k, script_path=str(sp), audio_path=str(ap)))
+        pairs.append(Segment(label=_stem_key(sp), script_path=str(sp), audio_path=str(ap)))
 
     return pairs
 
@@ -151,13 +165,12 @@ def pair_segments(scripts: List[Path], audios: List[Path]) -> List[Segment]:
 # Duration (Audio is authority)
 # -----------------------------
 def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
-    p = str(path)
     cmd = [
         ffprobe_exe(),
         "-v", "error",
         "-show_entries", "format=duration",
         "-of", "json",
-        p,
+        str(path),
     ]
     try:
         out = _run(cmd, check=True).stdout
@@ -169,14 +182,9 @@ def ffprobe_duration_seconds(path: Union[str, Path]) -> float:
 
 
 def _decode_duration_seconds(path: Union[str, Path]) -> float:
-    """
-    Accurate duration by decoding to null and parsing the LAST time=... line.
-    Slower but robust for MP3 header weirdness.
-    """
     ff = ffmpeg_exe()
-    p = str(path)
     proc = subprocess.run(
-        [ff, "-hide_banner", "-loglevel", "info", "-i", p, "-vn", "-f", "null", "-"],
+        [ff, "-hide_banner", "-loglevel", "info", "-i", str(path), "-vn", "-f", "null", "-"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -193,10 +201,6 @@ def _decode_duration_seconds(path: Union[str, Path]) -> float:
 
 
 def audio_duration_seconds(path: Union[str, Path]) -> float:
-    """
-    Duration where audio is authority.
-    If metadata is short/missing, decode-to-null for truth.
-    """
     p = Path(path)
     d = float(ffprobe_duration_seconds(p))
     try:
@@ -204,13 +208,11 @@ def audio_duration_seconds(path: Union[str, Path]) -> float:
     except Exception:
         sz = 0
 
-    # If metadata is missing/short, decode for truth.
     if d <= 0.0 or d < 15.0:
         d2 = float(_decode_duration_seconds(p))
         if d2 > 0.0:
             return d2
 
-    # Extra guard: big file but short duration => decode anyway
     if sz > 250_000 and d < 20.0:
         d2 = float(_decode_duration_seconds(p))
         if d2 > d * 1.2:
@@ -227,189 +229,187 @@ def _compute_scene_plan(
     audio_duration: float,
     max_scenes: int,
     target_scene_seconds: float,
-) -> Tuple[int, float]:
+) -> Tuple[int, float, bool]:
     """
-    Returns (n_scenes, seconds_per_scene).
-    Guarantees: n_scenes * sec_per_scene >= audio_duration (+buffer handled outside).
+    Returns (n_scenes, seconds_per_scene, cap_overridden_upward)
+    Guarantees: n_scenes * sec_per_scene >= audio_duration
     If user cap would truncate, override upward.
     """
     dur = max(0.5, float(audio_duration))
-    max_scenes = max(1, int(max_scenes))
+    cap = max(1, int(max_scenes))
     target = max(0.5, float(target_scene_seconds))
 
-    # Start at target
+    # target-based initial scene count
     n = max(1, int(round(dur / target)))
 
-    # If user cap too low, override upward (audio is authority)
-    if n > max_scenes:
-        max_scenes = n
+    overridden = False
+    if n > cap:
+        cap = n
+        overridden = True
 
-    n = max(1, min(max_scenes, n))
+    n = max(1, min(cap, n))
     sec = dur / n
 
-    # If sec becomes too tiny, reduce scenes modestly
+    # prevent unreadably-fast flicker
     min_sec = 1.0
     if sec < min_sec:
         n = max(1, int(math.floor(dur / min_sec)))
         sec = dur / n
 
-    # Final coverage guard
+    # final coverage guard
     if n * sec + 1e-3 < dur:
         n = int(math.ceil(dur / sec))
         sec = dur / n
+        if n > cap:
+            overridden = True
 
-    return int(n), float(sec)
+    return int(n), float(sec), bool(overridden)
 
 
 # -----------------------------
-# OpenAI image generation (cost disciplined)
+# OpenAI image generation (robust + correct endpoints)
 # -----------------------------
+def _openai_base_url() -> str:
+    return os.environ.get("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
+
+
 def _openai_image_generate_bytes(
     *,
     prompt: str,
     api_key: str,
     size: str,
     timeout_s: int = 120,
+    max_retries: int = 4,
 ) -> bytes:
     """
-    Uses OpenAI Images API via HTTPS (requests) to avoid python-client version drift.
-    Model: 'gpt-image-1' (current image gen family). If your account uses a different model,
-    adjust MODEL below.
+    OpenAI Images: uses /v1/images/generations (primary).
+    Fixes the 404 shown in the UI when code incorrectly hits /v1/images.
+    - Only falls back to /v1/images if /generations returns 404.
+    - Retries on 429/5xx with backoff.
     """
-    MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
+    model = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
+    base = _openai_base_url()
 
-    url = "https://api.openai.com/v1/images"
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    # Some accounts use /v1/images/generations; /v1/images works for newer unified endpoint.
-    # We'll try generations first, then fallback.
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "size": size,
-        "n": 1,
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
+    payload = {"model": model, "prompt": prompt, "size": size, "n": 1}
 
-    # Attempt 1: /generations
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/images/generations",
-            headers={**headers, "Content-Type": "application/json"},
-            json=payload,
-            timeout=timeout_s,
-        )
-        if r.status_code == 200:
-            j = r.json()
-            b64 = None
-            if "data" in j and j["data"]:
-                b64 = j["data"][0].get("b64_json")
-                url_img = j["data"][0].get("url")
-                if b64:
-                    import base64
-                    return base64.b64decode(b64)
-                if url_img:
-                    rr = requests.get(url_img, timeout=timeout_s)
+    endpoints = [f"{base}/v1/images/generations", f"{base}/v1/images"]  # fallback only if first is 404
+
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries):
+        for idx, url in enumerate(endpoints):
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+
+                # If primary endpoint not found, allow fallback; otherwise raise.
+                if r.status_code == 404 and idx == 0:
+                    continue
+
+                if r.status_code in (429, 500, 502, 503, 504):
+                    # transient; retry
+                    raise RuntimeError(f"OpenAI transient {r.status_code}: {r.text[:200]}")
+
+                r.raise_for_status()
+                j = r.json()
+
+                if "data" not in j or not j["data"]:
+                    raise RuntimeError("OpenAI image response missing data")
+
+                d0 = j["data"][0]
+                if d0.get("b64_json"):
+                    return base64.b64decode(d0["b64_json"])
+                if d0.get("url"):
+                    rr = requests.get(d0["url"], timeout=timeout_s)
                     rr.raise_for_status()
                     return rr.content
-        # fall through to endpoint 2
-    except Exception:
-        pass
 
-    # Attempt 2: /images (unified)
-    r = requests.post(
-        url,
-        headers={**headers, "Content-Type": "application/json"},
-        json=payload,
-        timeout=timeout_s,
-    )
-    r.raise_for_status()
-    j = r.json()
-    if "data" not in j or not j["data"]:
-        raise RuntimeError("OpenAI image response missing data")
-    d0 = j["data"][0]
-    if d0.get("b64_json"):
-        import base64
-        return base64.b64decode(d0["b64_json"])
-    if d0.get("url"):
-        rr = requests.get(d0["url"], timeout=timeout_s)
-        rr.raise_for_status()
-        return rr.content
-    raise RuntimeError("OpenAI image response missing url/b64")
+                raise RuntimeError("OpenAI image response missing url/b64")
+            except Exception as e:
+                last_err = e
+                # If primary was 404 we already continued; otherwise break to retry/backoff
+                break
+
+        # backoff before next retry
+        time.sleep(0.6 * (2 ** attempt))
+
+    raise RuntimeError(f"OpenAI image generation failed: {last_err}")
 
 
-def _image_cache_path(cache_dir: Path, key: str) -> Path:
-    return cache_dir / f"{key}.png"
+# -----------------------------
+# Cache paths (real caching)
+# -----------------------------
+def _image_cache_path(size: str, key: str) -> Path:
+    return cache_root() / "images" / size / f"{key}.png"
 
 
-def _ensure_image_for_scene(
-    *,
-    cache_dir: Path,
-    api_key: str,
-    prompt: str,
-    size: str,
-) -> Path:
-    cache_dir.mkdir(parents=True, exist_ok=True)
+def _clip_cache_path(w: int, h: int, fps: int, key: str) -> Path:
+    return cache_root() / "clips" / f"{w}x{h}_{fps}" / f"{key}.mp4"
+
+
+def _ensure_image_for_scene(*, api_key: str, prompt: str, size: str) -> Path:
     key = _sha1(prompt + "|" + size)
-    out = _image_cache_path(cache_dir, key)
+    out = _image_cache_path(size, key)
     if out.exists() and out.stat().st_size > 10_000:
         return out
 
     img_bytes = _openai_image_generate_bytes(prompt=prompt, api_key=api_key, size=size)
     if not img_bytes or len(img_bytes) < 10_000:
         raise RuntimeError("OpenAI returned invalid image bytes")
-    out.write_bytes(img_bytes)
+    _atomic_write_bytes(out, img_bytes)
     return out
 
 
 # -----------------------------
-# Prompts (script-driven, retention-minded)
+# Prompts (script-driven, retention-minded, deterministic)
 # -----------------------------
 def _scene_prompts_from_script(script: str, n_scenes: int, vertical: bool) -> List[str]:
     """
-    Cheap + deterministic: split script into n chunks and derive a prompt per chunk.
-    No extra tokens. No GPT calls.
+    Deterministic prompt derivation:
+    - Split script into n chunks
+    - House style ensures consistency + retention framing
+    - NO extra token burn
     """
     text = re.sub(r"\s+", " ", (script or "").strip())
     if not text:
         text = "A cinematic documentary scene."
 
-    # chunk by characters
-    chunks: List[str] = []
     L = len(text)
-    step = max(1, L // n_scenes)
+    step = max(1, L // max(1, n_scenes))
+    chunks: List[str] = []
     for i in range(n_scenes):
         a = i * step
         b = (i + 1) * step if i < n_scenes - 1 else L
         chunks.append(text[a:b].strip())
 
-    # House style: cinematic photoreal, documentary, sharp subject, high retention composition
-    framing = "vertical 9:16 composition, subject centered, strong foreground, shallow depth of field" if vertical else "wide 16:9 composition, cinematic framing, strong foreground, shallow depth of field"
+    framing = (
+        "vertical 9:16, fill-frame composition, subject dominates frame, strong foreground, shallow depth of field"
+        if vertical
+        else "wide 16:9, cinematic composition, strong foreground, shallow depth of field"
+    )
+
     base = (
-        "Cinematic photoreal documentary still, 1940s archival realism, natural film grain, dramatic lighting, high detail, "
-        "no text, no captions, no logos, no watermarks. "
+        "Cinematic photoreal documentary still, natural film grain, dramatic but realistic lighting, high detail, "
+        "documentary realism, no text, no captions, no logos, no watermarks. "
         f"{framing}. "
     )
 
-    prompts: List[str] = []
-    for i, c in enumerate(chunks, 1):
-        prompts.append(base + f"Scene {i}: {c}")
-    return prompts
+    return [base + f"Scene {i+1}: {c}" for i, c in enumerate(chunks)]
 
 
 # -----------------------------
 # FFmpeg video building
 # -----------------------------
 def _vf_fill_frame(w: int, h: int) -> str:
-    """
-    Fill frame, crop if necessary, never pad.
-    """
-    # scale to cover then crop exact
-    # force even dims for codecs
+    # Fill frame, crop if necessary, never pad.
     return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
 
 
 def _clamp_sub_style(style: Dict[str, Any], frame_h: int) -> Dict[str, Any]:
     s = dict(style or {})
+
     # Font clamp: 2.8%–5.0% of frame height
     min_fs = max(18, int(frame_h * 0.028))
     max_fs = max(min_fs, int(frame_h * 0.050))
@@ -421,18 +421,12 @@ def _clamp_sub_style(style: Dict[str, Any], frame_h: int) -> Dict[str, Any]:
     mv = max(int(frame_h * 0.01), min(int(frame_h * 0.12), mv))
     s["margin_v"] = int(mv)
 
-    # Enforce bottom-center alignment
-    s["alignment"] = 2
-    # Boxed subtitles
-    s["border_style"] = int(s.get("border_style", 3))
+    s["alignment"] = 2        # bottom-center
+    s["border_style"] = int(s.get("border_style", 3))  # boxed
     return s
 
 
 def _vf_subtitles(srt_path: Path, style: Dict[str, Any]) -> str:
-    """
-    libass subtitles filter.
-    force_style values must be comma-separated ASS style pairs.
-    """
     srt_esc = _quote_path(srt_path)
 
     font = style.get("font_name", "DejaVu Sans")
@@ -443,8 +437,6 @@ def _vf_subtitles(srt_path: Path, style: Dict[str, Any]) -> str:
     alignment = int(style.get("alignment", 2))
     margin_v = int(style.get("margin_v", 48))
 
-    # ASS force_style is sensitive — DO NOT include stray quotes.
-    # BackColor: semi-transparent black (AA000000). OutlineColor: black. PrimaryColor: white.
     force = (
         f"FontName={font},"
         f"FontSize={font_size},"
@@ -460,21 +452,27 @@ def _vf_subtitles(srt_path: Path, style: Dict[str, Any]) -> str:
     return f"subtitles='{srt_esc}':force_style='{force}'"
 
 
-def _make_image_clip(
+def _make_image_clip_cached(
     *,
     image_path: Path,
-    out_path: Path,
     w: int,
     h: int,
     fps: int,
     duration: float,
-) -> None:
+) -> Path:
     """
-    Create an H.264 MP4 clip from a still image for duration seconds.
+    Creates (or reuses) a still-image clip for duration seconds.
+    Caches by (image sha1 + w/h/fps + duration_ms bucket).
     """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    vf = _vf_fill_frame(w, h)
+    dur_ms = int(round(max(0.1, float(duration)) * 1000.0))
+    # quantize to 10ms buckets for stable keys
+    dur_ms = int(round(dur_ms / 10.0) * 10)
+    key = _sha1(f"{image_path.name}|{w}x{h}|{fps}|{dur_ms}")
+    out = _clip_cache_path(w, h, fps, key)
+    if out.exists() and out.stat().st_size > 50_000:
+        return out
 
+    vf = _vf_fill_frame(w, h)
     cmd = [
         ffmpeg_exe(),
         "-hide_banner",
@@ -482,27 +480,26 @@ def _make_image_clip(
         "-loglevel", "error",
         "-loop", "1",
         "-i", str(image_path),
-        "-t", f"{max(0.1, float(duration)):.3f}",
+        "-t", f"{dur_ms/1000.0:.3f}",
         "-vf", vf,
         "-r", str(int(fps)),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        str(out_path),
+        str(out),
     ]
     _run(cmd, check=True)
 
+    if out.exists() and out.stat().st_size > 50_000:
+        return out
+
+    raise RuntimeError("Clip render produced invalid output")
+
 
 def _concat_clips(clips: List[Path], out_path: Path) -> None:
-    """
-    Concat MP4 clips using concat demuxer.
-    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lst = out_path.parent / f"concat_{_sha1(str(out_path))}.txt"
-    lines = []
-    for c in clips:
-        lines.append(f"file {shlex.quote(str(c))}")
-    lst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    lst.write_text("\n".join([f"file {shlex.quote(str(c))}" for c in clips]) + "\n", encoding="utf-8")
 
     cmd = [
         ffmpeg_exe(),
@@ -519,11 +516,6 @@ def _concat_clips(clips: List[Path], out_path: Path) -> None:
 
 
 def _mux_audio(video_path: Path, audio_path: Path, out_path: Path) -> None:
-    """
-    Mux audio into video. Audio is authority, so video MUST be >= audio.
-    Use -shortest to trim any extra video tail (never trims audio if video covers it).
-    Explicit mapping prevents "no audio" outputs.
-    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg_exe(),
@@ -571,7 +563,7 @@ def _burn_subtitles(video_in: Path, srt_path: Path, out_path: Path, *, w: int, h
 # Subtitles (deterministic SRT)
 # -----------------------------
 def _clean_script_for_subs(text: str) -> str:
-    # Remove backslashes and weird escapes, normalize whitespace.
+    # Remove backslashes and normalize whitespace.
     t = (text or "").replace("\\", "")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\s*\n\s*", "\n", t).strip()
@@ -587,26 +579,18 @@ def _format_ts(seconds: float) -> str:
 
 
 def make_srt_from_script(script_text: str, duration: float, out_path: Path) -> Path:
-    """
-    Cheap SRT:
-    - Split into short lines by punctuation/length
-    - Allocate time proportionally by word count across duration
-    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     txt = _clean_script_for_subs(script_text)
     txt = re.sub(r"\s+", " ", txt).strip()
-
     if not txt:
         txt = " "
 
-    # Split into phrases
     parts = re.split(r"(?<=[\.\!\?\:;])\s+", txt)
     lines: List[str] = []
     for p in parts:
         p = p.strip()
         if not p:
             continue
-        # wrap long phrases
         while len(p) > 64:
             cut = p.rfind(" ", 0, 64)
             if cut <= 0:
@@ -619,29 +603,28 @@ def make_srt_from_script(script_text: str, duration: float, out_path: Path) -> P
     if not lines:
         lines = [txt[:64]]
 
-    # Allocate time by word count
     words_per_line = [max(1, len(l.split())) for l in lines]
     total_words = sum(words_per_line)
     dur = max(0.5, float(duration))
+
     t = 0.0
-    srt_blocks: List[str] = []
+    blocks: List[str] = []
     for i, (line, wc) in enumerate(zip(lines, words_per_line), 1):
         frac = wc / total_words if total_words > 0 else 1.0 / len(lines)
-        seg = max(0.9, dur * frac)  # minimum readability
+        seg = max(0.9, dur * frac)
         t2 = min(dur, t + seg)
-        # prevent zero-length
         if t2 - t < 0.5:
             t2 = min(dur, t + 0.5)
 
-        srt_blocks.append(str(i))
-        srt_blocks.append(f"{_format_ts(t)} --> {_format_ts(t2)}")
-        srt_blocks.append(line)
-        srt_blocks.append("")  # blank
+        blocks.append(str(i))
+        blocks.append(f"{_format_ts(t)} --> {_format_ts(t2)}")
+        blocks.append(line)
+        blocks.append("")
         t = t2
         if t >= dur:
             break
 
-    out_path.write_text("\n".join(srt_blocks).strip() + "\n", encoding="utf-8")
+    out_path.write_text("\n".join(blocks).strip() + "\n", encoding="utf-8")
     return out_path
 
 
@@ -722,24 +705,16 @@ def upload_to_spaces(file_path: Path, cfg: SpacesConfig) -> str:
     if not ok2:
         raise RuntimeError(f"Refusing upload; invalid MP4: {msg2}")
 
-    s3, endpoint = _spaces_client(cfg)
+    s3, _endpoint = _spaces_client(cfg)
 
     prefix = (cfg.prefix or "").strip().strip("/")
     key_name = file_path.name
     key = f"{prefix}/{key_name}" if prefix else key_name
 
-    extra = {}
-    if cfg.public_read:
-        extra["ACL"] = "public-read"
+    extra = {"ACL": "public-read"} if cfg.public_read else {}
+    s3.upload_file(str(file_path), cfg.bucket, key, ExtraArgs=(extra or None))
 
-    s3.upload_file(str(file_path), cfg.bucket, key, ExtraArgs=extra or None)
-
-    # Public URL
-    # DigitalOcean Spaces URL patterns:
-    # - https://{bucket}.{region}.digitaloceanspaces.com/{key}
-    # - or endpoint based
-    url = f"https://{cfg.bucket}.{cfg.region}.digitaloceanspaces.com/{key}"
-    return url
+    return f"https://{cfg.bucket}.{cfg.region}.digitaloceanspaces.com/{key}"
 
 
 # -----------------------------
@@ -788,36 +763,30 @@ def render_segment_mp4(
     dur_plus = dur + end_buffer
 
     # 2) scene plan to COVER dur_plus (never truncate)
-    n_scenes, sec_per = _compute_scene_plan(
+    n_scenes, sec_per, cap_overridden = _compute_scene_plan(
         audio_duration=dur_plus,
         max_scenes=int(max_scenes),
         target_scene_seconds=float(target_scene_seconds),
     )
 
-    # If rounding makes video slightly short, bump scenes
-    if n_scenes * sec_per + 1e-3 < dur_plus:
-        n_scenes = int(math.ceil(dur_plus / sec_per))
-        sec_per = dur_plus / n_scenes
-
-    # 3) output names
+    # 3) output path
     label = _safe_slug(segment.label)
     base = f"{label}_{width}x{height}_{fps}fps"
     final_mp4 = out_dir / f"{base}.mp4"
+
     if final_mp4.exists() and not overwrite:
         ok, msg = validate_mp4(final_mp4, require_audio=True)
         if ok:
-            return final_mp4, {"audio_duration": dur, "scenes": n_scenes, "sec_per_scene": sec_per, "cached": True}
-        # otherwise re-render
-
-    work = Path(tempfile.mkdtemp(prefix="uappress_render_"))
-    cache_dir = work / "img_cache"
-    clips_dir = work / "clips"
-    clips_dir.mkdir(parents=True, exist_ok=True)
-
-    size = f"{width}x{height}"
-
-    # 4) prompts (deterministic)
-    prompts = _scene_prompts_from_script(script_text, n_scenes, vertical)
+            return final_mp4, {
+                "audio_duration": dur,
+                "audio_duration_plus_buffer": dur_plus,
+                "end_buffer": end_buffer,
+                "scenes": n_scenes,
+                "sec_per_scene": sec_per,
+                "burn_subtitles": bool(burn_subtitles),
+                "cached_final": True,
+                "cap_overridden": cap_overridden,
+            }
 
     def _p(x: float) -> None:
         if progress_cb:
@@ -828,58 +797,70 @@ def render_segment_mp4(
 
     _p(0.02)
 
-    # 5) generate images + clips
+    # 4) prompts (deterministic)
+    prompts = _scene_prompts_from_script(script_text, n_scenes, vertical)
+    size = f"{width}x{height}"
+
+    # 5) images + cached clips
     clips: List[Path] = []
     for i, prompt in enumerate(prompts, 1):
-        img = _ensure_image_for_scene(cache_dir=cache_dir, api_key=openai_api_key, prompt=prompt, size=size)
-        clip = clips_dir / f"clip_{i:03d}.mp4"
-        _make_image_clip(image_path=img, out_path=clip, w=width, h=height, fps=fps, duration=sec_per)
+        img = _ensure_image_for_scene(api_key=openai_api_key, prompt=prompt, size=size)
+        clip = _make_image_clip_cached(image_path=img, w=width, h=height, fps=fps, duration=sec_per)
         clips.append(clip)
-        _p(0.02 + 0.58 * (i / max(1, len(prompts))))
+        _p(0.02 + 0.62 * (i / max(1, len(prompts))))
 
-    # 6) concat
-    concat_mp4 = work / "concat.mp4"
-    _concat_clips(clips, concat_mp4)
-    _p(0.70)
+    # 6) concat + mux + optional burn (use small temp work dir for manifests and subs)
+    work = Path(tempfile.mkdtemp(prefix="uappress_work_"))
+    try:
+        concat_mp4 = work / "concat.mp4"
+        _concat_clips(clips, concat_mp4)
+        _p(0.72)
 
-    # 7) mux audio (audio authority: video covers dur_plus; -shortest trims extra tail to exact audio length)
-    mux_mp4 = work / "mux.mp4"
-    _mux_audio(concat_mp4, ap, mux_mp4)
-    _p(0.82)
+        mux_mp4 = work / "mux.mp4"
+        _mux_audio(concat_mp4, ap, mux_mp4)
+        _p(0.86)
 
-    # validate mux
-    ok, msg = validate_mp4(mux_mp4, require_audio=True)
-    if not ok:
-        raise RuntimeError(f"Invalid mux output: {msg}")
+        ok, msg = validate_mp4(mux_mp4, require_audio=True)
+        if not ok:
+            raise RuntimeError(f"Invalid mux output: {msg}")
 
-    # 8) subtitles (optional)
-    out_candidate = mux_mp4
-    if burn_subtitles:
-        srt = work / "subs.srt"
-        make_srt_from_script(script_text, dur, srt)
-        burned = work / "burned.mp4"
-        _burn_subtitles(mux_mp4, srt, burned, w=width, h=height, style=(subtitle_style or {}))
-        ok2, msg2 = validate_mp4(burned, require_audio=True)
-        if not ok2:
-            raise RuntimeError(f"Invalid subtitle output: {msg2}")
-        out_candidate = burned
-    _p(0.94)
+        out_candidate = mux_mp4
+        if burn_subtitles:
+            srt = work / "subs.srt"
+            make_srt_from_script(script_text, dur, srt)
+            burned = work / "burned.mp4"
+            _burn_subtitles(mux_mp4, srt, burned, w=width, h=height, style=(subtitle_style or {}))
+            ok2, msg2 = validate_mp4(burned, require_audio=True)
+            if not ok2:
+                raise RuntimeError(f"Invalid subtitle output: {msg2}")
+            out_candidate = burned
 
-    # 9) finalize
-    final_mp4.write_bytes(out_candidate.read_bytes())
-    ok3, msg3 = validate_mp4(final_mp4, require_audio=True)
-    if not ok3:
-        raise RuntimeError(f"Final MP4 invalid: {msg3}")
+        _p(0.96)
 
-    _p(1.0)
+        # 7) finalize (atomic)
+        _atomic_write_bytes(final_mp4, out_candidate.read_bytes())
+        ok3, msg3 = validate_mp4(final_mp4, require_audio=True)
+        if not ok3:
+            raise RuntimeError(f"Final MP4 invalid: {msg3}")
 
-    meta = {
-        "audio_duration": dur,
-        "audio_duration_plus_buffer": dur_plus,
-        "end_buffer": end_buffer,
-        "scenes": n_scenes,
-        "sec_per_scene": sec_per,
-        "burn_subtitles": bool(burn_subtitles),
-        "output": str(final_mp4),
-    }
-    return final_mp4, meta
+        _p(1.0)
+
+        meta = {
+            "audio_duration": dur,
+            "audio_duration_plus_buffer": dur_plus,
+            "end_buffer": end_buffer,
+            "scenes": n_scenes,
+            "sec_per_scene": sec_per,
+            "burn_subtitles": bool(burn_subtitles),
+            "output": str(final_mp4),
+            "cap_overridden": cap_overridden,
+            "cache_root": str(cache_root()),
+        }
+        return final_mp4, meta
+    finally:
+        # Keep cache; remove only ephemeral workdir
+        try:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+        except Exception:
+            pass
