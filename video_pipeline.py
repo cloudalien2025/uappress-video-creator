@@ -312,6 +312,13 @@ def _openai_image_generate_bytes(
     - If the request schema changes (common cause of 400), we try a small set of known-safe payload variants.
     - Error messages include status + response snippet for fast diagnosis.
     """
+
+    # Guardrail: OpenAI requires a non-empty prompt string.
+    # Some callers may pass None/whitespace; normalize to a safe default to prevent 400 (missing prompt).
+    prompt = (prompt or "").strip()
+    if not prompt:
+        prompt = "A cinematic documentary scene."
+
     model = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
     base = _openai_base_url()
 
@@ -328,7 +335,8 @@ def _openai_image_generate_bytes(
     payload_variants = [
         {"model": model, "prompt": prompt, "size": size, "n": 1},
         {"model": model, "prompt": prompt, "size": size, "n": 1, "response_format": "b64_json"},
-        {"model": model, "input": prompt, "size": size, "n": 1, "response_format": "b64_json"},
+        # Some schemas accept "input"; keep it, but NEVER omit "prompt" (server may reject without it).
+        {"model": model, "prompt": prompt, "input": prompt, "size": size, "n": 1, "response_format": "b64_json"},
     ]
 
     def _extract_image_bytes(j: Dict[str, Any], *, timeout: int) -> bytes:
@@ -395,6 +403,9 @@ def _clip_cache_path(w: int, h: int, fps: int, key: str) -> Path:
 
 
 def _ensure_image_for_scene(*, api_key: str, prompt: str, size: str) -> Path:
+    prompt = (prompt or "").strip()
+    if not prompt:
+        prompt = "A cinematic documentary scene."
     key = _sha1(prompt + "|" + size)
     out = _image_cache_path(size, key)
     if out.exists() and out.stat().st_size > 10_000:
