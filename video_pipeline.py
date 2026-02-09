@@ -298,7 +298,6 @@ def _openai_safe_size(w: int, h: int) -> str:
     return "256x256"
 
 def _openai_image_generate_bytes(
-
     *,
     prompt: str,
     api_key: str,
@@ -308,9 +307,10 @@ def _openai_image_generate_bytes(
 ) -> bytes:
     """
     OpenAI Images: uses /v1/images/generations (primary).
-    Fixes the 404 shown in the UI when code incorrectly hits /v1/images.
-    - Only falls back to /v1/images if /generations returns 404.
+    Streamlit Cloud reliability goals:
     - Retries on 429/5xx with backoff.
+    - If the request schema changes (common cause of 400), we try a small set of known-safe payload variants.
+    - Error messages include status + response snippet for fast diagnosis.
     """
     model = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
     base = _openai_base_url()
@@ -319,49 +319,69 @@ def _openai_image_generate_bytes(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    payload = {"model": model, "prompt": prompt, "size": size, "n": 1}
 
-    endpoints = [f"{base}/v1/images/generations", f"{base}/v1/images"]  # fallback only if first is 404
+    # Primary endpoint + legacy fallback (some proxies expose /v1/images instead)
+    endpoints = [f"{base}/v1/images/generations", f"{base}/v1/images"]
+
+    # Payload variants (defensive against API schema drift causing 400)
+    # Keep n=1 for cost discipline.
+    payload_variants = [
+        {"model": model, "prompt": prompt, "size": size, "n": 1},
+        {"model": model, "prompt": prompt, "size": size, "n": 1, "response_format": "b64_json"},
+        {"model": model, "input": prompt, "size": size, "n": 1, "response_format": "b64_json"},
+    ]
+
+    def _extract_image_bytes(j: Dict[str, Any], *, timeout: int) -> bytes:
+        if not isinstance(j, dict):
+            raise RuntimeError("OpenAI image response is not JSON object")
+        data = j.get("data")
+        if not data or not isinstance(data, list):
+            raise RuntimeError("OpenAI image response missing data[]")
+        d0 = data[0] if data else {}
+        if isinstance(d0, dict) and d0.get("b64_json"):
+            return base64.b64decode(d0["b64_json"])
+        if isinstance(d0, dict) and d0.get("url"):
+            rr = requests.get(d0["url"], timeout=timeout)
+            rr.raise_for_status()
+            return rr.content
+        raise RuntimeError("OpenAI image response missing b64_json/url")
 
     last_err: Optional[Exception] = None
+
     for attempt in range(max_retries):
-        for idx, url in enumerate(endpoints):
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+        for url in endpoints:
+            for payload in payload_variants:
+                try:
+                    r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
 
-                # If primary endpoint not found, allow fallback; otherwise raise.
-                if r.status_code == 404 and idx == 0:
+                    # If endpoint missing, try next endpoint (do not waste retries)
+                    if r.status_code == 404:
+                        break
+
+                    # Retry on transient statuses
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        raise RuntimeError(f"OpenAI transient {r.status_code}: {(r.text or '')[:300]}")
+
+                    # 400 is common when schema differs; try next payload variant before failing
+                    if r.status_code == 400:
+                        raise ValueError(f"OpenAI 400: {(r.text or '')[:600]}")
+
+                    r.raise_for_status()
+                    j = r.json()
+                    return _extract_image_bytes(j, timeout=timeout_s)
+
+                except ValueError as e:
+                    # payload/schema issue, try next payload variant (same endpoint, same attempt)
+                    last_err = e
                     continue
-
-                if r.status_code in (429, 500, 502, 503, 504):
-                    # transient; retry
-                    raise RuntimeError(f"OpenAI transient {r.status_code}: {r.text[:200]}")
-
-                r.raise_for_status()
-                j = r.json()
-
-                if "data" not in j or not j["data"]:
-                    raise RuntimeError("OpenAI image response missing data")
-
-                d0 = j["data"][0]
-                if d0.get("b64_json"):
-                    return base64.b64decode(d0["b64_json"])
-                if d0.get("url"):
-                    rr = requests.get(d0["url"], timeout=timeout_s)
-                    rr.raise_for_status()
-                    return rr.content
-
-                raise RuntimeError("OpenAI image response missing url/b64")
-            except Exception as e:
-                last_err = e
-                # If primary was 404 we already continued; otherwise break to retry/backoff
-                break
-
-        # backoff before next retry
+                except Exception as e:
+                    last_err = e
+                    # Any other error: break to retry/backoff (do not loop payloads endlessly)
+                    break
+            # proceed to next endpoint
         time.sleep(0.6 * (2 ** attempt))
 
     raise RuntimeError(f"OpenAI image generation failed: {last_err}")
-
 
 # -----------------------------
 # Cache paths (real caching)
