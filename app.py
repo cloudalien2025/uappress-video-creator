@@ -155,56 +155,83 @@ st.markdown(
     <style>
 .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
 
-/* Sidebar: high-contrast "Ferrari dark" */
-[data-testid="stSidebar"] {
-  background: linear-gradient(180deg, #0b0f16 0%, #070a0f 100%);
-  border-right: 1px solid rgba(255,255,255,0.08);
+/* ========== SIDEBAR THEME (new palette: "Ice on Graphite") ========== */
+[data-testid="stSidebar"]{
+  background: linear-gradient(180deg,#0f172a 0%, #0b1220 100%);
+  border-right: 1px solid rgba(148,163,184,0.18);
 }
 
-/* Default sidebar text */
-[data-testid="stSidebar"] * {
-  color: #F5F8FF !important;
-  font-weight: 550;
+/* Headings + general text */
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3{
+  color:#f8fafc !important;
+  letter-spacing: .2px;
+}
+[data-testid="stSidebar"] *{
+  color:#e2e8f0 !important;
 }
 
-/* Labels / helper text */
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] span,
-[data-testid="stSidebar"] small,
-[data-testid="stSidebar"] .stMarkdown {
-  color: #F5F8FF !important;
-}
-
-/* Make Streamlit "caption" / secondary text readable */
+/* Secondary text (captions/help) */
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] *,
-[data-testid="stSidebar"] .stCaption,
-[data-testid="stSidebar"] .st-emotion-cache-1wmy9hl,
-[data-testid="stSidebar"] .st-emotion-cache-16idsys {
-  color: #CFE0FF !important;
-  opacity: 1 !important;
+[data-testid="stSidebar"] .stCaption{
+  color:#cbd5e1 !important;
+  opacity:1 !important;
 }
 
-/* Inputs: ensure the typed text and placeholder are visible */
+/* Section separators (expanders, hr-ish) */
+[data-testid="stSidebar"] [data-testid="stExpander"]{
+  border: 1px solid rgba(148,163,184,0.20) !important;
+  background: rgba(2,6,23,0.35) !important;
+  border-radius: 12px !important;
+}
+
+/* Inputs (text/number) */
 [data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea,
-[data-testid="stSidebar"] select {
-  background-color: #0F1726 !important;
-  color: #F5F8FF !important;
-  border: 1px solid rgba(255,255,255,0.14) !important;
+[data-testid="stSidebar"] textarea{
+  background: rgba(248,250,252,0.10) !important;
+  color:#f8fafc !important;
+  border: 1px solid rgba(148,163,184,0.35) !important;
+  border-radius: 10px !important;
 }
-
 [data-testid="stSidebar"] input::placeholder,
-[data-testid="stSidebar"] textarea::placeholder {
-  color: rgba(245, 248, 255, 0.65) !important;
+[data-testid="stSidebar"] textarea::placeholder{
+  color: rgba(226,232,240,0.78) !important;
 }
 
-/* Sliders: brighter track + value */
-[data-testid="stSidebar"] [data-baseweb="slider"] * {
-  color: #F5F8FF !important;
+/* BaseWeb SELECT (this is what Streamlit uses for selectbox) */
+[data-testid="stSidebar"] [data-baseweb="select"] > div{
+  background: rgba(248,250,252,0.10) !important;
+  border: 1px solid rgba(148,163,184,0.35) !important;
+  border-radius: 10px !important;
 }
-[data-testid="stSidebar"] [data-baseweb="slider"] [data-testid="stTickBar"] {
-  background: rgba(255,255,255,0.18) !important;
+[data-testid="stSidebar"] [data-baseweb="select"] *{
+  color:#f8fafc !important;
+}
+[data-testid="stSidebar"] [data-baseweb="select"] svg{
+  fill:#f8fafc !important;
+}
+
+/* Checkboxes / toggles */
+[data-testid="stSidebar"] [role="checkbox"],
+[data-testid="stSidebar"] [data-testid="stCheckbox"] *{
+  color:#f8fafc !important;
+}
+[data-testid="stSidebar"] [data-testid="stCheckbox"] input[type="checkbox"]{
+  accent-color: #ef4444 !important;
+}
+
+/* Sliders */
+[data-testid="stSidebar"] [data-baseweb="slider"] *{ color:#f8fafc !important; }
+[data-testid="stSidebar"] [data-baseweb="slider"] [role="slider"]{ background:#ef4444 !important; }
+[data-testid="stSidebar"] [data-baseweb="slider"] [data-testid="stTickBar"]{ background: rgba(226,232,240,0.25) !important; }
+
+/* Buttons inside sidebar (rare, but just in case) */
+[data-testid="stSidebar"] button{
+  background: #ef4444 !important;
+  color:#ffffff !important;
+  border: 1px solid rgba(255,255,255,0.18) !important;
+  border-radius: 12px !important;
 }
 </style>
     """,
