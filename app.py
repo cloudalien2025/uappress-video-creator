@@ -153,11 +153,60 @@ def _detect_segments(extract_root: Path) -> List[vp.Segment]:
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-    [data-testid="stSidebar"] { background: linear-gradient(180deg, #0b0f16 0%, #070a0f 100%); }
-    [data-testid="stSidebar"] * { color: #EAF2FF; font-weight: 500; }
-[data-testid="stSidebar"] input, [data-testid="stSidebar"] select { background-color: #101826; color: #EAF2FF; }
-    </style>
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+
+/* Sidebar: high-contrast "Ferrari dark" */
+[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, #0b0f16 0%, #070a0f 100%);
+  border-right: 1px solid rgba(255,255,255,0.08);
+}
+
+/* Default sidebar text */
+[data-testid="stSidebar"] * {
+  color: #F5F8FF !important;
+  font-weight: 550;
+}
+
+/* Labels / helper text */
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] small,
+[data-testid="stSidebar"] .stMarkdown {
+  color: #F5F8FF !important;
+}
+
+/* Make Streamlit "caption" / secondary text readable */
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] *,
+[data-testid="stSidebar"] .stCaption,
+[data-testid="stSidebar"] .st-emotion-cache-1wmy9hl,
+[data-testid="stSidebar"] .st-emotion-cache-16idsys {
+  color: #CFE0FF !important;
+  opacity: 1 !important;
+}
+
+/* Inputs: ensure the typed text and placeholder are visible */
+[data-testid="stSidebar"] input,
+[data-testid="stSidebar"] textarea,
+[data-testid="stSidebar"] select {
+  background-color: #0F1726 !important;
+  color: #F5F8FF !important;
+  border: 1px solid rgba(255,255,255,0.14) !important;
+}
+
+[data-testid="stSidebar"] input::placeholder,
+[data-testid="stSidebar"] textarea::placeholder {
+  color: rgba(245, 248, 255, 0.65) !important;
+}
+
+/* Sliders: brighter track + value */
+[data-testid="stSidebar"] [data-baseweb="slider"] * {
+  color: #F5F8FF !important;
+}
+[data-testid="stSidebar"] [data-baseweb="slider"] [data-testid="stTickBar"] {
+  background: rgba(255,255,255,0.18) !important;
+}
+</style>
     """,
     unsafe_allow_html=True,
 )
