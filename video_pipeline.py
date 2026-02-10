@@ -312,12 +312,9 @@ def _openai_image_generate_bytes(
     - If the request schema changes (common cause of 400), we try a small set of known-safe payload variants.
     - Error messages include status + response snippet for fast diagnosis.
     """
-
-    # Guardrail: OpenAI requires a non-empty prompt string.
-    # Some callers may pass None/whitespace; normalize to a safe default to prevent 400 (missing prompt).
-    prompt = (prompt or "").strip()
+    prompt = (prompt or \"\").strip()
     if not prompt:
-        prompt = "A cinematic documentary scene."
+        raise RuntimeError(\"OpenAI image generation: empty prompt\")
 
     model = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
     base = _openai_base_url()
@@ -335,7 +332,6 @@ def _openai_image_generate_bytes(
     payload_variants = [
         {"model": model, "prompt": prompt, "size": size, "n": 1},
         {"model": model, "prompt": prompt, "size": size, "n": 1, "response_format": "b64_json"},
-        # Some schemas accept "input"; keep it, but NEVER omit "prompt" (server may reject without it).
         {"model": model, "prompt": prompt, "input": prompt, "size": size, "n": 1, "response_format": "b64_json"},
     ]
 
@@ -403,9 +399,6 @@ def _clip_cache_path(w: int, h: int, fps: int, key: str) -> Path:
 
 
 def _ensure_image_for_scene(*, api_key: str, prompt: str, size: str) -> Path:
-    prompt = (prompt or "").strip()
-    if not prompt:
-        prompt = "A cinematic documentary scene."
     key = _sha1(prompt + "|" + size)
     out = _image_cache_path(size, key)
     if out.exists() and out.stat().st_size > 10_000:
@@ -482,7 +475,12 @@ def _clamp_sub_style(style: Dict[str, Any], frame_h: int) -> Dict[str, Any]:
     return s
 
 
-def _vf_subtitles(srt_path: Path, style: Dict[str, Any]) -> str:
+def _vf_subtitles(srt_path: Path, style: Dict[str, Any], *, w: int, h: int) -> str:
+    """FFmpeg subtitles filter string with libass scaling pinned to the actual output size.
+
+    Key fix: specify original_size so libass does NOT assume 384x288 (which causes clown-sized text
+    when rendering to 1080x1920 shorts).
+    """
     srt_esc = _quote_path(srt_path)
 
     font = style.get("font_name", "DejaVu Sans")
@@ -505,7 +503,9 @@ def _vf_subtitles(srt_path: Path, style: Dict[str, Any]) -> str:
         f"Alignment={alignment},"
         f"MarginV={margin_v}"
     )
-    return f"subtitles='{srt_esc}':force_style='{force}'"
+
+    # original_size pins subtitle composition to the real render size (W×H).
+    return f"subtitles='{srt_esc}':original_size={int(w)}x{int(h)}:force_style='{force}'"
 
 
 def _make_image_clip_cached(
@@ -607,7 +607,7 @@ def _burn_subtitles(video_in: Path, srt_path: Path, out_path: Path, *, w: int, h
     style = _clamp_sub_style(style or {}, h)
 
     vf = _vf_fill_frame(w, h)
-    vf2 = vf + "," + _vf_subtitles(srt_path, style)
+    vf2 = vf + "," + _vf_subtitles(srt_path, style, w=w, h=h)
 
     cmd = [
         ffmpeg_exe(),
