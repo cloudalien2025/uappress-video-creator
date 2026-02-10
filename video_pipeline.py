@@ -331,10 +331,7 @@ def _openai_image_generate_bytes(
     # Keep n=1 for cost discipline.
     payload_variants = [
         {"model": model, "prompt": prompt, "size": size, "n": 1},
-        {"model": model, "prompt": prompt, "size": size, "n": 1, "response_format": "b64_json"},
-        {"model": model, "prompt": prompt, "input": prompt, "size": size, "n": 1, "response_format": "b64_json"},
     ]
-
     def _extract_image_bytes(j: Dict[str, Any], *, timeout: int) -> bytes:
         if not isinstance(j, dict):
             raise RuntimeError("OpenAI image response is not JSON object")
