@@ -47,7 +47,7 @@ def _ss_init() -> None:
         "subs_size": "Medium",
         "subs_safe_margin": 6,  # % of height
         "subs_custom_font": True,
-        "subs_font_px": 42,
+        "subs_font_px": 34,
         # ZIP persistence
         "zip_saved_path": "",
         "extract_root": "",
