@@ -288,28 +288,14 @@ def _openai_base_url() -> str:
 
 
 def _openai_safe_size(w: int, h: int) -> str:
-    """
-    OpenAI Images accepts only a small set of sizes (as of the current API):
-      - "1024x1024"
-      - "1024x1536" (portrait)
-      - "1536x1024" (landscape)
-      - "auto"
-
-    The pipeline renders final video at any resolution, but we generate images at one of the
-    supported sizes and then FFmpeg scales/crops to the target frame (fill-frame, never pad).
-    """
-    w = int(w or 0)
-    h = int(h or 0)
-    if w <= 0 or h <= 0:
+    # OpenAI Images supports limited sizes; choose closest and upscale/crop locally with FFmpeg.
+    # This prevents 400 errors for 1080x1920, 1920x1080, etc.
+    # NOTE: choose larger when possible for quality.
+    if w >= 1024 and h >= 1024:
         return "1024x1024"
-
-    # Near-square → square.
-    m = max(w, h)
-    if abs(w - h) <= int(0.10 * m):
-        return "1024x1024"
-
-    # Match orientation.
-    return "1024x1536" if h > w else "1536x1024"
+    if w >= 512 and h >= 512:
+        return "512x512"
+    return "256x256"
 
 def _openai_image_generate_bytes(
     *,
@@ -470,10 +456,11 @@ def _vf_fill_frame(w: int, h: int) -> str:
 def _clamp_sub_style(style: Dict[str, Any], frame_h: int) -> Dict[str, Any]:
     s = dict(style or {})
 
-    # Font clamp: 2.8%–5.0% of frame height
-    min_fs = max(18, int(frame_h * 0.028))
-    max_fs = max(min_fs, int(frame_h * 0.050))
-    fs = int(s.get("font_size", min_fs))
+    # Font clamp tuned for Shorts: prevents billboard subtitles at 720x1280.
+    # Allow explicit UI px control while keeping sane bounds.
+    min_fs = max(16, int(frame_h * 0.016))
+    max_fs = max(min_fs + 4, int(frame_h * 0.038))
+    fs = int(s.get("font_size", int(frame_h * 0.025)))
     s["font_size"] = int(max(min_fs, min(max_fs, fs)))
 
     # Margin clamp: 1%–12% of frame height
@@ -481,8 +468,14 @@ def _clamp_sub_style(style: Dict[str, Any], frame_h: int) -> Dict[str, Any]:
     mv = max(int(frame_h * 0.01), min(int(frame_h * 0.12), mv))
     s["margin_v"] = int(mv)
 
-    s["alignment"] = 2        # bottom-center
-    s["border_style"] = int(s.get("border_style", 3))  # boxed
+    # Locked: outline-only, bottom-center.
+    s["alignment"] = 2
+    s["border_style"] = 1  # outline-only (no black box)
+
+    # Outline/shadow clamps (keep readable without blocking visuals).
+    s["outline"] = int(max(1, min(6, int(s.get("outline", 3)))))
+    s["shadow"] = int(max(0, min(4, int(s.get("shadow", 0)))))
+
     return s
 
 
@@ -507,7 +500,7 @@ def _vf_subtitles(srt_path: Path, style: Dict[str, Any], *, w: int, h: int) -> s
         f"FontSize={font_size},"
         f"PrimaryColour=&H00FFFFFF,"
         f"OutlineColour=&H00000000,"
-        f"BackColour=&HAA000000,"
+        f"BackColour=&HFF000000,"
         f"Outline={outline},"
         f"Shadow={shadow},"
         f"BorderStyle={border_style},"
