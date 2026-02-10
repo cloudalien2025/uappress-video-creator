@@ -46,6 +46,8 @@ def _ss_init() -> None:
         "burn_subs": True,
         "subs_size": "Medium",
         "subs_safe_margin": 6,  # % of height
+        "subs_custom_font": True,
+        "subs_font_px": 42,
         # ZIP persistence
         "zip_saved_path": "",
         "extract_root": "",
@@ -84,22 +86,33 @@ def _wh_from_resolution(res: str) -> Tuple[int, int]:
 
 
 def _subtitle_style_for_ui(w: int, h: int) -> Dict[str, Any]:
-    size = st.session_state["subs_size"]
-    if size == "Small":
-        font_px = max(22, int(h * 0.030))
-    elif size == "Large":
-        font_px = max(28, int(h * 0.038))
+    # User-controlled, resolution-aware subtitle sizing.
+    # For Shorts (e.g., 720x1280), "Small" should never produce billboard text.
+    min_px = max(18, int(h * 0.016))
+    max_px = max(min_px + 4, int(h * 0.038))
+
+    if bool(st.session_state.get("subs_custom_font", True)):
+        raw = int(st.session_state.get("subs_font_px", int(h * 0.025)))
+        font_px = max(min_px, min(max_px, raw))
     else:
-        font_px = max(26, int(h * 0.034))
+        size = st.session_state["subs_size"]
+        if size == "Small":
+            font_px = max(min_px, int(h * 0.022))
+        elif size == "Large":
+            font_px = max(min_px, int(h * 0.028))
+        else:
+            font_px = max(min_px, int(h * 0.025))
+        font_px = min(max_px, int(font_px))
 
     margin_v = max(16, int(h * (st.session_state["subs_safe_margin"] / 100.0)))
 
+    # Outline-only (NO BOX). BorderStyle=1 removes the black background block.
     return {
         "font_name": "DejaVu Sans",
         "font_size": int(font_px),
-        "outline": 2,
-        "shadow": 1,
-        "border_style": 3,  # boxed
+        "outline": 3,
+        "shadow": 0,
+        "border_style": 1,  # outline-only
         "alignment": 2,     # bottom-center
         "margin_v": int(margin_v),
     }
@@ -253,7 +266,25 @@ with st.sidebar:
     st.divider()
     st.subheader("Subtitles")
     st.session_state["burn_subs"] = st.checkbox("Burn-in subtitles (recommended)", value=bool(st.session_state["burn_subs"]))
-    st.session_state["subs_size"] = st.selectbox("Subtitle size", ["Small", "Medium", "Large"], index=["Small", "Medium", "Large"].index(st.session_state["subs_size"]))
+
+    # Precision control (recommended): exact font size in px, tailored to the selected resolution.
+    _w_tmp, _h_tmp = _wh_from_resolution(st.session_state.get("resolution", "1080x1920"))
+    _min_px = max(18, int(_h_tmp * 0.016))
+    _max_px = max(_min_px + 4, int(_h_tmp * 0.038))
+
+    st.session_state["subs_custom_font"] = st.toggle("Use custom font size (px)", value=bool(st.session_state.get("subs_custom_font", True)))
+
+    # Always keep the stored value inside slider bounds (rerun-safe).
+    _cur_px = int(st.session_state.get("subs_font_px", int(_h_tmp * 0.025)))
+    _cur_px = max(_min_px, min(_max_px, _cur_px))
+    st.session_state["subs_font_px"] = _cur_px
+
+    if st.session_state["subs_custom_font"]:
+        st.session_state["subs_font_px"] = st.slider("Subtitle font size (px)", _min_px, _max_px, int(st.session_state["subs_font_px"]), 1)
+        # Size preset is still shown for convenience, but it will NOT affect output when custom is enabled.
+        st.session_state["subs_size"] = st.selectbox("Subtitle size (preset)", ["Small", "Medium", "Large"], index=["Small", "Medium", "Large"].index(st.session_state["subs_size"]), disabled=True)
+    else:
+        st.session_state["subs_size"] = st.selectbox("Subtitle size", ["Small", "Medium", "Large"], index=["Small", "Medium", "Large"].index(st.session_state["subs_size"]))
     st.session_state["subs_safe_margin"] = st.slider("Bottom safe margin (%)", 2, 14, int(st.session_state["subs_safe_margin"]), 1)
 
     st.divider()
