@@ -155,82 +155,69 @@ st.markdown(
     <style>
 .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
 
-/* ========== SIDEBAR THEME (new palette: "Ice on Graphite") ========== */
-[data-testid="stSidebar"]{
-  background: linear-gradient(180deg,#0f172a 0%, #0b1220 100%);
-  border-right: 1px solid rgba(148,163,184,0.18);
+/* Sidebar: "Midnight Teal" (high contrast, readable labels & inputs) */
+[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, #07121A 0%, #041018 100%) !important;
+}
+[data-testid="stSidebar"] * {
+  color: #F2F6FF !important;
+}
+[data-testid="stSidebar"] .stMarkdown, 
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] small,
+[data-testid="stSidebar"] .stCaptionContainer {
+  color: #F2F6FF !important;
 }
 
-/* Headings + general text */
-[data-testid="stSidebar"] h1,
-[data-testid="stSidebar"] h2,
-[data-testid="stSidebar"] h3{
-  color:#f8fafc !important;
-  letter-spacing: .2px;
-}
-[data-testid="stSidebar"] *{
-  color:#e2e8f0 !important;
+/* Muted/help text */
+[data-testid="stSidebar"] .stCaptionContainer,
+[data-testid="stSidebar"] .stMarkdown small,
+[data-testid="stSidebar"] .stMarkdown p small {
+  color: #B8C4D6 !important;
 }
 
-/* Secondary text (captions/help) */
-[data-testid="stSidebar"] [data-testid="stCaptionContainer"] *,
-[data-testid="stSidebar"] .stCaption{
-  color:#cbd5e1 !important;
-  opacity:1 !important;
-}
-
-/* Section separators (expanders, hr-ish) */
-[data-testid="stSidebar"] [data-testid="stExpander"]{
-  border: 1px solid rgba(148,163,184,0.20) !important;
-  background: rgba(2,6,23,0.35) !important;
-  border-radius: 12px !important;
-}
-
-/* Inputs (text/number) */
+/* Inputs */
 [data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea{
-  background: rgba(248,250,252,0.10) !important;
-  color:#f8fafc !important;
-  border: 1px solid rgba(148,163,184,0.35) !important;
-  border-radius: 10px !important;
-}
-[data-testid="stSidebar"] input::placeholder,
-[data-testid="stSidebar"] textarea::placeholder{
-  color: rgba(226,232,240,0.78) !important;
+[data-testid="stSidebar"] textarea {
+  background: #0F1F2B !important;
+  color: #F2F6FF !important;
+  border: 1px solid #2A3B4F !important;
 }
 
-/* BaseWeb SELECT (this is what Streamlit uses for selectbox) */
-[data-testid="stSidebar"] [data-baseweb="select"] > div{
-  background: rgba(248,250,252,0.10) !important;
-  border: 1px solid rgba(148,163,184,0.35) !important;
-  border-radius: 10px !important;
+/* BaseWeb select (st.selectbox) */
+[data-testid="stSidebar"] [data-baseweb="select"] > div {
+  background: #0F1F2B !important;
+  border: 1px solid #2A3B4F !important;
 }
-[data-testid="stSidebar"] [data-baseweb="select"] *{
-  color:#f8fafc !important;
-}
-[data-testid="stSidebar"] [data-baseweb="select"] svg{
-  fill:#f8fafc !important;
+[data-testid="stSidebar"] [data-baseweb="select"] * {
+  color: #F2F6FF !important;
 }
 
-/* Checkboxes / toggles */
-[data-testid="stSidebar"] [role="checkbox"],
-[data-testid="stSidebar"] [data-testid="stCheckbox"] *{
-  color:#f8fafc !important;
-}
-[data-testid="stSidebar"] [data-testid="stCheckbox"] input[type="checkbox"]{
-  accent-color: #ef4444 !important;
+/* Toggles/checkbox accents */
+[data-testid="stSidebar"] [role="checkbox"] svg,
+[data-testid="stSidebar"] [data-testid="stCheckbox"] svg {
+  fill: #00D1B2 !important;
+  color: #00D1B2 !important;
 }
 
-/* Sliders */
-[data-testid="stSidebar"] [data-baseweb="slider"] *{ color:#f8fafc !important; }
-[data-testid="stSidebar"] [data-baseweb="slider"] [role="slider"]{ background:#ef4444 !important; }
-[data-testid="stSidebar"] [data-baseweb="slider"] [data-testid="stTickBar"]{ background: rgba(226,232,240,0.25) !important; }
+/* Slider */
+[data-testid="stSidebar"] [data-testid="stSlider"] * {
+  color: #F2F6FF !important;
+}
+[data-testid="stSidebar"] [data-baseweb="slider"] [role="slider"] {
+  background: #00D1B2 !important;
+  border: 2px solid #0B2A2B !important;
+}
+[data-testid="stSidebar"] [data-baseweb="slider"] [data-baseweb="track"] div {
+  background: #00D1B2 !important;
+}
 
-/* Buttons inside sidebar (rare, but just in case) */
-[data-testid="stSidebar"] button{
-  background: #ef4444 !important;
-  color:#ffffff !important;
-  border: 1px solid rgba(255,255,255,0.18) !important;
+/* Expanders */
+[data-testid="stSidebar"] details {
+  background: rgba(15, 31, 43, 0.55) !important;
+  border: 1px solid #2A3B4F !important;
   border-radius: 12px !important;
 }
 </style>
