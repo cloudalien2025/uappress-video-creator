@@ -155,70 +155,51 @@ st.markdown(
     <style>
 .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
 
-/* Sidebar: "Midnight Teal" (high contrast, readable labels & inputs) */
-[data-testid="stSidebar"] {
-  background: linear-gradient(180deg, #07121A 0%, #041018 100%) !important;
+/* Sidebar: high-contrast, readable */
+[data-testid="stSidebar"]{
+  background: linear-gradient(180deg, #0f172a 0%, #020617 100%) !important;
+  border-right: 1px solid rgba(148,163,184,0.25);
 }
-[data-testid="stSidebar"] * {
-  color: #F2F6FF !important;
+[data-testid="stSidebar"] *{
+  color: #f8fafc !important;
+  font-weight: 550;
 }
-[data-testid="stSidebar"] .stMarkdown, 
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] span,
-[data-testid="stSidebar"] small,
-[data-testid="stSidebar"] .stCaptionContainer {
-  color: #F2F6FF !important;
-}
-
-/* Muted/help text */
-[data-testid="stSidebar"] .stCaptionContainer,
-[data-testid="stSidebar"] .stMarkdown small,
-[data-testid="stSidebar"] .stMarkdown p small {
-  color: #B8C4D6 !important;
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{
+  color: #ffffff !important;
+  letter-spacing: 0.2px;
 }
 
 /* Inputs */
 [data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea {
-  background: #0F1F2B !important;
-  color: #F2F6FF !important;
-  border: 1px solid #2A3B4F !important;
+[data-testid="stSidebar"] textarea,
+[data-testid="stSidebar"] select,
+[data-testid="stSidebar"] .stNumberInput input{
+  background: #111827 !important;
+  color: #f8fafc !important;
+  border: 1px solid rgba(148,163,184,0.45) !important;
+  border-radius: 10px !important;
 }
 
-/* BaseWeb select (st.selectbox) */
-[data-testid="stSidebar"] [data-baseweb="select"] > div {
-  background: #0F1F2B !important;
-  border: 1px solid #2A3B4F !important;
+/* Selectbox + multiselect */
+[data-testid="stSidebar"] [data-baseweb="select"] > div{
+  background: #111827 !important;
+  border: 1px solid rgba(148,163,184,0.45) !important;
+  border-radius: 10px !important;
 }
-[data-testid="stSidebar"] [data-baseweb="select"] * {
-  color: #F2F6FF !important;
-}
-
-/* Toggles/checkbox accents */
-[data-testid="stSidebar"] [role="checkbox"] svg,
-[data-testid="stSidebar"] [data-testid="stCheckbox"] svg {
-  fill: #00D1B2 !important;
-  color: #00D1B2 !important;
+[data-testid="stSidebar"] [data-baseweb="select"] span{
+  color: #f8fafc !important;
 }
 
-/* Slider */
-[data-testid="stSidebar"] [data-testid="stSlider"] * {
-  color: #F2F6FF !important;
-}
-[data-testid="stSidebar"] [data-baseweb="slider"] [role="slider"] {
-  background: #00D1B2 !important;
-  border: 2px solid #0B2A2B !important;
-}
-[data-testid="stSidebar"] [data-baseweb="slider"] [data-baseweb="track"] div {
-  background: #00D1B2 !important;
+/* Sliders */
+[data-testid="stSidebar"] [data-testid="stSlider"] *{
+  color: #f8fafc !important;
 }
 
-/* Expanders */
-[data-testid="stSidebar"] details {
-  background: rgba(15, 31, 43, 0.55) !important;
-  border: 1px solid #2A3B4F !important;
-  border-radius: 12px !important;
+/* Captions / help text */
+[data-testid="stSidebar"] small,
+[data-testid="stSidebar"] .stCaption,
+[data-testid="stSidebar"] .stMarkdown p{
+  color: rgba(226,232,240,0.92) !important;
 }
 </style>
     """,
