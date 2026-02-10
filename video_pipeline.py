@@ -67,6 +67,10 @@ def cache_root() -> Path:
     root.mkdir(parents=True, exist_ok=True)
     return root
 
+# Bump this whenever clip rendering logic changes (prevents stale cached clips with wrong aspect/padding).
+CLIP_CACHE_VERSION = os.environ.get("UAPPRESS_CLIP_CACHE_VERSION", "2")
+
+
 
 # -----------------------------
 # Utilities
@@ -539,7 +543,7 @@ def _make_image_clip_cached(
     dur_ms = int(round(max(0.1, float(duration)) * 1000.0))
     # quantize to 10ms buckets for stable keys
     dur_ms = int(round(dur_ms / 10.0) * 10)
-    key = _sha1(f"{image_path.name}|{w}x{h}|{fps}|{dur_ms}")
+    key = _sha1(f"{CLIP_CACHE_VERSION}|{image_path.name}|{w}x{h}|{fps}|{dur_ms}|{vf}")
     out = _clip_cache_path(w, h, fps, key)
     if out.exists() and out.stat().st_size > 50_000:
         return out
