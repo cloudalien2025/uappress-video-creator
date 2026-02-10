@@ -288,14 +288,28 @@ def _openai_base_url() -> str:
 
 
 def _openai_safe_size(w: int, h: int) -> str:
-    # OpenAI Images supports limited sizes; choose closest and upscale/crop locally with FFmpeg.
-    # This prevents 400 errors for 1080x1920, 1920x1080, etc.
-    # NOTE: choose larger when possible for quality.
-    if w >= 1024 and h >= 1024:
+    """
+    OpenAI Images accepts only a small set of sizes (as of the current API):
+      - "1024x1024"
+      - "1024x1536" (portrait)
+      - "1536x1024" (landscape)
+      - "auto"
+
+    The pipeline renders final video at any resolution, but we generate images at one of the
+    supported sizes and then FFmpeg scales/crops to the target frame (fill-frame, never pad).
+    """
+    w = int(w or 0)
+    h = int(h or 0)
+    if w <= 0 or h <= 0:
         return "1024x1024"
-    if w >= 512 and h >= 512:
-        return "512x512"
-    return "256x256"
+
+    # Near-square → square.
+    m = max(w, h)
+    if abs(w - h) <= int(0.10 * m):
+        return "1024x1024"
+
+    # Match orientation.
+    return "1024x1536" if h > w else "1536x1024"
 
 def _openai_image_generate_bytes(
     *,
