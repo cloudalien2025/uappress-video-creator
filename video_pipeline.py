@@ -288,14 +288,26 @@ def _openai_base_url() -> str:
 
 
 def _openai_safe_size(w: int, h: int) -> str:
-    # OpenAI Images supports limited sizes; choose closest and upscale/crop locally with FFmpeg.
-    # This prevents 400 errors for 1080x1920, 1920x1080, etc.
-    # NOTE: choose larger when possible for quality.
-    if w >= 1024 and h >= 1024:
+    # OpenAI Images supports limited sizes (as of this app):
+    #   1024x1024, 1024x1536, 1536x1024, and "auto".
+    # We pick the closest *supported* aspect and then scale/crop locally via FFmpeg to the
+    # exact target render resolution. This prevents OpenAI 400 invalid size errors.
+    w = int(w or 0)
+    h = int(h or 0)
+    if w <= 0 or h <= 0:
         return "1024x1024"
-    if w >= 512 and h >= 512:
-        return "512x512"
-    return "256x256"
+
+    ar = w / float(h)
+
+    # Near-square → square
+    if 0.8 <= ar <= 1.25:
+        return "1024x1024"
+
+    # Vertical vs horizontal
+    if ar < 1.0:
+        return "1024x1536"
+    return "1536x1024"
+
 
 def _openai_image_generate_bytes(
     *,
