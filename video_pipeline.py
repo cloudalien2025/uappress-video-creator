@@ -312,9 +312,9 @@ def _openai_image_generate_bytes(
     - If the request schema changes (common cause of 400), we try a small set of known-safe payload variants.
     - Error messages include status + response snippet for fast diagnosis.
     """
-    prompt = (prompt or \"\").strip()
+    prompt = (prompt or "").strip()
     if not prompt:
-        raise RuntimeError(\"OpenAI image generation: empty prompt\")
+        raise RuntimeError("OpenAI image generation: empty prompt")
 
     model = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
     base = _openai_base_url()
@@ -710,7 +710,7 @@ def _ffprobe_streams(path: Path) -> Dict[str, Any]:
     return json.loads(out) if out else {}
 
 
-def validate_mp4(path: Union[str, Path], *, require_audio: bool = True, min_bytes: int = 50_000) -> Tuple[bool, str]:
+def validate_mp4(path: Union[str, Path], *, require_audio: bool = True, min_bytes: int = 50_000, expect_w: Optional[int] = None, expect_h: Optional[int] = None) -> Tuple[bool, str]:
     p = Path(path)
     if not p.exists():
         return False, "missing"
@@ -728,6 +728,15 @@ def validate_mp4(path: Union[str, Path], *, require_audio: bool = True, min_byte
             return False, "no audio stream"
         if dur <= 0.1:
             return False, "zero duration"
+
+        # Resolution guard: prevents low-res renders that cause subtitle scaling artifacts.
+        v0 = next((s for s in streams if s.get("codec_type") == "video"), {}) or {}
+        vw = int(v0.get("width") or 0)
+        vh = int(v0.get("height") or 0)
+        if vw < 320 or vh < 320:
+            return False, f"video too small ({vw}x{vh})"
+        if expect_w and expect_h and (vw != int(expect_w) or vh != int(expect_h)):
+            return False, f"unexpected resolution ({vw}x{vh}) expected ({int(expect_w)}x{int(expect_h)})"
         return True, "ok"
     except Exception as e:
         return False, f"ffprobe failed: {e}"
@@ -841,7 +850,7 @@ def render_segment_mp4(
     final_mp4 = out_dir / f"{base}.mp4"
 
     if final_mp4.exists() and not overwrite:
-        ok, msg = validate_mp4(final_mp4, require_audio=True)
+        ok, msg = validate_mp4(final_mp4, require_audio=True, expect_w=width, expect_h=height)
         if ok:
             return final_mp4, {
                 "audio_duration": dur,
@@ -889,7 +898,7 @@ def render_segment_mp4(
         _mux_audio(concat_mp4, ap, mux_mp4)
         _p(0.86)
 
-        ok, msg = validate_mp4(mux_mp4, require_audio=True)
+        ok, msg = validate_mp4(mux_mp4, require_audio=True, expect_w=width, expect_h=height)
         if not ok:
             raise RuntimeError(f"Invalid mux output: {msg}")
 
@@ -899,7 +908,7 @@ def render_segment_mp4(
             make_srt_from_script(script_text, dur, srt)
             burned = work / "burned.mp4"
             _burn_subtitles(mux_mp4, srt, burned, w=width, h=height, style=(subtitle_style or {}))
-            ok2, msg2 = validate_mp4(burned, require_audio=True)
+            ok2, msg2 = validate_mp4(burned, require_audio=True, expect_w=width, expect_h=height)
             if not ok2:
                 raise RuntimeError(f"Invalid subtitle output: {msg2}")
             out_candidate = burned
@@ -908,7 +917,7 @@ def render_segment_mp4(
 
         # 7) finalize (atomic)
         _atomic_write_bytes(final_mp4, out_candidate.read_bytes())
-        ok3, msg3 = validate_mp4(final_mp4, require_audio=True)
+        ok3, msg3 = validate_mp4(final_mp4, require_audio=True, expect_w=width, expect_h=height)
         if not ok3:
             raise RuntimeError(f"Final MP4 invalid: {msg3}")
 
