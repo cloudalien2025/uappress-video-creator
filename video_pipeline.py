@@ -543,16 +543,15 @@ def _make_image_clip_cached(
     dur_ms = int(round(max(0.1, float(duration)) * 1000.0))
     # quantize to 10ms buckets for stable keys
     dur_ms = int(round(dur_ms / 10.0) * 10)
+    vf = _vf_fill_frame(w, h)
     key = _sha1(f"{CLIP_CACHE_VERSION}|{image_path.name}|{w}x{h}|{fps}|{dur_ms}|{vf}")
     out = _clip_cache_path(w, h, fps, key)
     if out.exists() and out.stat().st_size > 50_000:
         return out
 
-    vf = _vf_fill_frame(w, h)
     # Ensure clip cache directory exists (ffmpeg fails with exit 1 if it doesn't).
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    vf = _vf_fill_frame(w, h)
     cmd = [
         ffmpeg_exe(),
         "-hide_banner",
